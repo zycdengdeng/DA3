@@ -461,23 +461,24 @@ def main():
         # Generate point cloud for this camera
         K, dist, R_V2C, t_V2C, is_fisheye = get_camera_params(calib, cam_id)
 
-        # Load and resize image to match depth resolution
+        # Load original image
         img = cv2.imread(images[i])
-        img_resized = cv2.resize(img, (calibrated.shape[1], calibrated.shape[0]))
-
-        # Adjust intrinsics for resized image
         orig_H, orig_W = img.shape[:2]
-        new_H, new_W = calibrated.shape
-        K_scaled = K.copy()
-        K_scaled[0, 0] *= new_W / orig_W  # fx
-        K_scaled[1, 1] *= new_H / orig_H  # fy
-        K_scaled[0, 2] *= new_W / orig_W  # cx
-        K_scaled[1, 2] *= new_H / orig_H  # cy
+
+        # Resize depth to original image resolution (avoid intrinsic scaling issues)
+        calibrated_fullres = cv2.resize(
+            calibrated.astype(np.float32),
+            (orig_W, orig_H),
+            interpolation=cv2.INTER_LINEAR
+        )
+
+        # Use original intrinsics (no scaling needed)
+        K_used = K.copy()
 
         # Convert depth to point cloud
         xyz, colors = depth_to_pointcloud(
-            calibrated, K_scaled, R_V2C, t_V2C,
-            image=img_resized, max_depth=200.0, downsample=2
+            calibrated_fullres, K_used, R_V2C, t_V2C,
+            image=img, max_depth=200.0, downsample=2
         )
 
         if len(xyz) > 0:
