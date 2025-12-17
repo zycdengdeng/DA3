@@ -19,7 +19,7 @@ import torch
 from PIL import Image
 
 # DA3 imports
-from depth_anything_3 import DepthAnything3
+from depth_anything_3.api import DepthAnything3
 from depth_anything_3.utils.alignment import least_squares_scale_scalar
 
 
