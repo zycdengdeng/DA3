@@ -207,6 +207,82 @@ def visualize_depth(depth, output_path, colormap=cv2.COLORMAP_MAGMA):
     print(f"Saved depth visualization: {output_path}")
 
 
+def depth_to_pointcloud(depth, K, R_V2C, t_V2C, image=None, max_depth=200.0, downsample=1):
+    """
+    Convert depth map to point cloud in VirtualLidar (world) frame.
+
+    Args:
+        depth: (H, W) depth map in camera frame
+        K: (3, 3) intrinsic matrix
+        R_V2C: (3, 3) rotation from VirtualLidar to Camera
+        t_V2C: (3,) translation from VirtualLidar to Camera
+        image: (H, W, 3) RGB image for colors (optional)
+        max_depth: maximum depth to include
+        downsample: downsample factor (1 = full resolution)
+
+    Returns:
+        xyz_world: (N, 3) points in VirtualLidar frame
+        colors: (N, 3) RGB colors (0-255) or None
+    """
+    H, W = depth.shape
+
+    # Create pixel grid
+    u = np.arange(0, W, downsample)
+    v = np.arange(0, H, downsample)
+    u, v = np.meshgrid(u, v)
+    u = u.flatten()
+    v = v.flatten()
+
+    # Get depth values
+    d = depth[v, u]
+
+    # Filter valid depth
+    valid = (d > 0.1) & (d < max_depth) & np.isfinite(d)
+    u, v, d = u[valid], v[valid], d[valid]
+
+    if len(d) == 0:
+        return np.zeros((0, 3)), None
+
+    # Backproject to camera frame
+    fx, fy = K[0, 0], K[1, 1]
+    cx, cy = K[0, 2], K[1, 2]
+
+    X_cam = (u - cx) * d / fx
+    Y_cam = (v - cy) * d / fy
+    Z_cam = d
+
+    xyz_cam = np.stack([X_cam, Y_cam, Z_cam], axis=1)  # (N, 3)
+
+    # Transform to VirtualLidar (world) frame
+    # Camera -> VirtualLidar: X_v = R_V2C^T @ (X_c - t_V2C)
+    R_C2V = R_V2C.T
+    t_C2V = -R_C2V @ t_V2C
+
+    xyz_world = (R_C2V @ xyz_cam.T).T + t_C2V.reshape(1, 3)
+
+    # Get colors
+    colors = None
+    if image is not None:
+        colors = image[v, u]  # (N, 3) BGR
+        colors = colors[:, ::-1]  # BGR -> RGB
+
+    return xyz_world, colors
+
+
+def save_pointcloud_ply(xyz, colors, output_path):
+    """Save point cloud to PLY file."""
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(xyz)
+
+    if colors is not None:
+        # Normalize colors to [0, 1]
+        colors_normalized = colors.astype(np.float64) / 255.0
+        pcd.colors = o3d.utility.Vector3dVector(colors_normalized)
+
+    o3d.io.write_point_cloud(output_path, pcd)
+    print(f"Saved point cloud: {output_path} ({len(xyz)} points)")
+
+
 def main():
     parser = argparse.ArgumentParser(description="DA3 Depth Calibration with LiDAR")
     parser.add_argument("--data_dir", type=str, default="./SELF_data", help="Data directory")
@@ -363,8 +439,11 @@ def main():
     print(f"Mean relative error: {rel_error.mean()*100:.2f} %")
     print(f"Median relative error: {np.median(rel_error)*100:.2f} %")
 
-    # Apply scale and save calibrated depth maps
-    print("\n--- Saving Calibrated Depth Maps ---")
+    # Apply scale and save calibrated depth maps + point clouds
+    print("\n--- Saving Calibrated Depth Maps and Point Clouds ---")
+
+    all_xyz = []
+    all_colors = []
 
     for i, cam_id in enumerate(valid_cam_ids):
         da3_depth = prediction.depth[i]
@@ -378,6 +457,61 @@ def main():
         # Visualize
         vis_path = os.path.join(args.output_dir, f"cam{cam_id}_depth_calibrated_vis.png")
         visualize_depth(calibrated, vis_path)
+
+        # Generate point cloud for this camera
+        K, dist, R_V2C, t_V2C, is_fisheye = get_camera_params(calib, cam_id)
+
+        # Load and resize image to match depth resolution
+        img = cv2.imread(images[i])
+        img_resized = cv2.resize(img, (calibrated.shape[1], calibrated.shape[0]))
+
+        # Adjust intrinsics for resized image
+        orig_H, orig_W = img.shape[:2]
+        new_H, new_W = calibrated.shape
+        K_scaled = K.copy()
+        K_scaled[0, 0] *= new_W / orig_W  # fx
+        K_scaled[1, 1] *= new_H / orig_H  # fy
+        K_scaled[0, 2] *= new_W / orig_W  # cx
+        K_scaled[1, 2] *= new_H / orig_H  # cy
+
+        # Convert depth to point cloud
+        xyz, colors = depth_to_pointcloud(
+            calibrated, K_scaled, R_V2C, t_V2C,
+            image=img_resized, max_depth=200.0, downsample=2
+        )
+
+        if len(xyz) > 0:
+            all_xyz.append(xyz)
+            if colors is not None:
+                all_colors.append(colors)
+
+            # Save individual camera point cloud
+            ply_path = os.path.join(args.output_dir, f"cam{cam_id}_pointcloud.ply")
+            save_pointcloud_ply(xyz, colors, ply_path)
+
+    # Merge all point clouds
+    if all_xyz:
+        print("\n--- Merging Point Clouds ---")
+        merged_xyz = np.concatenate(all_xyz, axis=0)
+        merged_colors = np.concatenate(all_colors, axis=0) if all_colors else None
+
+        # Save merged point cloud
+        merged_ply_path = os.path.join(args.output_dir, "merged_pointcloud.ply")
+        save_pointcloud_ply(merged_xyz, merged_colors, merged_ply_path)
+
+        # Also save with LiDAR points for comparison
+        print("\n--- Adding LiDAR points for comparison ---")
+        lidar_pcd_path = os.path.join(data_dir, f"{timestamp}.pcd")
+        lidar_xyz = load_pcd(lidar_pcd_path)
+
+        # Create comparison point cloud (DA3 in color, LiDAR in red)
+        lidar_colors = np.full((len(lidar_xyz), 3), [255, 0, 0], dtype=np.uint8)  # Red
+
+        combined_xyz = np.concatenate([merged_xyz, lidar_xyz], axis=0)
+        combined_colors = np.concatenate([merged_colors, lidar_colors], axis=0) if merged_colors is not None else None
+
+        combined_ply_path = os.path.join(args.output_dir, "combined_da3_lidar.ply")
+        save_pointcloud_ply(combined_xyz, combined_colors, combined_ply_path)
 
     # Save calibration results
     results = {
