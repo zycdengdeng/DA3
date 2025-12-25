@@ -1,0 +1,18 @@
+dataset:
+  data_roots:
+    - "/mnt/zihanw/proj_utils_pro/blur投影/001/001"
+  image_size: [512, 512]
+
+model:
+  model_id: "runwayml/stable-diffusion-v1-5"
+  lidar_channels: 3
+  t_max: 1000
+
+train:
+  batch_size: 16
+  max_epochs: 601
+  lr: 1e-4
+  weight_decay: 0.0
+
+save_dir: "./experiments"
+log_dir: "./logs"
