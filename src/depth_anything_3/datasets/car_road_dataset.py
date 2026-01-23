@@ -132,18 +132,19 @@ class CarRoadDatasetLoader:
     """
 
     # Camera ID to folder name mapping
+    # Verified from actual data: pinhole0->cam3, pinhole1->cam6, pinhole2->cam9, pinhole3->cam0
     PINHOLE_CAMERAS = {
-        "0": "pinhole0",   # cam0
-        "3": "pinhole1",   # cam3
-        "6": "pinhole2",   # cam6
-        "9": "pinhole3",   # cam9
+        "0": "pinhole3",   # cam0 is in pinhole3 folder
+        "3": "pinhole0",   # cam3 is in pinhole0 folder
+        "6": "pinhole1",   # cam6 is in pinhole1 folder
+        "9": "pinhole2",   # cam9 is in pinhole2 folder
     }
 
     FISHEYE_CAMERAS = {
-        "2": "fisheye0",   # cam2
-        "5": "fisheye1",   # cam5
-        "8": "fisheye2",   # cam8
-        "11": "fisheye3",  # cam11
+        "2": "fisheye0",   # TODO: verify actual mapping
+        "5": "fisheye1",
+        "8": "fisheye2",
+        "11": "fisheye3",
     }
 
     # LiDAR to Camera pairing (from the example code)
