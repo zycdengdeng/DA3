@@ -52,10 +52,14 @@ def main():
 
     # Run inference
     print(f"Running inference with process_res={args.process_res}")
+    print(f"Image size: {img.shape[1]}x{img.shape[0]}")
+
     prediction = model.inference(
         image=[args.image],
         process_res=args.process_res,
     )
+
+    print(f"Model output depth range: [{prediction.depth[0].min():.6f}, {prediction.depth[0].max():.6f}]")
 
     depth = prediction.depth[0]  # (H, W)
     conf = prediction.conf[0] if prediction.conf is not None else None
