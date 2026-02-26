@@ -39,6 +39,16 @@ import numpy as np
 from scipy.interpolate import griddata
 from scipy.spatial import ConvexHull
 
+# Import SAM segmentation module (optional)
+try:
+    from depth_anything_3.utils.sam_segmentation import (
+        SAMGuidedMaskGenerator,
+        get_available_sam_backend,
+    )
+    SAM_INTEGRATION_AVAILABLE = True
+except ImportError:
+    SAM_INTEGRATION_AVAILABLE = False
+
 
 # Dynamic object categories (objects that move)
 DYNAMIC_CATEGORIES = {
@@ -382,6 +392,9 @@ class SemanticDepthCompleter:
 
     Separates dynamic objects from static background and completes
     depth independently for each region.
+
+    Supports SAM (Segment Anything Model) for precise object masks,
+    falling back to convex hull projection if SAM is unavailable.
     """
 
     def __init__(
@@ -390,6 +403,10 @@ class SemanticDepthCompleter:
         min_object_points: int = 5,
         use_da3_fallback: bool = True,
         bilateral_filter: bool = True,
+        use_sam: bool = True,
+        sam_backend: str = "auto",
+        sam_model_path: Optional[str] = None,
+        device: str = "cuda",
     ):
         """
         Initialize semantic depth completer.
@@ -399,11 +416,40 @@ class SemanticDepthCompleter:
             min_object_points: Minimum LiDAR points required per object
             use_da3_fallback: Use DA3 depth for objects with few LiDAR points
             bilateral_filter: Apply bilateral filter for smoothing
+            use_sam: Use SAM for precise object masks (recommended)
+            sam_backend: SAM backend ("auto", "sam", "sam2", "mobile_sam")
+            sam_model_path: Path to SAM model checkpoint
+            device: Device for SAM ("cuda" or "cpu")
         """
         self.max_depth = max_depth
         self.min_object_points = min_object_points
         self.use_da3_fallback = use_da3_fallback
         self.bilateral_filter = bilateral_filter
+
+        # Initialize SAM mask generator
+        self.sam_generator = None
+        self.use_sam = use_sam
+
+        if use_sam and SAM_INTEGRATION_AVAILABLE:
+            backend = get_available_sam_backend()
+            if backend is not None:
+                print(f"  Initializing SAM ({backend}) for precise object masks...")
+                self.sam_generator = SAMGuidedMaskGenerator(
+                    sam_backend=sam_backend,
+                    sam_model_path=sam_model_path,
+                    device=device,
+                    use_point_prompts=True,
+                )
+                if self.sam_generator.sam_available:
+                    print(f"  SAM ready: precise object segmentation enabled")
+                else:
+                    print(f"  SAM not available, using convex hull fallback")
+                    self.sam_generator = None
+            else:
+                print("  SAM not installed, using convex hull for object masks")
+                print("  Install SAM for better results: pip install sam2")
+        elif use_sam and not SAM_INTEGRATION_AVAILABLE:
+            print("  SAM integration not available, using convex hull")
 
     def complete(
         self,
@@ -449,22 +495,53 @@ class SemanticDepthCompleter:
             static_sparse, static_mask, rgb
         )
 
-        # Step 4: Process each dynamic object
+        # Step 4: Set up SAM if available
+        if self.sam_generator is not None and self.sam_generator.sam_available:
+            self.sam_generator.set_image(rgb)
+            using_sam = True
+            print("  Using SAM for precise object masks")
+        else:
+            using_sam = False
+            print("  Using convex hull for object masks")
+
+        # Step 5: Process each dynamic object
         object_info = {}
         for bbox in bboxes:
             if bbox.label not in DYNAMIC_CATEGORIES:
                 continue
 
+            # Get LiDAR points for this object (needed for SAM prompts)
+            obj_points = object_points.get(bbox.id, np.array([]))
+
+            # Get 2D projected points for SAM prompts
+            obj_points_2d = None
+            if len(obj_points) > 0:
+                obj_sparse_temp, obj_valid_temp = self._project_points_to_depth(
+                    obj_points, intrinsics, extrinsics, (H, W)
+                )
+                if obj_valid_temp.sum() > 0:
+                    v_coords, u_coords = np.where(obj_valid_temp)
+                    obj_points_2d = np.column_stack([u_coords, v_coords])
+
             # Get 2D mask for this object
-            obj_mask_2d = project_bbox_to_2d(
-                bbox, intrinsics, extrinsics, (H, W)
-            )
+            if using_sam:
+                # Use SAM with 3D bbox corners as guidance
+                corners_3d = bbox.get_corners()
+                obj_mask_2d = self.sam_generator.generate_mask(
+                    bbox_3d_corners=corners_3d,
+                    intrinsics=intrinsics,
+                    extrinsics=extrinsics,
+                    image_hw=(H, W),
+                    lidar_points_2d=obj_points_2d,
+                )
+            else:
+                # Fallback: convex hull projection
+                obj_mask_2d = project_bbox_to_2d(
+                    bbox, intrinsics, extrinsics, (H, W)
+                )
 
             if obj_mask_2d is None or obj_mask_2d.sum() < 10:
                 continue
-
-            # Get LiDAR points for this object
-            obj_points = object_points.get(bbox.id, np.array([]))
 
             if len(obj_points) >= self.min_object_points:
                 # Enough LiDAR points: interpolate within object region
@@ -488,7 +565,9 @@ class SemanticDepthCompleter:
                 object_info[bbox.id] = {
                     "label": bbox.label,
                     "n_points": len(obj_points),
-                    "method": "lidar_interp",
+                    "depth_method": "lidar_interp",
+                    "mask_method": "sam" if using_sam else "convex_hull",
+                    "mask_pixels": int(obj_mask_2d.sum()),
                 }
 
             elif da3_depth is not None and self.use_da3_fallback:
@@ -501,7 +580,9 @@ class SemanticDepthCompleter:
                 object_info[bbox.id] = {
                     "label": bbox.label,
                     "n_points": len(obj_points),
-                    "method": "da3_fallback",
+                    "depth_method": "da3_fallback",
+                    "mask_method": "sam" if using_sam else "convex_hull",
+                    "mask_pixels": int(obj_mask_2d.sum()),
                 }
             else:
                 # No points and no DA3: skip
@@ -511,12 +592,13 @@ class SemanticDepthCompleter:
             valid_obj = obj_mask_2d & (obj_depth > 0)
             dense_depth[valid_obj] = obj_depth[valid_obj]
 
-        # Step 5: Clamp to valid range
+        # Step 6: Clamp to valid range
         dense_depth = np.clip(dense_depth, 0, self.max_depth)
 
         info = {
             "n_objects": len(object_info),
             "n_static_points": len(static_points),
+            "mask_method": "sam" if using_sam else "convex_hull",
             "objects": object_info,
         }
 
