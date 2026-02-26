@@ -39,9 +39,18 @@ def main():
 
     os.makedirs(args.output, exist_ok=True)
 
-    # Load model
-    print(f"Loading model: {args.model}")
-    model = DepthAnything3(model_name=args.model)
+    # Load model with pretrained weights
+    # Map model name to HuggingFace repo
+    model_repo_map = {
+        "da3-giant": "depth-anything/DA3-GIANT",
+        "da3-large": "depth-anything/DA3-LARGE",
+        "da3-base": "depth-anything/DA3-BASE",
+        "da3-small": "depth-anything/DA3-SMALL",
+        "da3nested-giant-large": "depth-anything/DA3NESTED-GIANT-LARGE",
+    }
+    repo_id = model_repo_map.get(args.model.lower(), args.model)
+    print(f"Loading model from: {repo_id}")
+    model = DepthAnything3.from_pretrained(repo_id)
     model.to("cuda")
     model.eval()
 

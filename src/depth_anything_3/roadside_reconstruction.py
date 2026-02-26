@@ -133,8 +133,17 @@ class RoadsideReconstructor:
                 "and relying on LiDAR for metric scale."
             )
 
-        logger.info(f"Loading DA3 model: {model_name}")
-        self.model = DepthAnything3(model_name=model_name)
+        # Map model name to HuggingFace repo
+        model_repo_map = {
+            "da3-giant": "depth-anything/DA3-GIANT",
+            "da3-large": "depth-anything/DA3-LARGE",
+            "da3-base": "depth-anything/DA3-BASE",
+            "da3-small": "depth-anything/DA3-SMALL",
+            "da3nested-giant-large": "depth-anything/DA3NESTED-GIANT-LARGE",
+        }
+        repo_id = model_repo_map.get(model_name.lower(), model_name)
+        logger.info(f"Loading DA3 model from: {repo_id}")
+        self.model = DepthAnything3.from_pretrained(repo_id)
         self.model.to(device)
         self.model.eval()
 
