@@ -178,8 +178,8 @@ def main():
 
     # Override model if metric flag is set
     if args.metric:
-        args.model = "da3nested-giant-large"
-        print("Using metric depth model: da3nested-giant-large")
+        args.model = "da3nested-giant-large-1.1"
+        print("Using metric depth model: da3nested-giant-large-1.1")
 
     # Create output directory
     output_dir = os.path.join(args.output_dir, args.scene, args.timestamp)
@@ -197,6 +197,7 @@ def main():
         "da3-base": "depth-anything/DA3-BASE",
         "da3-small": "depth-anything/DA3-SMALL",
         "da3nested-giant-large": "depth-anything/DA3NESTED-GIANT-LARGE",
+        "da3nested-giant-large-1.1": "depth-anything/DA3NESTED-GIANT-LARGE-1.1",
         "da3metric-large": "depth-anything/DA3METRIC-LARGE",
     }
     repo_id = model_repo_map.get(args.model.lower(), args.model)
