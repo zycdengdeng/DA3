@@ -447,6 +447,462 @@ def create_sparse_depth_map(
     return sparse_depth, valid_mask
 
 
+def fit_ground_plane_ransac(
+    lidar_points: np.ndarray,  # (N, 3) world coordinates
+    height_threshold: float = 0.5,  # Only consider points near ground
+    n_iterations: int = 1000,
+    distance_threshold: float = 0.1,  # Inlier distance threshold (meters)
+    min_inlier_ratio: float = 0.3,
+) -> Tuple[np.ndarray, float, np.ndarray]:
+    """
+    Fit ground plane from LiDAR points using RANSAC.
+
+    Assumes ground is roughly horizontal (normal pointing up in Z).
+
+    Args:
+        lidar_points: LiDAR points in world coordinates (N, 3)
+        height_threshold: Only use points within this height range for fitting
+        n_iterations: Number of RANSAC iterations
+        distance_threshold: Distance threshold for inliers (meters)
+        min_inlier_ratio: Minimum ratio of inliers to accept fit
+
+    Returns:
+        plane_normal: (3,) unit normal vector of ground plane (pointing up)
+        plane_d: plane equation: normal.dot(point) + d = 0
+        inlier_mask: (N,) boolean mask of inlier points
+    """
+    # Filter points by height - assume ground is near the minimum Z
+    z_values = lidar_points[:, 2]
+    z_min = np.percentile(z_values, 5)  # 5th percentile as approximate ground
+    z_max = z_min + height_threshold
+
+    ground_candidates = (z_values >= z_min) & (z_values <= z_max)
+    candidate_points = lidar_points[ground_candidates]
+
+    if len(candidate_points) < 100:
+        # Not enough points, return default horizontal plane
+        print(f"  Warning: Only {len(candidate_points)} ground candidates, using default plane")
+        return np.array([0, 0, 1]), -z_min, np.zeros(len(lidar_points), dtype=bool)
+
+    print(f"  Ground candidates: {len(candidate_points)} points in Z=[{z_min:.2f}, {z_max:.2f}]")
+
+    rng = np.random.default_rng(42)
+    best_normal = np.array([0, 0, 1])
+    best_d = -z_min
+    best_inliers = np.zeros(len(candidate_points), dtype=bool)
+    best_score = 0
+
+    for _ in range(n_iterations):
+        # Sample 3 random points
+        indices = rng.choice(len(candidate_points), size=3, replace=False)
+        p1, p2, p3 = candidate_points[indices]
+
+        # Compute plane normal
+        v1 = p2 - p1
+        v2 = p3 - p1
+        normal = np.cross(v1, v2)
+        norm = np.linalg.norm(normal)
+        if norm < 1e-6:
+            continue
+        normal = normal / norm
+
+        # Ensure normal points up (positive Z)
+        if normal[2] < 0:
+            normal = -normal
+
+        # Check if plane is roughly horizontal (normal mostly in Z direction)
+        if abs(normal[2]) < 0.9:  # Allow ~25 degree tilt max
+            continue
+
+        # Compute d: normal.dot(p) + d = 0 => d = -normal.dot(p)
+        d = -np.dot(normal, p1)
+
+        # Count inliers
+        distances = np.abs(np.dot(candidate_points, normal) + d)
+        inliers = distances < distance_threshold
+        score = np.sum(inliers)
+
+        if score > best_score:
+            best_score = score
+            best_normal = normal
+            best_d = d
+            best_inliers = inliers
+
+    inlier_ratio = best_score / len(candidate_points)
+    print(f"  Ground plane: normal={best_normal}, d={best_d:.3f}")
+    print(f"  Inliers: {best_score}/{len(candidate_points)} ({inlier_ratio:.1%})")
+
+    # Convert inlier mask back to full point cloud
+    full_inlier_mask = np.zeros(len(lidar_points), dtype=bool)
+    full_inlier_mask[ground_candidates] = best_inliers
+
+    return best_normal, best_d, full_inlier_mask
+
+
+def compute_ground_depth_from_plane(
+    plane_normal: np.ndarray,  # (3,) ground plane normal
+    plane_d: float,  # plane equation constant
+    intrinsics: np.ndarray,  # (3, 3) camera intrinsics
+    extrinsics: np.ndarray,  # (4, 4) world-to-camera transform
+    image_hw: Tuple[int, int],
+    ground_mask: Optional[np.ndarray] = None,  # (H, W) optional mask of ground pixels
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Compute depth map for ground pixels by ray-plane intersection.
+
+    For each pixel, shoot a ray from camera and find intersection with ground plane.
+
+    Args:
+        plane_normal: Ground plane normal (pointing up)
+        plane_d: Plane equation constant (normal.dot(p) + d = 0)
+        intrinsics: Camera intrinsics (3, 3)
+        extrinsics: World-to-camera transformation (4, 4)
+        image_hw: Image size (H, W)
+        ground_mask: Optional mask indicating ground pixels
+
+    Returns:
+        ground_depth: (H, W) depth at ground plane (0 where not ground or invalid)
+        valid_mask: (H, W) boolean mask of valid ground depth pixels
+    """
+    H, W = image_hw
+
+    # Camera position in world coordinates
+    # extrinsics: p_cam = R @ p_world + t
+    # So: p_world = R^T @ (p_cam - t) = R^T @ p_cam - R^T @ t
+    # Camera center: p_cam = 0 => p_world = -R^T @ t
+    R = extrinsics[:3, :3]
+    t = extrinsics[:3, 3]
+    R_inv = R.T
+    cam_center = -R_inv @ t  # Camera position in world coords
+
+    # Intrinsics
+    fx, fy = intrinsics[0, 0], intrinsics[1, 1]
+    cx, cy = intrinsics[0, 2], intrinsics[1, 2]
+
+    # Create pixel grid
+    u, v = np.meshgrid(np.arange(W), np.arange(H))
+    u = u.astype(np.float32)
+    v = v.astype(np.float32)
+
+    # Ray direction in camera coordinates (normalized)
+    ray_cam_x = (u - cx) / fx
+    ray_cam_y = (v - cy) / fy
+    ray_cam_z = np.ones_like(u)
+
+    # Stack and normalize
+    ray_cam = np.stack([ray_cam_x, ray_cam_y, ray_cam_z], axis=-1)  # (H, W, 3)
+    ray_cam = ray_cam / np.linalg.norm(ray_cam, axis=-1, keepdims=True)
+
+    # Transform ray direction to world coordinates
+    # ray_world = R^T @ ray_cam
+    ray_world = np.einsum('ij,hwj->hwi', R_inv, ray_cam)  # (H, W, 3)
+
+    # Ray-plane intersection
+    # Ray: p = cam_center + t * ray_dir
+    # Plane: normal.dot(p) + d = 0
+    # => normal.dot(cam_center + t * ray_dir) + d = 0
+    # => t = -(normal.dot(cam_center) + d) / normal.dot(ray_dir)
+
+    numerator = -(np.dot(plane_normal, cam_center) + plane_d)
+    denominator = np.einsum('i,hwi->hw', plane_normal, ray_world)  # (H, W)
+
+    # Avoid division by zero (ray parallel to plane)
+    valid = np.abs(denominator) > 1e-6
+
+    # Compute intersection distance (in world coordinates along ray)
+    t_intersect = np.zeros((H, W), dtype=np.float32)
+    t_intersect[valid] = numerator / denominator[valid]
+
+    # Convert to camera depth (Z in camera coordinates)
+    # Intersection point in world: p_world = cam_center + t * ray_world
+    # In camera coords: p_cam = R @ p_world + t_ext
+    # We want depth = p_cam[2]
+
+    # Simpler: depth = t_intersect * cos(angle between ray and optical axis)
+    # For normalized ray_cam: depth = t_intersect * ray_cam_z / ||ray_cam||
+    # Since ray_cam_z = 1 before normalization:
+    ray_cam_unnorm = np.stack([ray_cam_x, ray_cam_y, ray_cam_z], axis=-1)
+    ray_length = np.linalg.norm(ray_cam_unnorm, axis=-1)
+
+    ground_depth = np.zeros((H, W), dtype=np.float32)
+    ground_depth[valid] = t_intersect[valid] / ray_length[valid]
+
+    # Filter invalid depths (behind camera or too far)
+    valid = valid & (ground_depth > 0.1) & (ground_depth < 500)
+
+    # Apply ground mask if provided
+    if ground_mask is not None:
+        valid = valid & ground_mask
+
+    ground_depth = np.where(valid, ground_depth, 0)
+
+    return ground_depth, valid
+
+
+def ground_constrained_depth_fusion(
+    camera_depth: np.ndarray,  # (H, W) camera depth (aligned)
+    lidar_points: np.ndarray,  # (N, 3) world coordinates
+    intrinsics: np.ndarray,  # (3, 3)
+    extrinsics: np.ndarray,  # (4, 4) w2c
+    ground_mask: Optional[np.ndarray] = None,  # (H, W) semantic ground mask
+    estimate_ground_from_image: bool = True,  # Estimate ground from image position
+    ground_height_tolerance: float = 0.3,  # Tolerance for ground plane (meters)
+    blend_width: float = 5.0,  # Pixels to blend at ground boundary
+) -> Tuple[np.ndarray, np.ndarray, dict]:
+    """
+    Fuse camera depth with ground plane constraint.
+
+    Key insight: Ground is flat, so we can use LiDAR to fit a ground plane
+    and then compute exact depth for ground pixels.
+
+    Args:
+        camera_depth: Camera aligned depth (H, W)
+        lidar_points: LiDAR point cloud in world coordinates
+        intrinsics: Camera intrinsics (3, 3)
+        extrinsics: World-to-camera transformation (4, 4)
+        ground_mask: Optional semantic segmentation mask for ground
+        estimate_ground_from_image: If True and no ground_mask, estimate ground
+                                    from image position (lower part = ground)
+        ground_height_tolerance: Height tolerance for ground plane fitting
+        blend_width: Width of blending region at ground/non-ground boundary
+
+    Returns:
+        fused_depth: (H, W) fused depth with ground constraint
+        ground_mask_used: (H, W) actual ground mask used
+        info: Dict with fitting info (plane_normal, plane_d, etc.)
+    """
+    from scipy.ndimage import gaussian_filter, binary_erosion, binary_dilation
+
+    H, W = camera_depth.shape
+
+    # Step 1: Fit ground plane from LiDAR
+    print("Fitting ground plane from LiDAR...")
+    plane_normal, plane_d, lidar_ground_mask = fit_ground_plane_ransac(
+        lidar_points,
+        height_threshold=ground_height_tolerance * 3,
+        distance_threshold=ground_height_tolerance,
+    )
+
+    # Step 2: Compute ground depth from plane
+    print("Computing ground depth from plane intersection...")
+    ground_depth, valid_ground = compute_ground_depth_from_plane(
+        plane_normal, plane_d, intrinsics, extrinsics, (H, W)
+    )
+
+    # Step 3: Determine ground mask
+    if ground_mask is not None:
+        # Use provided semantic mask
+        ground_mask_used = ground_mask.astype(bool)
+        print(f"Using provided ground mask: {ground_mask_used.sum()} pixels")
+    elif estimate_ground_from_image:
+        # Estimate ground from image position + depth consistency
+        # Ground is typically in lower part of image and has consistent depth with plane
+
+        # Heuristic: lower 60% of image is potential ground
+        v_grid = np.arange(H).reshape(-1, 1)
+        position_ground = v_grid > (H * 0.4)  # Lower 60%
+        position_ground = np.broadcast_to(position_ground, (H, W))
+
+        # Check depth consistency with ground plane
+        depth_diff = np.abs(camera_depth - ground_depth)
+        depth_consistent = (depth_diff < ground_height_tolerance * 2) & (ground_depth > 0)
+
+        # Combine: position + depth consistency
+        ground_mask_used = position_ground & depth_consistent & valid_ground
+
+        # Clean up mask
+        ground_mask_used = binary_erosion(ground_mask_used, iterations=2)
+        ground_mask_used = binary_dilation(ground_mask_used, iterations=2)
+
+        print(f"Estimated ground mask: {ground_mask_used.sum()} pixels ({ground_mask_used.mean():.1%})")
+    else:
+        # No ground mask, use all valid ground depth
+        ground_mask_used = valid_ground
+        print(f"Using all valid ground: {ground_mask_used.sum()} pixels")
+
+    # Step 4: Create blending weights
+    # Smooth transition at ground boundary
+    ground_weight = ground_mask_used.astype(np.float32)
+    if blend_width > 0:
+        ground_weight = gaussian_filter(ground_weight, sigma=blend_width)
+
+    # Step 5: Fuse depths
+    # Where we have valid ground depth and ground mask, blend towards ground depth
+    fused_depth = camera_depth.copy()
+
+    valid_fusion = (ground_depth > 0.1) & (camera_depth > 0.1)
+    fused_depth = np.where(
+        valid_fusion,
+        ground_weight * ground_depth + (1 - ground_weight) * camera_depth,
+        camera_depth
+    )
+
+    # Compute stats
+    if valid_fusion.any():
+        depth_correction = ground_depth[valid_fusion] - camera_depth[valid_fusion]
+        print(f"Ground depth correction: mean={depth_correction.mean():.3f}m, "
+              f"std={depth_correction.std():.3f}m")
+
+    info = {
+        'plane_normal': plane_normal,
+        'plane_d': plane_d,
+        'n_ground_pixels': int(ground_mask_used.sum()),
+        'ground_coverage': float(ground_mask_used.mean()),
+    }
+
+    return fused_depth, ground_mask_used.astype(np.float32), info
+
+
+def lidar_anchored_depth(
+    camera_depth: np.ndarray,  # (H, W) raw camera relative depth (NOT aligned)
+    lidar_points: np.ndarray,  # (N, 3) world coordinates - THE GROUND TRUTH
+    intrinsics: np.ndarray,  # (3, 3)
+    extrinsics: np.ndarray,  # (4, 4) w2c
+    use_ground_plane: bool = True,  # Use ground plane for large-area anchoring
+    ground_height_tolerance: float = 0.3,
+    local_scale_radius: int = 50,  # Radius for local scale estimation
+) -> Tuple[np.ndarray, np.ndarray, dict]:
+    """
+    LiDAR-anchored depth estimation.
+
+    Philosophy: LiDAR points are GROUND TRUTH. Use them as anchors, fill gaps with camera.
+
+    Priority:
+    1. LiDAR projection points → Direct LiDAR depth (absolute truth)
+    2. Ground pixels → Depth from LiDAR-fitted ground plane (geometric truth)
+    3. Other pixels → Camera depth with LOCAL scale correction (based on nearby LiDAR)
+
+    Args:
+        camera_depth: Raw camera depth (relative, not yet aligned)
+        lidar_points: LiDAR point cloud in world coordinates (THE ANCHOR)
+        intrinsics: Camera intrinsics
+        extrinsics: World-to-camera transformation
+        use_ground_plane: Whether to use ground plane constraint
+        ground_height_tolerance: Tolerance for ground plane fitting
+        local_scale_radius: Radius (pixels) for local scale estimation
+
+    Returns:
+        anchored_depth: (H, W) depth anchored to LiDAR
+        source_map: (H, W) 0=camera, 1=lidar, 2=ground_plane
+        info: Dict with statistics
+    """
+    from scipy.ndimage import gaussian_filter, distance_transform_edt
+
+    H, W = camera_depth.shape
+    anchored_depth = np.zeros((H, W), dtype=np.float32)
+    source_map = np.zeros((H, W), dtype=np.uint8)  # 0=camera, 1=lidar, 2=ground
+
+    # ========== Step 1: Project LiDAR to image ==========
+    print("Step 1: Projecting LiDAR points...")
+    sparse_lidar, lidar_mask = create_sparse_depth_map(
+        lidar_points, intrinsics, extrinsics, (H, W)
+    )
+    n_lidar_pixels = lidar_mask.sum()
+    print(f"  LiDAR coverage: {n_lidar_pixels} pixels ({n_lidar_pixels/(H*W)*100:.2f}%)")
+
+    # Use LiDAR directly where available
+    anchored_depth[lidar_mask] = sparse_lidar[lidar_mask]
+    source_map[lidar_mask] = 1
+
+    # ========== Step 2: Ground plane (optional) ==========
+    ground_depth = None
+    ground_mask = None
+    plane_info = {}
+
+    if use_ground_plane:
+        print("Step 2: Fitting ground plane...")
+        plane_normal, plane_d, _ = fit_ground_plane_ransac(
+            lidar_points,
+            height_threshold=ground_height_tolerance * 3,
+            distance_threshold=ground_height_tolerance,
+        )
+        plane_info = {'plane_normal': plane_normal, 'plane_d': plane_d}
+
+        # Compute ground depth for all pixels
+        ground_depth, valid_ground = compute_ground_depth_from_plane(
+            plane_normal, plane_d, intrinsics, extrinsics, (H, W)
+        )
+
+        # Estimate ground region: lower part of image where camera depth matches ground
+        # First, compute global scale from LiDAR
+        if lidar_mask.sum() > 50:
+            lidar_depths = sparse_lidar[lidar_mask]
+            camera_at_lidar = camera_depth[lidar_mask]
+            valid = camera_at_lidar > 0.01
+            if valid.sum() > 20:
+                global_scale = np.median(lidar_depths[valid] / camera_at_lidar[valid])
+                camera_scaled = camera_depth * global_scale
+
+                # Ground = where scaled camera depth matches ground plane depth
+                v_grid = np.arange(H).reshape(-1, 1)
+                lower_half = v_grid > (H * 0.35)
+                lower_half = np.broadcast_to(lower_half, (H, W))
+
+                depth_match = np.abs(camera_scaled - ground_depth) < ground_height_tolerance
+                ground_mask = lower_half & depth_match & valid_ground & (~lidar_mask)
+
+                # Use ground plane depth
+                anchored_depth[ground_mask] = ground_depth[ground_mask]
+                source_map[ground_mask] = 2
+
+                n_ground = ground_mask.sum()
+                print(f"  Ground plane coverage: {n_ground} pixels ({n_ground/(H*W)*100:.2f}%)")
+
+    # ========== Step 3: Fill remaining with locally-scaled camera depth ==========
+    print("Step 3: Filling gaps with locally-scaled camera depth...")
+    remaining = (source_map == 0) & (camera_depth > 0.01)
+
+    if remaining.any():
+        # Compute distance to nearest LiDAR point
+        anchor_mask = (source_map > 0)  # LiDAR or ground
+        dist_to_anchor = distance_transform_edt(~anchor_mask)
+
+        # For each remaining pixel, estimate local scale from nearby anchors
+        # Use a smoothed scale field for efficiency
+
+        # Create scale field: at anchor pixels, scale = anchor_depth / camera_depth
+        scale_field = np.ones((H, W), dtype=np.float32)
+        anchor_with_camera = anchor_mask & (camera_depth > 0.01)
+        if anchor_with_camera.sum() > 10:
+            scale_field[anchor_with_camera] = (
+                anchored_depth[anchor_with_camera] / camera_depth[anchor_with_camera]
+            )
+
+            # Smooth and propagate scale
+            # Weight by inverse distance to anchors
+            weight_field = np.exp(-dist_to_anchor / local_scale_radius)
+            weight_field[anchor_with_camera] = 1.0
+
+            # Weighted smoothing of scale
+            scale_sum = gaussian_filter(scale_field * weight_field, sigma=local_scale_radius)
+            weight_sum = gaussian_filter(weight_field, sigma=local_scale_radius)
+            smoothed_scale = scale_sum / (weight_sum + 1e-6)
+
+            # Apply local scale to remaining pixels
+            anchored_depth[remaining] = camera_depth[remaining] * smoothed_scale[remaining]
+        else:
+            # Fallback: global scale
+            if lidar_mask.sum() > 10:
+                global_scale = np.median(
+                    sparse_lidar[lidar_mask] / camera_depth[lidar_mask]
+                )
+            else:
+                global_scale = 1.0
+            anchored_depth[remaining] = camera_depth[remaining] * global_scale
+
+    n_camera = (source_map == 0).sum()
+    print(f"  Camera-filled: {n_camera} pixels ({n_camera/(H*W)*100:.2f}%)")
+
+    info = {
+        'n_lidar': int(n_lidar_pixels),
+        'n_ground': int(ground_mask.sum()) if ground_mask is not None else 0,
+        'n_camera': int(n_camera),
+        **plane_info,
+    }
+
+    return anchored_depth, source_map, info
+
+
 def compute_lidar_density_map(
     lidar_points: np.ndarray,  # (N, 3) world coordinates
     intrinsics: np.ndarray,  # (3, 3)

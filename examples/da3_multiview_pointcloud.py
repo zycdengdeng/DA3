@@ -32,7 +32,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from depth_anything_3.api import DepthAnything3
 from depth_anything_3.datasets.car_road_dataset import CarRoadDatasetLoader
-from depth_anything_3.utils.lidar_alignment import adaptive_depth_fusion
+from depth_anything_3.utils.lidar_alignment import (
+    adaptive_depth_fusion,
+    lidar_anchored_depth,
+)
 
 
 def project_lidar_to_camera(
@@ -384,6 +387,11 @@ def main():
     parser.add_argument("--adaptive_fusion", action="store_true",
                         help="Enable adaptive camera/LiDAR fusion. Uses LiDAR where it's dense, "
                              "camera where LiDAR is sparse. Improves intersection center quality.")
+    parser.add_argument("--lidar_anchored", action="store_true",
+                        help="Use LiDAR-anchored depth: LiDAR as ground truth, ground plane "
+                             "constraint, camera only fills gaps. RECOMMENDED for best quality.")
+    parser.add_argument("--use_ground_plane", action="store_true", default=True,
+                        help="Enable ground plane constraint (default: True)")
     parser.add_argument("--density_sigma", type=float, default=15.0,
                         help="Density smoothing sigma for adaptive fusion (default: 15)")
     parser.add_argument("--distance_threshold", type=float, default=30.0,
@@ -496,44 +504,60 @@ def main():
         K = intrinsics_all[i]  # (3, 3)
         E = extrinsics_all[i]  # (4, 4)
 
-        # LiDAR alignment if enabled
+        # LiDAR-based depth processing
         if lidar_points is not None:
-            print(f"Aligning depth with LiDAR (method={args.align_method})...")
-            lidar_uv, lidar_depths = project_lidar_to_camera(
-                lidar_points, K, E, img.shape[1], img.shape[0]
-            )
-            print(f"  Projected {len(lidar_uv)} LiDAR points to camera")
-
-            # Build depth range if specified
-            depth_range = None
-            if args.align_depth_min is not None or args.align_depth_max is not None:
-                depth_range = (
-                    args.align_depth_min if args.align_depth_min else 0.0,
-                    args.align_depth_max if args.align_depth_max else 1000.0,
-                )
-
-            depth_resized, scale, shift = align_depth_with_lidar(
-                depth_resized, lidar_uv, lidar_depths,
-                method=args.align_method,
-                depth_range=depth_range,
-            )
-            print(f"  Aligned depth range: [{depth_resized.min():.4f}, {depth_resized.max():.4f}]")
-
-            # Adaptive fusion: use LiDAR where dense, camera where sparse
-            if args.adaptive_fusion:
-                print(f"Applying adaptive camera/LiDAR fusion...")
-                fused_depth, lidar_weight, _ = adaptive_depth_fusion(
-                    camera_depth=depth_resized,
+            if args.lidar_anchored:
+                # NEW: LiDAR-anchored depth (recommended)
+                # LiDAR = ground truth, ground plane = geometric truth, camera fills gaps
+                print(f"Using LiDAR-anchored depth (ground_plane={args.use_ground_plane})...")
+                depth_resized, source_map, info = lidar_anchored_depth(
+                    camera_depth=depth_resized,  # Raw relative depth
                     lidar_points=lidar_points,
                     intrinsics=K,
                     extrinsics=E,
-                    camera_confidence=conf_resized,
-                    density_sigma=args.density_sigma,
-                    distance_threshold=args.distance_threshold,
+                    use_ground_plane=args.use_ground_plane,
                 )
-                depth_resized = fused_depth
-                print(f"  LiDAR weight: mean={lidar_weight.mean():.2%}, max={lidar_weight.max():.2%}")
-                print(f"  Fused depth range: [{depth_resized.min():.4f}, {depth_resized.max():.4f}]")
+                print(f"  Source: LiDAR={info['n_lidar']}, Ground={info['n_ground']}, Camera={info['n_camera']}")
+                print(f"  Anchored depth range: [{depth_resized.min():.4f}, {depth_resized.max():.4f}]")
+
+            else:
+                # Original: scale alignment + optional adaptive fusion
+                print(f"Aligning depth with LiDAR (method={args.align_method})...")
+                lidar_uv, lidar_depths = project_lidar_to_camera(
+                    lidar_points, K, E, img.shape[1], img.shape[0]
+                )
+                print(f"  Projected {len(lidar_uv)} LiDAR points to camera")
+
+                # Build depth range if specified
+                depth_range = None
+                if args.align_depth_min is not None or args.align_depth_max is not None:
+                    depth_range = (
+                        args.align_depth_min if args.align_depth_min else 0.0,
+                        args.align_depth_max if args.align_depth_max else 1000.0,
+                    )
+
+                depth_resized, scale, shift = align_depth_with_lidar(
+                    depth_resized, lidar_uv, lidar_depths,
+                    method=args.align_method,
+                    depth_range=depth_range,
+                )
+                print(f"  Aligned depth range: [{depth_resized.min():.4f}, {depth_resized.max():.4f}]")
+
+                # Adaptive fusion: use LiDAR where dense, camera where sparse
+                if args.adaptive_fusion:
+                    print(f"Applying adaptive camera/LiDAR fusion...")
+                    fused_depth, lidar_weight, _ = adaptive_depth_fusion(
+                        camera_depth=depth_resized,
+                        lidar_points=lidar_points,
+                        intrinsics=K,
+                        extrinsics=E,
+                        camera_confidence=conf_resized,
+                        density_sigma=args.density_sigma,
+                        distance_threshold=args.distance_threshold,
+                    )
+                    depth_resized = fused_depth
+                    print(f"  LiDAR weight: mean={lidar_weight.mean():.2%}, max={lidar_weight.max():.2%}")
+                    print(f"  Fused depth range: [{depth_resized.min():.4f}, {depth_resized.max():.4f}]")
 
         print(f"Using calibrated intrinsics:\n{K}")
         print(f"Using calibrated extrinsics (w2c):\n{E}")
