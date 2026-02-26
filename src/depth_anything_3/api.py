@@ -122,9 +122,14 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
         Returns:
             Dictionary containing model predictions
         """
-        # Determine optimal autocast dtype
+        # Determine optimal autocast dtype (can be disabled via DA3_DISABLE_AUTOCAST=1)
+        disable_autocast = os.environ.get("DA3_DISABLE_AUTOCAST", "0") == "1"
         autocast_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
         with torch.no_grad():
+            if disable_autocast:
+                return self.model(
+                    image, extrinsics, intrinsics, export_feat_layers, infer_gs, use_ray_pose, ref_view_strategy
+                )
             with torch.autocast(device_type=image.device.type, dtype=autocast_dtype):
                 return self.model(
                     image, extrinsics, intrinsics, export_feat_layers, infer_gs, use_ray_pose, ref_view_strategy
