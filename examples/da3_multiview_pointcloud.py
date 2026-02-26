@@ -32,6 +32,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from depth_anything_3.api import DepthAnything3
 from depth_anything_3.datasets.car_road_dataset import CarRoadDatasetLoader
+from depth_anything_3.utils.lidar_alignment import adaptive_depth_fusion
 
 
 def project_lidar_to_camera(
@@ -380,6 +381,13 @@ def main():
                         help="Max view angle from optical axis (degrees). "
                              "Filters peripheral noise. Try 50-70 for roadside. Default: 90 (no filter)")
     parser.add_argument("--depth_scale", type=float, default=1.0, help="Manual depth scale")
+    parser.add_argument("--adaptive_fusion", action="store_true",
+                        help="Enable adaptive camera/LiDAR fusion. Uses LiDAR where it's dense, "
+                             "camera where LiDAR is sparse. Improves intersection center quality.")
+    parser.add_argument("--density_sigma", type=float, default=15.0,
+                        help="Density smoothing sigma for adaptive fusion (default: 15)")
+    parser.add_argument("--distance_threshold", type=float, default=30.0,
+                        help="Distance (m) to start boosting LiDAR weight (default: 30)")
     args = parser.parse_args()
 
     if args.lidar_align:
@@ -510,6 +518,22 @@ def main():
                 depth_range=depth_range,
             )
             print(f"  Aligned depth range: [{depth_resized.min():.4f}, {depth_resized.max():.4f}]")
+
+            # Adaptive fusion: use LiDAR where dense, camera where sparse
+            if args.adaptive_fusion:
+                print(f"Applying adaptive camera/LiDAR fusion...")
+                fused_depth, lidar_weight, _ = adaptive_depth_fusion(
+                    camera_depth=depth_resized,
+                    lidar_points=lidar_points,
+                    intrinsics=K,
+                    extrinsics=E,
+                    camera_confidence=conf_resized,
+                    density_sigma=args.density_sigma,
+                    distance_threshold=args.distance_threshold,
+                )
+                depth_resized = fused_depth
+                print(f"  LiDAR weight: mean={lidar_weight.mean():.2%}, max={lidar_weight.max():.2%}")
+                print(f"  Fused depth range: [{depth_resized.min():.4f}, {depth_resized.max():.4f}]")
 
         print(f"Using calibrated intrinsics:\n{K}")
         print(f"Using calibrated extrinsics (w2c):\n{E}")
