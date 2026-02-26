@@ -40,6 +40,10 @@ from depth_anything_3.utils.depth_completion import (
     DepthCompleter,
     create_sparse_depth_from_lidar,
 )
+from depth_anything_3.utils.semantic_depth_completion import (
+    SemanticDepthCompleter,
+    load_annotations,
+)
 
 
 def project_lidar_to_camera(
@@ -397,12 +401,15 @@ def main():
     parser.add_argument("--use_ground_plane", action="store_true", default=True,
                         help="Enable ground plane constraint (default: True)")
     parser.add_argument("--depth_completion", type=str, default=None,
-                        choices=["completionformer", "simple"],
+                        choices=["completionformer", "simple", "semantic"],
                         help="Use depth completion network instead of DA3. "
                              "Input: sparse LiDAR + RGB -> Output: dense metric depth. "
-                             "Recommended: 'completionformer' for best quality, 'simple' as fallback.")
+                             "'simple': basic interpolation, 'semantic': use 3D bbox annotations "
+                             "to separate dynamic/static objects (best for roadside).")
     parser.add_argument("--completion_model", type=str, default=None,
                         help="Path to depth completion model weights")
+    parser.add_argument("--annotation_path", type=str, default=None,
+                        help="Path to 3D bbox annotation JSON file (for semantic depth completion)")
     parser.add_argument("--density_sigma", type=float, default=15.0,
                         help="Density smoothing sigma for adaptive fusion (default: 15)")
     parser.add_argument("--distance_threshold", type=float, default=30.0,
@@ -423,17 +430,52 @@ def main():
     # Initialize depth estimation model
     model = None
     depth_completer = None
+    semantic_completer = None
+    annotation_bboxes = None
     is_metric = False
 
     if args.depth_completion:
         # Use depth completion network (sparse LiDAR + RGB -> dense depth)
         print(f"\nUsing depth completion: {args.depth_completion}")
-        depth_completer = DepthCompleter(
-            method=args.depth_completion,
-            model_path=args.completion_model,
-            device="cuda",
-            max_depth=args.max_depth,
-        )
+
+        if args.depth_completion == "semantic":
+            # Semantic-guided depth completion using 3D bbox annotations
+            if not args.annotation_path:
+                # Try to find annotation automatically
+                annotation_path = os.path.join(
+                    args.data_root, args.scene, "road_labels",
+                    "interpolation_labels", f"{args.timestamp}.json"
+                )
+                if not os.path.exists(annotation_path):
+                    annotation_path = os.path.join(
+                        args.data_root, args.scene, "road_labels",
+                        "ori_labels", f"{args.timestamp}.json"
+                    )
+            else:
+                annotation_path = args.annotation_path
+
+            if os.path.exists(annotation_path):
+                print(f"Loading annotations: {annotation_path}")
+                annotation_bboxes = load_annotations(annotation_path)
+                print(f"  Loaded {len(annotation_bboxes)} bounding boxes")
+            else:
+                print(f"WARNING: Annotation file not found: {annotation_path}")
+                print("  Falling back to 'simple' depth completion")
+                args.depth_completion = "simple"
+
+            semantic_completer = SemanticDepthCompleter(
+                max_depth=args.max_depth,
+                min_object_points=5,
+                use_da3_fallback=False,  # No DA3 in this mode
+                bilateral_filter=True,
+            )
+        else:
+            depth_completer = DepthCompleter(
+                method=args.depth_completion,
+                model_path=args.completion_model,
+                device="cuda",
+                max_depth=args.max_depth,
+            )
         is_metric = True  # Depth completion outputs metric depth
         print("Depth completion outputs METRIC depth (no alignment needed)")
     else:
@@ -512,7 +554,30 @@ def main():
         conf = None
         conf_resized = None
 
-        if depth_completer is not None:
+        if semantic_completer is not None and annotation_bboxes is not None:
+            # Semantic-guided depth completion mode
+            print(f"Running semantic depth completion...")
+
+            if lidar_points is None:
+                print("ERROR: Semantic depth completion requires LiDAR! Use --lidar_align")
+                return
+
+            # Complete depth using 3D bbox separation
+            depth_resized, info = semantic_completer.complete(
+                rgb=img_rgb,
+                lidar_points=lidar_points,
+                bboxes=annotation_bboxes,
+                intrinsics=K,
+                extrinsics=E,
+                da3_depth=None,  # No DA3 fallback
+            )
+            print(f"  Objects: {info['n_objects']}, Static points: {info['n_static_points']}")
+            print(f"  Completed depth range: [{depth_resized.min():.2f}, {depth_resized.max():.2f}]m")
+
+            # Skip further LiDAR processing (already metric)
+            lidar_points_for_camera = None
+
+        elif depth_completer is not None:
             # Depth completion mode: sparse LiDAR + RGB -> dense depth
             print(f"Running depth completion ({args.depth_completion})...")
 
