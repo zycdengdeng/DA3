@@ -184,10 +184,20 @@ class RoadsideReconstructor:
         depth_maps = {}
         confidence_maps = {}
         processed_images = {}
+        scaled_intrinsics = {}  # Store intrinsics scaled to processing resolution
 
         for cam_idx in range(N):
             cam_id = f"cam_{cam_idx}"
             logger.info(f"Processing camera {cam_idx + 1}/{N}")
+
+            # Load image to get original size
+            if isinstance(images[cam_idx], str):
+                img = Image.open(images[cam_idx])
+                orig_w, orig_h = img.size
+            elif isinstance(images[cam_idx], np.ndarray):
+                orig_h, orig_w = images[cam_idx].shape[:2]
+            else:
+                orig_w, orig_h = images[cam_idx].size
 
             # Run DA3 inference
             prediction = self.model.inference(
@@ -198,6 +208,16 @@ class RoadsideReconstructor:
             depth_maps[cam_id] = prediction.depth[0]  # (H, W)
             confidence_maps[cam_id] = prediction.conf[0]  # (H, W)
             processed_images[cam_id] = prediction.processed_images[0]  # (H, W, 3)
+
+            # Compute scaled intrinsics for processing resolution
+            proc_h, proc_w = depth_maps[cam_id].shape[:2]
+            scale_x = proc_w / orig_w
+            scale_y = proc_h / orig_h
+            K_scaled = intrinsics[cam_idx].copy()
+            K_scaled[0, :] *= scale_x  # fx, cx
+            K_scaled[1, :] *= scale_y  # fy, cy
+            scaled_intrinsics[cam_id] = K_scaled
+            logger.info(f"  Original: {orig_w}x{orig_h} -> Processing: {proc_w}x{proc_h}, scale: ({scale_x:.3f}, {scale_y:.3f})")
 
         # Step 2: LiDAR alignment for metric scale
         alignment_results = {}
@@ -216,10 +236,11 @@ class RoadsideReconstructor:
                 logger.info(f"Aligning camera {cam_idx} with LiDAR {lidar_idx}")
 
                 try:
+                    # Use scaled intrinsics that match the processing resolution
                     result = align_depth_with_lidar(
                         predicted_depth=depth_maps[cam_id],
                         lidar_points=lidar_points[lidar_idx],
-                        intrinsics=intrinsics[cam_idx],
+                        intrinsics=scaled_intrinsics[cam_id],  # Use scaled intrinsics!
                         extrinsics=extrinsics[cam_idx],
                         confidence=confidence_maps[cam_id],
                         use_ransac=use_ransac,
@@ -262,12 +283,12 @@ class RoadsideReconstructor:
             # Compute confidence threshold
             conf_thresh = np.percentile(conf[conf > 0], conf_threshold_percentile)
 
-            # Create point cloud
+            # Create point cloud using scaled intrinsics
             points, point_colors = self._depth_to_pointcloud(
                 depth=depth,
                 confidence=conf,
                 rgb=rgb,
-                intrinsics=intrinsics[cam_idx],
+                intrinsics=scaled_intrinsics[cam_id],  # Use scaled intrinsics!
                 extrinsics=extrinsics[cam_idx],
                 conf_threshold=conf_thresh,
                 max_points=max_points_per_camera,
