@@ -333,8 +333,8 @@ def main():
 
     # Get merged LiDAR points if available
     lidar_points = None
-    if args.lidar_align and scene_data.merged_lidar is not None:
-        lidar_points = scene_data.merged_lidar[:, :3]  # (N, 3) xyz
+    if args.lidar_align and scene_data.merged_points is not None:
+        lidar_points = scene_data.merged_points[:, :3]  # (N, 3) xyz
         print(f"Loaded merged LiDAR: {len(lidar_points):,} points")
 
     available_cameras = sorted(scene_data.images.keys())
