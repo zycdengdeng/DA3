@@ -515,7 +515,7 @@ def adaptive_depth_fusion(
     min_lidar_weight: float = 0.0,  # Minimum weight for LiDAR
     max_lidar_weight: float = 0.95,  # Maximum weight for LiDAR (never fully 1.0)
     distance_boost: bool = True,  # Boost LiDAR weight at larger distances
-    distance_threshold: float = 50.0,  # Distance (m) at which to start boosting LiDAR
+    distance_threshold: float = 30.0,  # Distance (m) at which to start boosting LiDAR
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Adaptive fusion of camera depth and LiDAR depth based on local LiDAR density.
