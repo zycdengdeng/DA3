@@ -445,3 +445,186 @@ def create_sparse_depth_map(
         sparse_depth = maximum_filter(sparse_depth, size=dilation_kernel) * valid_mask
 
     return sparse_depth, valid_mask
+
+
+def compute_lidar_density_map(
+    lidar_points: np.ndarray,  # (N, 3) world coordinates
+    intrinsics: np.ndarray,  # (3, 3)
+    extrinsics: np.ndarray,  # (4, 4) w2c
+    image_hw: Tuple[int, int],
+    kernel_size: int = 31,  # Size of local window for density estimation
+    sigma: float = 10.0,  # Gaussian blur sigma
+) -> np.ndarray:
+    """
+    Compute local LiDAR point density map.
+
+    This creates a smooth density map indicating how many LiDAR points
+    are available in local neighborhoods. High density regions should
+    rely more on LiDAR, low density regions on camera depth.
+
+    Args:
+        lidar_points: LiDAR points in world coordinates (N, 3)
+        intrinsics: Camera intrinsics (3, 3)
+        extrinsics: World-to-camera transformation (4, 4)
+        image_hw: Image size (H, W)
+        kernel_size: Size of kernel for density smoothing
+        sigma: Gaussian blur sigma for smooth density
+
+    Returns:
+        density_map: Normalized density map (H, W), values in [0, 1]
+    """
+    from scipy.ndimage import gaussian_filter
+
+    H, W = image_hw
+    count_map = np.zeros((H, W), dtype=np.float32)
+
+    # Project LiDAR points to image
+    pixel_coords, depths, _ = project_lidar_to_image(
+        lidar_points, intrinsics, extrinsics, image_hw
+    )
+
+    if len(depths) == 0:
+        return count_map
+
+    # Count points per pixel
+    u = pixel_coords[:, 0].astype(int)
+    v = pixel_coords[:, 1].astype(int)
+    np.add.at(count_map, (v, u), 1)
+
+    # Smooth with Gaussian to get local density
+    density_map = gaussian_filter(count_map, sigma=sigma)
+
+    # Normalize to [0, 1] using a soft threshold
+    # This determines how many points per area = "dense"
+    # Tune this based on typical LiDAR density
+    density_threshold = 0.1  # Points per pixel after smoothing
+    density_map = np.clip(density_map / density_threshold, 0, 1)
+
+    return density_map
+
+
+def adaptive_depth_fusion(
+    camera_depth: np.ndarray,  # (H, W) aligned camera depth
+    lidar_points: np.ndarray,  # (N, 3) world coordinates
+    intrinsics: np.ndarray,  # (3, 3)
+    extrinsics: np.ndarray,  # (4, 4) w2c
+    camera_confidence: Optional[np.ndarray] = None,  # (H, W) confidence
+    density_kernel: int = 31,
+    density_sigma: float = 15.0,
+    interpolation_kernel: int = 15,
+    min_lidar_weight: float = 0.0,  # Minimum weight for LiDAR
+    max_lidar_weight: float = 0.95,  # Maximum weight for LiDAR (never fully 1.0)
+    distance_boost: bool = True,  # Boost LiDAR weight at larger distances
+    distance_threshold: float = 50.0,  # Distance (m) at which to start boosting LiDAR
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Adaptive fusion of camera depth and LiDAR depth based on local LiDAR density.
+
+    Key insight:
+    - Near regions (roadside): Camera pixels dense, LiDAR sparse → Trust camera
+    - Far regions (intersection center): Camera pixels sparse, LiDAR dense → Trust LiDAR
+
+    The fusion weight is computed as:
+        w_lidar = f(local_lidar_density, distance)
+
+    Args:
+        camera_depth: Camera aligned depth map (H, W), already scale-corrected
+        lidar_points: LiDAR point cloud in world coordinates (N, 3)
+        intrinsics: Camera intrinsics (3, 3)
+        extrinsics: World-to-camera transformation (4, 4)
+        camera_confidence: Optional confidence map from DA3
+        density_kernel: Kernel size for density estimation
+        density_sigma: Gaussian sigma for density smoothing
+        interpolation_kernel: Kernel size for LiDAR depth interpolation
+        min_lidar_weight: Minimum LiDAR weight (for sparse regions)
+        max_lidar_weight: Maximum LiDAR weight (for dense regions)
+        distance_boost: Whether to increase LiDAR weight at larger distances
+        distance_threshold: Distance at which to start boosting LiDAR weight
+
+    Returns:
+        fused_depth: Fused depth map (H, W)
+        lidar_weight_map: Weight map showing LiDAR contribution (H, W)
+        interpolated_lidar: Interpolated LiDAR depth for debugging (H, W)
+    """
+    from scipy.ndimage import gaussian_filter
+    from scipy.interpolate import griddata
+
+    H, W = camera_depth.shape
+
+    # Step 1: Compute LiDAR density map
+    density_map = compute_lidar_density_map(
+        lidar_points, intrinsics, extrinsics, (H, W),
+        kernel_size=density_kernel, sigma=density_sigma
+    )
+
+    # Step 2: Create sparse depth map from LiDAR
+    sparse_depth, valid_mask = create_sparse_depth_map(
+        lidar_points, intrinsics, extrinsics, (H, W)
+    )
+
+    # Step 3: Interpolate LiDAR depth where we have nearby points
+    # Use natural neighbor or linear interpolation
+    if valid_mask.sum() > 10:
+        # Get coordinates of valid LiDAR points
+        v_valid, u_valid = np.where(valid_mask)
+        lidar_depths = sparse_depth[valid_mask]
+
+        # Create grid for interpolation
+        u_grid, v_grid = np.meshgrid(np.arange(W), np.arange(H))
+        grid_points = np.stack([u_grid.ravel(), v_grid.ravel()], axis=1)
+        lidar_coords = np.stack([u_valid, v_valid], axis=1)
+
+        # Interpolate (linear with nearest neighbor fallback)
+        try:
+            interpolated_lidar = griddata(
+                lidar_coords, lidar_depths, grid_points,
+                method='linear', fill_value=0
+            ).reshape(H, W)
+
+            # Fill remaining holes with nearest neighbor
+            missing = interpolated_lidar == 0
+            if missing.any() and (~missing).any():
+                interp_nearest = griddata(
+                    lidar_coords, lidar_depths, grid_points,
+                    method='nearest'
+                ).reshape(H, W)
+                interpolated_lidar[missing] = interp_nearest[missing]
+        except Exception:
+            # Fallback: just use sparse depth with some dilation
+            interpolated_lidar = gaussian_filter(sparse_depth, sigma=interpolation_kernel)
+            interpolated_lidar = np.where(interpolated_lidar > 0, interpolated_lidar, camera_depth)
+    else:
+        # Not enough LiDAR points, use camera depth
+        interpolated_lidar = camera_depth.copy()
+
+    # Step 4: Compute adaptive weight for LiDAR
+    # Base weight from density
+    lidar_weight = density_map * (max_lidar_weight - min_lidar_weight) + min_lidar_weight
+
+    # Boost weight at larger distances (where camera is less reliable)
+    if distance_boost and distance_threshold > 0:
+        distance_factor = np.clip(camera_depth / distance_threshold, 0, 2) - 1
+        distance_factor = np.clip(distance_factor, 0, 1)  # 0 at near, 1 at far
+        # Blend in more LiDAR weight at distance
+        lidar_weight = lidar_weight + distance_factor * (1 - lidar_weight) * 0.5
+
+    # Reduce LiDAR weight where interpolation is far from actual LiDAR points
+    interpolation_confidence = 1.0 - np.clip(
+        gaussian_filter((~valid_mask).astype(float), sigma=density_sigma) * 2, 0, 1
+    )
+    lidar_weight = lidar_weight * interpolation_confidence
+
+    # Clip to valid range
+    lidar_weight = np.clip(lidar_weight, min_lidar_weight, max_lidar_weight)
+
+    # Step 5: Fuse depths
+    fused_depth = lidar_weight * interpolated_lidar + (1 - lidar_weight) * camera_depth
+
+    # Handle edge cases
+    fused_depth = np.where(
+        (interpolated_lidar > 0.1) & (camera_depth > 0.1),
+        fused_depth,
+        np.maximum(interpolated_lidar, camera_depth)  # Use whichever is valid
+    )
+
+    return fused_depth, lidar_weight.astype(np.float32), interpolated_lidar.astype(np.float32)

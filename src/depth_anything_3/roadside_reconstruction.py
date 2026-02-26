@@ -51,6 +51,7 @@ from depth_anything_3.api import DepthAnything3
 from depth_anything_3.utils.geometry import unproject_depth
 from depth_anything_3.utils.lidar_alignment import (
     LiDARAlignmentResult,
+    adaptive_depth_fusion,
     align_depth_with_lidar,
     create_sparse_depth_map,
 )
@@ -161,6 +162,8 @@ class RoadsideReconstructor:
         max_points_per_camera: int = 500_000,
         max_view_angle: float = 70.0,  # Filter points outside this angle from optical axis
         max_depth: float = 150.0,  # Maximum depth to keep (meters)
+        use_adaptive_fusion: bool = True,  # Enable adaptive camera/LiDAR fusion
+        adaptive_fusion_kwargs: Optional[Dict] = None,  # kwargs for adaptive_depth_fusion
     ) -> ReconstructionResult:
         """
         Reconstruct roadside scene from multi-camera images with LiDAR alignment.
@@ -183,6 +186,14 @@ class RoadsideReconstructor:
                            Default: 70 degrees (keeps central ~140° FOV)
             max_depth: Maximum depth in meters. Points beyond this are filtered.
                        Default: 150m (appropriate for roadside scenarios)
+            use_adaptive_fusion: Enable adaptive fusion based on local LiDAR density.
+                                When True, regions with dense LiDAR points will use
+                                interpolated LiDAR depth, while sparse regions use
+                                camera depth. This improves quality at intersection
+                                centers where camera pixels are sparse but LiDAR is dense.
+            adaptive_fusion_kwargs: Optional kwargs for adaptive_depth_fusion function.
+                                   Keys: density_sigma, min_lidar_weight, max_lidar_weight,
+                                   distance_boost, distance_threshold
 
         Returns:
             ReconstructionResult with depth maps, point clouds, and fusion
@@ -282,6 +293,45 @@ class RoadsideReconstructor:
             logger.warning("No LiDAR data provided, depth will be in relative scale")
             for cam_idx in range(N):
                 scale_factors[f"cam_{cam_idx}"] = 1.0
+
+        # Step 2.5: Adaptive fusion - use LiDAR directly where it's dense
+        # Key insight: Camera is reliable near (dense pixels), LiDAR is reliable
+        # at intersection center (dense points). Adaptively blend based on density.
+        lidar_weight_maps = {}
+        if use_adaptive_fusion and lidar_points is not None:
+            logger.info("Applying adaptive camera/LiDAR fusion...")
+            fusion_kwargs = adaptive_fusion_kwargs or {}
+
+            for cam_idx in range(N):
+                cam_id = f"cam_{cam_idx}"
+                lidar_idx = lidar_to_camera_mapping[cam_idx]
+
+                if lidar_idx is None or lidar_idx >= len(lidar_points):
+                    lidar_weight_maps[cam_id] = np.zeros_like(depth_maps[cam_id])
+                    continue
+
+                try:
+                    fused_depth, lidar_weight, _ = adaptive_depth_fusion(
+                        camera_depth=depth_maps[cam_id],
+                        lidar_points=lidar_points[lidar_idx],
+                        intrinsics=scaled_intrinsics[cam_id],
+                        extrinsics=extrinsics[cam_idx],
+                        camera_confidence=confidence_maps[cam_id],
+                        **fusion_kwargs,
+                    )
+
+                    depth_maps[cam_id] = fused_depth
+                    lidar_weight_maps[cam_id] = lidar_weight
+
+                    mean_weight = lidar_weight.mean()
+                    max_weight = lidar_weight.max()
+                    logger.info(
+                        f"  Camera {cam_idx}: LiDAR weight mean={mean_weight:.2%}, max={max_weight:.2%}"
+                    )
+
+                except Exception as e:
+                    logger.warning(f"Adaptive fusion failed for camera {cam_idx}: {e}")
+                    lidar_weight_maps[cam_id] = np.zeros_like(depth_maps[cam_id])
 
         # Step 3: Generate point clouds
         point_clouds = {}
