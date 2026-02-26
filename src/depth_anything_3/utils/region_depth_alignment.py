@@ -1,0 +1,636 @@
+# Copyright (c) 2025 ByteDance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""
+Region-wise Depth Alignment using SAM segmentation and LiDAR anchors.
+
+Key idea:
+    1. DA3 outputs relative depth (good structure, wrong scale)
+    2. SAM segments the entire image into regions (roads, vehicles, poles, etc.)
+    3. LiDAR points are projected as sparse anchor points
+    4. For each SAM region: compute local affine transform (ax + b) using anchors
+    5. SAM boundaries act as hard constraints (no cross-region blending)
+
+This approach preserves DA3's structural accuracy while using LiDAR for
+per-region metric scale alignment.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+
+import cv2
+import numpy as np
+from scipy import ndimage
+
+# Try import SAM for automatic segmentation
+SAM_AVAILABLE = False
+try:
+    from segment_anything import sam_model_registry, SamAutomaticMaskGenerator, SamPredictor
+    SAM_AVAILABLE = True
+except ImportError:
+    pass
+
+
+@dataclass
+class RegionAlignmentResult:
+    """Result of region-wise depth alignment."""
+    aligned_depth: np.ndarray  # (H, W) metric depth
+    region_masks: np.ndarray  # (H, W) region labels (0 = background)
+    region_params: Dict[int, Tuple[float, float]]  # region_id -> (scale, shift)
+    region_stats: Dict[int, Dict]  # region_id -> stats
+    num_regions: int
+    coverage: float  # fraction of pixels with valid alignment
+
+
+class SAMAutoSegmenter:
+    """
+    SAM-based automatic image segmentation.
+
+    Uses SAM's "Segment Everything" mode to partition the entire image
+    into semantic regions without any prompts.
+    """
+
+    def __init__(
+        self,
+        model_type: str = "vit_h",
+        checkpoint_path: Optional[str] = None,
+        device: str = "cuda",
+        points_per_side: int = 32,
+        pred_iou_thresh: float = 0.88,
+        stability_score_thresh: float = 0.95,
+        min_mask_region_area: int = 100,
+    ):
+        """
+        Initialize SAM auto segmenter.
+
+        Args:
+            model_type: SAM model type ("vit_h", "vit_l", "vit_b")
+            checkpoint_path: Path to SAM checkpoint
+            device: Device to run on
+            points_per_side: Grid density for automatic mask generation
+            pred_iou_thresh: IoU threshold for mask filtering
+            stability_score_thresh: Stability score threshold
+            min_mask_region_area: Minimum mask area in pixels
+        """
+        self.device = device
+        self.generator = None
+
+        if not SAM_AVAILABLE:
+            print("WARNING: SAM not available. Install with:")
+            print("  pip install segment-anything")
+            print("  wget https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth")
+            return
+
+        # Find checkpoint
+        if checkpoint_path is None:
+            import os
+            for path in [
+                "sam_vit_h_4b8939.pth",
+                os.path.expanduser("~/.cache/sam/sam_vit_h_4b8939.pth"),
+                "/tmp/sam_vit_h_4b8939.pth",
+            ]:
+                if os.path.exists(path):
+                    checkpoint_path = path
+                    break
+
+        if checkpoint_path is None:
+            print("SAM checkpoint not found. Download from:")
+            print("  wget https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth")
+            return
+
+        try:
+            sam = sam_model_registry[model_type](checkpoint=checkpoint_path)
+            sam.to(device=device)
+
+            self.generator = SamAutomaticMaskGenerator(
+                model=sam,
+                points_per_side=points_per_side,
+                pred_iou_thresh=pred_iou_thresh,
+                stability_score_thresh=stability_score_thresh,
+                min_mask_region_area=min_mask_region_area,
+            )
+            print(f"SAM auto segmenter initialized: {checkpoint_path}")
+        except Exception as e:
+            print(f"Failed to initialize SAM: {e}")
+
+    @property
+    def is_available(self) -> bool:
+        return self.generator is not None
+
+    def segment(self, image: np.ndarray) -> Tuple[np.ndarray, List[dict]]:
+        """
+        Segment image into regions.
+
+        Args:
+            image: RGB image (H, W, 3)
+
+        Returns:
+            labels: (H, W) integer labels, 0 = background
+            masks_info: List of mask info dicts with 'area', 'bbox', etc.
+        """
+        if not self.is_available:
+            # Fallback: return single region
+            H, W = image.shape[:2]
+            return np.ones((H, W), dtype=np.int32), [{'area': H * W}]
+
+        # Generate masks
+        masks = self.generator.generate(image)
+
+        if len(masks) == 0:
+            H, W = image.shape[:2]
+            return np.ones((H, W), dtype=np.int32), [{'area': H * W}]
+
+        # Sort by area (largest first)
+        masks = sorted(masks, key=lambda x: x['area'], reverse=True)
+
+        # Create label map (handle overlapping masks by priority)
+        H, W = image.shape[:2]
+        labels = np.zeros((H, W), dtype=np.int32)
+
+        # Assign labels in reverse order (smaller masks override larger)
+        for i, mask_info in enumerate(reversed(masks)):
+            mask = mask_info['segmentation']
+            labels[mask] = len(masks) - i
+
+        return labels, masks
+
+
+def project_lidar_to_image(
+    lidar_points: np.ndarray,
+    intrinsics: np.ndarray,
+    extrinsics: np.ndarray,
+    image_hw: Tuple[int, int],
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Project LiDAR points to image plane.
+
+    Args:
+        lidar_points: (N, 3) points in world coordinates
+        intrinsics: (3, 3) camera intrinsics
+        extrinsics: (4, 4) world-to-camera transform
+        image_hw: (H, W) image size
+
+    Returns:
+        uv: (M, 2) valid pixel coordinates
+        depths: (M,) depth values
+        valid_mask: (N,) boolean mask
+    """
+    H, W = image_hw
+    N = len(lidar_points)
+
+    # Transform to camera coordinates
+    pts_homo = np.hstack([lidar_points[:, :3], np.ones((N, 1))])
+    pts_cam = (extrinsics @ pts_homo.T).T[:, :3]
+
+    # Filter behind camera
+    valid = pts_cam[:, 2] > 0.1
+
+    # Project to image
+    pts_img = (intrinsics @ pts_cam.T).T
+    uv = pts_img[:, :2] / (pts_img[:, 2:3] + 1e-8)
+    depths = pts_cam[:, 2]
+
+    # Filter outside image
+    valid &= (uv[:, 0] >= 0) & (uv[:, 0] < W)
+    valid &= (uv[:, 1] >= 0) & (uv[:, 1] < H)
+    valid &= np.isfinite(depths) & (depths < 300)
+
+    return uv[valid], depths[valid], valid
+
+
+def create_sparse_depth_map(
+    uv: np.ndarray,
+    depths: np.ndarray,
+    image_hw: Tuple[int, int],
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Create sparse depth map from projected points.
+
+    Args:
+        uv: (M, 2) pixel coordinates
+        depths: (M,) depth values
+        image_hw: (H, W)
+
+    Returns:
+        sparse_depth: (H, W) sparse depth map
+        valid_mask: (H, W) boolean mask of valid pixels
+    """
+    H, W = image_hw
+    sparse_depth = np.zeros((H, W), dtype=np.float32)
+    valid_mask = np.zeros((H, W), dtype=bool)
+
+    if len(uv) == 0:
+        return sparse_depth, valid_mask
+
+    u = uv[:, 0].astype(int)
+    v = uv[:, 1].astype(int)
+
+    # Use minimum depth per pixel (closest point)
+    for i in range(len(u)):
+        ui, vi, di = u[i], v[i], depths[i]
+        if sparse_depth[vi, ui] == 0 or di < sparse_depth[vi, ui]:
+            sparse_depth[vi, ui] = di
+            valid_mask[vi, ui] = True
+
+    return sparse_depth, valid_mask
+
+
+def compute_region_alignment(
+    relative_depth: np.ndarray,
+    lidar_depth: np.ndarray,
+    lidar_mask: np.ndarray,
+    region_mask: np.ndarray,
+    min_points: int = 3,
+) -> Optional[Tuple[float, float, Dict]]:
+    """
+    Compute affine alignment (ax + b) for a single region.
+
+    Args:
+        relative_depth: (H, W) DA3 relative depth
+        lidar_depth: (H, W) sparse LiDAR depth
+        lidar_mask: (H, W) valid LiDAR pixels
+        region_mask: (H, W) boolean mask for this region
+        min_points: minimum LiDAR points required
+
+    Returns:
+        (scale, shift, stats) or None if not enough points
+    """
+    # Get LiDAR anchors in this region
+    anchors = region_mask & lidar_mask
+    n_anchors = anchors.sum()
+
+    if n_anchors < min_points:
+        return None
+
+    # Get values at anchor points
+    rel_values = relative_depth[anchors]
+    lid_values = lidar_depth[anchors]
+
+    # Filter invalid values
+    valid = (rel_values > 0) & (lid_values > 0) & np.isfinite(rel_values) & np.isfinite(lid_values)
+    if valid.sum() < min_points:
+        return None
+
+    rel_values = rel_values[valid]
+    lid_values = lid_values[valid]
+
+    # Solve least squares: lidar = scale * relative + shift
+    # Using numpy lstsq: [rel, 1] @ [scale, shift]^T = lidar
+    A = np.column_stack([rel_values, np.ones_like(rel_values)])
+    result = np.linalg.lstsq(A, lid_values, rcond=None)
+
+    scale, shift = result[0]
+
+    # Compute residual
+    predicted = scale * rel_values + shift
+    residual = lid_values - predicted
+    rmse = np.sqrt(np.mean(residual ** 2))
+
+    # Compute stats
+    stats = {
+        'n_anchors': int(valid.sum()),
+        'scale': float(scale),
+        'shift': float(shift),
+        'rmse': float(rmse),
+        'rel_range': (float(rel_values.min()), float(rel_values.max())),
+        'lid_range': (float(lid_values.min()), float(lid_values.max())),
+    }
+
+    return scale, shift, stats
+
+
+def align_depth_by_regions(
+    relative_depth: np.ndarray,
+    region_labels: np.ndarray,
+    lidar_depth: np.ndarray,
+    lidar_mask: np.ndarray,
+    min_anchors_per_region: int = 3,
+    fallback_to_global: bool = True,
+    propagate_to_empty: bool = True,
+) -> RegionAlignmentResult:
+    """
+    Align relative depth to metric depth using per-region affine transforms.
+
+    Args:
+        relative_depth: (H, W) DA3 relative depth
+        region_labels: (H, W) integer region labels (0 = unlabeled)
+        lidar_depth: (H, W) sparse LiDAR depth
+        lidar_mask: (H, W) valid LiDAR pixels
+        min_anchors_per_region: minimum LiDAR points per region
+        fallback_to_global: use global alignment for regions without anchors
+        propagate_to_empty: propagate alignment from neighbors to empty regions
+
+    Returns:
+        RegionAlignmentResult
+    """
+    H, W = relative_depth.shape
+    aligned_depth = np.zeros((H, W), dtype=np.float32)
+    region_params = {}
+    region_stats = {}
+
+    # Get unique regions
+    unique_regions = np.unique(region_labels)
+    unique_regions = unique_regions[unique_regions > 0]  # Exclude background
+
+    print(f"  Aligning {len(unique_regions)} regions...")
+
+    # Compute global alignment as fallback
+    global_scale, global_shift = 1.0, 0.0
+    if fallback_to_global:
+        global_result = compute_region_alignment(
+            relative_depth, lidar_depth, lidar_mask,
+            np.ones((H, W), dtype=bool), min_points=10
+        )
+        if global_result is not None:
+            global_scale, global_shift, _ = global_result
+            print(f"    Global fallback: scale={global_scale:.4f}, shift={global_shift:.4f}")
+
+    # Process each region
+    regions_aligned = 0
+    regions_fallback = 0
+
+    for region_id in unique_regions:
+        region_mask = region_labels == region_id
+        region_area = region_mask.sum()
+
+        # Try to compute region-specific alignment
+        result = compute_region_alignment(
+            relative_depth, lidar_depth, lidar_mask,
+            region_mask, min_points=min_anchors_per_region
+        )
+
+        if result is not None:
+            scale, shift, stats = result
+            regions_aligned += 1
+        else:
+            # Fallback to global
+            scale, shift = global_scale, global_shift
+            stats = {'n_anchors': 0, 'fallback': 'global'}
+            regions_fallback += 1
+
+        # Apply alignment to this region
+        aligned_depth[region_mask] = scale * relative_depth[region_mask] + shift
+        region_params[region_id] = (scale, shift)
+        region_stats[region_id] = stats
+
+    # Handle unlabeled pixels (region_labels == 0)
+    unlabeled = region_labels == 0
+    if unlabeled.any():
+        aligned_depth[unlabeled] = global_scale * relative_depth[unlabeled] + global_shift
+
+    # Propagate to regions without anchors from neighbors
+    if propagate_to_empty and regions_fallback > 0:
+        aligned_depth = _propagate_from_neighbors(
+            aligned_depth, region_labels, region_params, relative_depth
+        )
+
+    # Compute coverage
+    valid_aligned = aligned_depth > 0
+    coverage = valid_aligned.sum() / (H * W)
+
+    print(f"    Aligned: {regions_aligned}, Fallback: {regions_fallback}, Coverage: {coverage:.1%}")
+
+    return RegionAlignmentResult(
+        aligned_depth=aligned_depth,
+        region_masks=region_labels,
+        region_params=region_params,
+        region_stats=region_stats,
+        num_regions=len(unique_regions),
+        coverage=coverage,
+    )
+
+
+def _propagate_from_neighbors(
+    aligned_depth: np.ndarray,
+    region_labels: np.ndarray,
+    region_params: Dict[int, Tuple[float, float]],
+    relative_depth: np.ndarray,
+) -> np.ndarray:
+    """
+    Propagate alignment parameters from neighboring regions.
+
+    For regions that fell back to global alignment, try to use
+    parameters from adjacent regions that have proper anchors.
+    """
+    # Find regions that need propagation (those with n_anchors == 0)
+    # This is a simple heuristic - could be improved
+
+    # For now, just return as-is
+    # TODO: implement neighbor-based propagation
+    return aligned_depth
+
+
+class RegionWiseDepthAligner:
+    """
+    Main class for region-wise depth alignment.
+
+    Workflow:
+        1. DA3 inference -> relative depth
+        2. SAM segment everything -> region masks
+        3. LiDAR projection -> sparse anchors
+        4. Per-region ax+b alignment
+        5. Compose final metric depth
+    """
+
+    def __init__(
+        self,
+        sam_checkpoint: Optional[str] = None,
+        device: str = "cuda",
+        min_anchors_per_region: int = 3,
+        sam_points_per_side: int = 32,
+    ):
+        """
+        Initialize region-wise depth aligner.
+
+        Args:
+            sam_checkpoint: Path to SAM checkpoint
+            device: Device for SAM
+            min_anchors_per_region: Minimum LiDAR anchors per region
+            sam_points_per_side: SAM grid density
+        """
+        self.device = device
+        self.min_anchors = min_anchors_per_region
+
+        # Initialize SAM auto segmenter
+        self.segmenter = SAMAutoSegmenter(
+            checkpoint_path=sam_checkpoint,
+            device=device,
+            points_per_side=sam_points_per_side,
+        )
+
+    @property
+    def sam_available(self) -> bool:
+        return self.segmenter.is_available
+
+    def align(
+        self,
+        image: np.ndarray,
+        relative_depth: np.ndarray,
+        lidar_points: np.ndarray,
+        intrinsics: np.ndarray,
+        extrinsics: np.ndarray,
+    ) -> RegionAlignmentResult:
+        """
+        Perform region-wise depth alignment.
+
+        Args:
+            image: RGB image (H, W, 3)
+            relative_depth: DA3 relative depth (H, W)
+            lidar_points: LiDAR points (N, 3) in world coordinates
+            intrinsics: Camera intrinsics (3, 3)
+            extrinsics: World-to-camera transform (4, 4)
+
+        Returns:
+            RegionAlignmentResult with aligned metric depth
+        """
+        H, W = relative_depth.shape
+
+        # Step 1: SAM segmentation
+        print("  [1/3] SAM segmentation...")
+        if image.shape[:2] != (H, W):
+            image_resized = cv2.resize(image, (W, H))
+        else:
+            image_resized = image
+
+        region_labels, masks_info = self.segmenter.segment(image_resized)
+        print(f"    Found {len(masks_info)} regions")
+
+        # Step 2: Project LiDAR to image
+        print("  [2/3] LiDAR projection...")
+        uv, depths, _ = project_lidar_to_image(
+            lidar_points, intrinsics, extrinsics, (H, W)
+        )
+        lidar_depth, lidar_mask = create_sparse_depth_map(uv, depths, (H, W))
+        print(f"    {lidar_mask.sum():,} LiDAR anchors")
+
+        # Step 3: Per-region alignment
+        print("  [3/3] Region alignment...")
+        result = align_depth_by_regions(
+            relative_depth=relative_depth,
+            region_labels=region_labels,
+            lidar_depth=lidar_depth,
+            lidar_mask=lidar_mask,
+            min_anchors_per_region=self.min_anchors,
+        )
+
+        return result
+
+    def visualize(
+        self,
+        image: np.ndarray,
+        result: RegionAlignmentResult,
+        output_path: Optional[str] = None,
+    ) -> np.ndarray:
+        """
+        Visualize region alignment results.
+
+        Args:
+            image: RGB image
+            result: Alignment result
+            output_path: Optional path to save visualization
+
+        Returns:
+            Visualization image
+        """
+        import matplotlib.pyplot as plt
+
+        H, W = result.aligned_depth.shape
+
+        # Resize image if needed
+        if image.shape[:2] != (H, W):
+            image = cv2.resize(image, (W, H))
+
+        fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+
+        # RGB
+        axes[0, 0].imshow(image)
+        axes[0, 0].set_title("RGB Image")
+        axes[0, 0].axis('off')
+
+        # Region labels
+        region_vis = plt.cm.tab20(result.region_masks % 20)[:, :, :3]
+        axes[0, 1].imshow(region_vis)
+        axes[0, 1].set_title(f"SAM Regions ({result.num_regions})")
+        axes[0, 1].axis('off')
+
+        # Aligned depth
+        depth_vis = result.aligned_depth.copy()
+        vmax = np.percentile(depth_vis[depth_vis > 0], 95) if (depth_vis > 0).any() else 100
+        axes[1, 0].imshow(depth_vis, cmap='turbo', vmin=0, vmax=vmax)
+        axes[1, 0].set_title(f"Aligned Depth (coverage: {result.coverage:.1%})")
+        axes[1, 0].axis('off')
+
+        # Per-region scale visualization
+        scale_map = np.zeros((H, W), dtype=np.float32)
+        for region_id, (scale, shift) in result.region_params.items():
+            mask = result.region_masks == region_id
+            scale_map[mask] = scale
+
+        axes[1, 1].imshow(scale_map, cmap='coolwarm', vmin=0.5, vmax=2.0)
+        axes[1, 1].set_title("Per-Region Scale")
+        axes[1, 1].axis('off')
+
+        plt.tight_layout()
+
+        if output_path:
+            plt.savefig(output_path, dpi=150, bbox_inches='tight')
+            print(f"  Saved visualization: {output_path}")
+
+        # Convert to image array
+        fig.canvas.draw()
+        vis_image = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+        vis_image = vis_image.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+
+        plt.close()
+
+        return vis_image
+
+
+def region_wise_depth_alignment(
+    image: np.ndarray,
+    relative_depth: np.ndarray,
+    lidar_points: np.ndarray,
+    intrinsics: np.ndarray,
+    extrinsics: np.ndarray,
+    sam_checkpoint: Optional[str] = None,
+    device: str = "cuda",
+) -> RegionAlignmentResult:
+    """
+    Convenience function for region-wise depth alignment.
+
+    Args:
+        image: RGB image (H, W, 3)
+        relative_depth: DA3 relative depth (H, W)
+        lidar_points: LiDAR points (N, 3)
+        intrinsics: Camera intrinsics (3, 3)
+        extrinsics: World-to-camera (4, 4)
+        sam_checkpoint: Path to SAM checkpoint
+        device: Device for SAM
+
+    Returns:
+        RegionAlignmentResult
+    """
+    aligner = RegionWiseDepthAligner(
+        sam_checkpoint=sam_checkpoint,
+        device=device,
+    )
+
+    return aligner.align(
+        image=image,
+        relative_depth=relative_depth,
+        lidar_points=lidar_points,
+        intrinsics=intrinsics,
+        extrinsics=extrinsics,
+    )
