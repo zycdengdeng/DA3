@@ -87,16 +87,22 @@ def align_depth_with_lidar(
     pred_depth: np.ndarray,
     lidar_uv: np.ndarray,
     lidar_depths: np.ndarray,
-    method: str = "scale_shift",
+    method: str = "scale",
+    depth_range: tuple = None,
 ) -> tuple:
     """
-    Align predicted depth with LiDAR ground truth using least squares.
+    Align predicted depth with LiDAR ground truth.
 
     Args:
         pred_depth: (H, W) predicted relative depth
         lidar_uv: (M, 2) pixel coordinates of LiDAR projections
         lidar_depths: (M,) LiDAR depth values
-        method: "scale_shift" for affine alignment, "scale" for scale only
+        method:
+            - "scale": scale only (recommended for DA3)
+            - "scale_shift": affine alignment (may cause issues)
+            - "ransac": RANSAC robust fitting
+            - "near_priority": prioritize near points for fitting
+        depth_range: (min, max) only use LiDAR points in this depth range
 
     Returns:
         aligned_depth: (H, W) aligned depth map
@@ -114,32 +120,93 @@ def align_depth_with_lidar(
 
     # Filter out invalid predictions
     valid = pred_at_lidar > 0
+
+    # Apply depth range filter if specified
+    if depth_range is not None:
+        valid = valid & (lidar_depths >= depth_range[0]) & (lidar_depths <= depth_range[1])
+        print(f"  Using depth range [{depth_range[0]:.1f}, {depth_range[1]:.1f}]m")
+
     pred_at_lidar = pred_at_lidar[valid]
     lidar_d = lidar_depths[valid]
+    u_valid = u[valid]
+    v_valid = v[valid]
 
     if len(pred_at_lidar) < 10:
         print(f"  Warning: Only {len(pred_at_lidar)} valid matches, using default scale")
         return pred_depth, 1.0, 0.0
 
+    print(f"  Using {len(pred_at_lidar)} LiDAR points for alignment")
+    print(f"  LiDAR depth range: [{lidar_d.min():.2f}, {lidar_d.max():.2f}]m")
+
     if method == "scale_shift":
         # Solve: lidar_d = scale * pred_at_lidar + shift
-        # Using least squares: [pred, 1] @ [scale, shift]^T = lidar_d
         A = np.vstack([pred_at_lidar, np.ones_like(pred_at_lidar)]).T
         result, _, _, _ = np.linalg.lstsq(A, lidar_d, rcond=None)
         scale, shift = result
-    else:
-        # Scale only: lidar_d = scale * pred_at_lidar
+
+    elif method == "scale":
+        # Scale only (recommended for DA3 relative depth)
         scale = np.median(lidar_d / pred_at_lidar)
         shift = 0.0
+
+    elif method == "ransac":
+        # RANSAC robust fitting (scale only)
+        n_iters = 100
+        best_scale = 1.0
+        best_inliers = 0
+        threshold = 0.1  # 10% relative error
+
+        for _ in range(n_iters):
+            # Random sample
+            idx = np.random.randint(0, len(pred_at_lidar))
+            scale_sample = lidar_d[idx] / pred_at_lidar[idx]
+
+            # Count inliers
+            pred_scaled = pred_at_lidar * scale_sample
+            rel_error = np.abs(pred_scaled - lidar_d) / lidar_d
+            inliers = np.sum(rel_error < threshold)
+
+            if inliers > best_inliers:
+                best_inliers = inliers
+                best_scale = scale_sample
+
+        # Refine with all inliers
+        pred_scaled = pred_at_lidar * best_scale
+        rel_error = np.abs(pred_scaled - lidar_d) / lidar_d
+        inlier_mask = rel_error < threshold
+        if np.sum(inlier_mask) > 10:
+            scale = np.median(lidar_d[inlier_mask] / pred_at_lidar[inlier_mask])
+        else:
+            scale = best_scale
+        shift = 0.0
+        print(f"  RANSAC: {best_inliers}/{len(pred_at_lidar)} inliers")
+
+    elif method == "near_priority":
+        # Weight near points more heavily (roadside scenario)
+        # Near points are more reliable for DA3, far points more reliable for LiDAR
+        # Use median of near+mid range points
+        mid_depth = np.median(lidar_d)
+        near_mask = lidar_d < mid_depth
+        if np.sum(near_mask) > 20:
+            scale = np.median(lidar_d[near_mask] / pred_at_lidar[near_mask])
+            print(f"  Near priority: using {np.sum(near_mask)} near points (< {mid_depth:.1f}m)")
+        else:
+            scale = np.median(lidar_d / pred_at_lidar)
+        shift = 0.0
+
+    else:
+        raise ValueError(f"Unknown method: {method}")
 
     # Apply alignment
     aligned_depth = pred_depth * scale + shift
     aligned_depth = np.maximum(aligned_depth, 0)  # No negative depths
 
     # Calculate alignment error
-    aligned_at_lidar = aligned_depth[v[valid], u[valid]]
+    aligned_at_lidar = aligned_depth[v_valid, u_valid]
     mae = np.mean(np.abs(aligned_at_lidar - lidar_d))
-    print(f"  LiDAR alignment: scale={scale:.4f}, shift={shift:.4f}, MAE={mae:.4f}m")
+    rel_mae = np.mean(np.abs(aligned_at_lidar - lidar_d) / lidar_d) * 100
+    print(f"  LiDAR alignment: scale={scale:.4f}, shift={shift:.4f}")
+    print(f"  MAE={mae:.4f}m, RelMAE={rel_mae:.2f}%")
 
     return aligned_depth, scale, shift
 
@@ -280,6 +347,15 @@ def main():
                         help="Model: da3-giant, da3-large, da3nested-giant-large")
     parser.add_argument("--lidar_align", action="store_true",
                         help="Align depth with LiDAR (recommended)")
+    parser.add_argument("--align_method", type=str, default="scale",
+                        choices=["scale", "scale_shift", "ransac", "near_priority"],
+                        help="Alignment method: scale (default, recommended), "
+                             "scale_shift (may cause curvature issues), "
+                             "ransac (robust), near_priority (roadside scenario)")
+    parser.add_argument("--align_depth_min", type=float, default=None,
+                        help="Min depth for alignment (meters)")
+    parser.add_argument("--align_depth_max", type=float, default=None,
+                        help="Max depth for alignment (meters)")
     parser.add_argument("--process_res", type=int, default=518)
     parser.add_argument("--downsample", type=int, default=2, help="Downsample factor")
     parser.add_argument("--conf_threshold", type=float, default=0.3, help="Confidence threshold")
@@ -395,13 +471,24 @@ def main():
 
         # LiDAR alignment if enabled
         if lidar_points is not None:
-            print("Aligning depth with LiDAR...")
+            print(f"Aligning depth with LiDAR (method={args.align_method})...")
             lidar_uv, lidar_depths = project_lidar_to_camera(
                 lidar_points, K, E, img.shape[1], img.shape[0]
             )
             print(f"  Projected {len(lidar_uv)} LiDAR points to camera")
+
+            # Build depth range if specified
+            depth_range = None
+            if args.align_depth_min is not None or args.align_depth_max is not None:
+                depth_range = (
+                    args.align_depth_min if args.align_depth_min else 0.0,
+                    args.align_depth_max if args.align_depth_max else 1000.0,
+                )
+
             depth_resized, scale, shift = align_depth_with_lidar(
-                depth_resized, lidar_uv, lidar_depths, method="scale_shift"
+                depth_resized, lidar_uv, lidar_depths,
+                method=args.align_method,
+                depth_range=depth_range,
             )
             print(f"  Aligned depth range: [{depth_resized.min():.4f}, {depth_resized.max():.4f}]")
 
