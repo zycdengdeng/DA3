@@ -513,9 +513,11 @@ def adaptive_depth_fusion(
     density_sigma: float = 15.0,
     interpolation_kernel: int = 15,
     min_lidar_weight: float = 0.0,  # Minimum weight for LiDAR
-    max_lidar_weight: float = 0.95,  # Maximum weight for LiDAR (never fully 1.0)
-    distance_boost: bool = True,  # Boost LiDAR weight at larger distances
+    max_lidar_weight: float = 0.7,  # Maximum weight for LiDAR (reduced from 0.95)
+    distance_boost: bool = False,  # Disabled by default - causes uplift issues
     distance_threshold: float = 30.0,  # Distance (m) at which to start boosting LiDAR
+    use_dilation_only: bool = True,  # Use dilation instead of interpolation
+    dilation_radius: int = 5,  # Radius for LiDAR point dilation
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Adaptive fusion of camera depth and LiDAR depth based on local LiDAR density.
@@ -524,8 +526,9 @@ def adaptive_depth_fusion(
     - Near regions (roadside): Camera pixels dense, LiDAR sparse → Trust camera
     - Far regions (intersection center): Camera pixels sparse, LiDAR dense → Trust LiDAR
 
-    The fusion weight is computed as:
-        w_lidar = f(local_lidar_density, distance)
+    IMPORTANT: This function avoids full-image interpolation which causes ground
+    "uplift" artifacts. Instead, it only uses LiDAR values at actual LiDAR point
+    locations (with optional small dilation).
 
     Args:
         camera_depth: Camera aligned depth map (H, W), already scale-corrected
@@ -535,36 +538,86 @@ def adaptive_depth_fusion(
         camera_confidence: Optional confidence map from DA3
         density_kernel: Kernel size for density estimation
         density_sigma: Gaussian sigma for density smoothing
-        interpolation_kernel: Kernel size for LiDAR depth interpolation
+        interpolation_kernel: Kernel size for LiDAR depth interpolation (if not using dilation)
         min_lidar_weight: Minimum LiDAR weight (for sparse regions)
         max_lidar_weight: Maximum LiDAR weight (for dense regions)
         distance_boost: Whether to increase LiDAR weight at larger distances
         distance_threshold: Distance at which to start boosting LiDAR weight
+        use_dilation_only: If True, only use LiDAR at actual points + small dilation
+                          If False, interpolate LiDAR across whole image (NOT recommended)
+        dilation_radius: Pixel radius to dilate LiDAR points (only if use_dilation_only=True)
 
     Returns:
         fused_depth: Fused depth map (H, W)
         lidar_weight_map: Weight map showing LiDAR contribution (H, W)
-        interpolated_lidar: Interpolated LiDAR depth for debugging (H, W)
+        lidar_depth_map: LiDAR depth (sparse or interpolated) for debugging (H, W)
     """
-    from scipy.ndimage import gaussian_filter
-    from scipy.interpolate import griddata
+    from scipy.ndimage import gaussian_filter, binary_dilation, distance_transform_edt
 
     H, W = camera_depth.shape
 
-    # Step 1: Compute LiDAR density map
-    density_map = compute_lidar_density_map(
-        lidar_points, intrinsics, extrinsics, (H, W),
-        kernel_size=density_kernel, sigma=density_sigma
-    )
-
-    # Step 2: Create sparse depth map from LiDAR
+    # Step 1: Create sparse depth map from LiDAR
     sparse_depth, valid_mask = create_sparse_depth_map(
         lidar_points, intrinsics, extrinsics, (H, W)
     )
 
-    # Step 3: Interpolate LiDAR depth where we have nearby points
-    # Use natural neighbor or linear interpolation
-    if valid_mask.sum() > 10:
+    n_lidar_pixels = valid_mask.sum()
+    if n_lidar_pixels < 10:
+        # Not enough LiDAR points, return camera depth unchanged
+        return camera_depth.copy(), np.zeros((H, W), dtype=np.float32), sparse_depth
+
+    if use_dilation_only:
+        # Conservative approach: only use LiDAR at/near actual LiDAR points
+        # Create dilated mask for LiDAR influence region
+        if dilation_radius > 0:
+            struct = np.ones((dilation_radius * 2 + 1, dilation_radius * 2 + 1))
+            dilated_mask = binary_dilation(valid_mask, struct)
+        else:
+            dilated_mask = valid_mask.copy()
+
+        # For dilated pixels, use nearest LiDAR depth (no interpolation!)
+        # Use distance transform to find nearest LiDAR point
+        dist_to_lidar = distance_transform_edt(~valid_mask)
+
+        # Create lidar depth map: at each dilated pixel, use nearest lidar value
+        lidar_depth_map = np.zeros_like(camera_depth)
+        if valid_mask.sum() > 0:
+            # For pixels with LiDAR, use LiDAR directly
+            lidar_depth_map[valid_mask] = sparse_depth[valid_mask]
+
+            # For dilated pixels without direct LiDAR, find nearest
+            dilated_no_direct = dilated_mask & (~valid_mask)
+            if dilated_no_direct.any():
+                from scipy.ndimage import grey_dilation
+
+                # Use grey dilation to propagate nearest lidar values
+                for _ in range(dilation_radius):
+                    kernel = np.ones((3, 3))
+                    dilated_depth = grey_dilation(lidar_depth_map, footprint=kernel)
+                    # Only update where we don't have values yet but are in dilated region
+                    update_mask = (lidar_depth_map == 0) & dilated_mask
+                    lidar_depth_map[update_mask] = dilated_depth[update_mask]
+
+        # LiDAR weight: only within dilated region, smooth falloff
+        lidar_weight = np.zeros((H, W), dtype=np.float32)
+
+        # Weight based on distance to nearest LiDAR point
+        # At LiDAR point: weight = max_lidar_weight
+        # At edge of dilation: weight = 0
+        weight_at_lidar = np.exp(-dist_to_lidar / (dilation_radius / 2 + 1))
+        lidar_weight = weight_at_lidar * max_lidar_weight
+        lidar_weight[~dilated_mask] = 0  # Zero outside dilated region
+
+    else:
+        # Original interpolation approach (NOT recommended - causes uplift)
+        from scipy.interpolate import griddata
+
+        # Compute LiDAR density map
+        density_map = compute_lidar_density_map(
+            lidar_points, intrinsics, extrinsics, (H, W),
+            kernel_size=density_kernel, sigma=density_sigma
+        )
+
         # Get coordinates of valid LiDAR points
         v_valid, u_valid = np.where(valid_mask)
         lidar_depths = sparse_depth[valid_mask]
@@ -576,55 +629,44 @@ def adaptive_depth_fusion(
 
         # Interpolate (linear with nearest neighbor fallback)
         try:
-            interpolated_lidar = griddata(
+            lidar_depth_map = griddata(
                 lidar_coords, lidar_depths, grid_points,
                 method='linear', fill_value=0
             ).reshape(H, W)
 
             # Fill remaining holes with nearest neighbor
-            missing = interpolated_lidar == 0
+            missing = lidar_depth_map == 0
             if missing.any() and (~missing).any():
                 interp_nearest = griddata(
                     lidar_coords, lidar_depths, grid_points,
                     method='nearest'
                 ).reshape(H, W)
-                interpolated_lidar[missing] = interp_nearest[missing]
+                lidar_depth_map[missing] = interp_nearest[missing]
         except Exception:
-            # Fallback: just use sparse depth with some dilation
-            interpolated_lidar = gaussian_filter(sparse_depth, sigma=interpolation_kernel)
-            interpolated_lidar = np.where(interpolated_lidar > 0, interpolated_lidar, camera_depth)
-    else:
-        # Not enough LiDAR points, use camera depth
-        interpolated_lidar = camera_depth.copy()
+            lidar_depth_map = camera_depth.copy()
 
-    # Step 4: Compute adaptive weight for LiDAR
-    # Base weight from density
-    lidar_weight = density_map * (max_lidar_weight - min_lidar_weight) + min_lidar_weight
+        # LiDAR weight based on density
+        lidar_weight = density_map * (max_lidar_weight - min_lidar_weight) + min_lidar_weight
 
-    # Boost weight at larger distances (where camera is less reliable)
+        # Reduce weight where interpolation is far from actual LiDAR points
+        interpolation_confidence = 1.0 - np.clip(
+            gaussian_filter((~valid_mask).astype(float), sigma=density_sigma) * 2, 0, 1
+        )
+        lidar_weight = lidar_weight * interpolation_confidence
+
+    # Optional: Boost weight at larger distances (DISABLED by default)
     if distance_boost and distance_threshold > 0:
         distance_factor = np.clip(camera_depth / distance_threshold, 0, 2) - 1
         distance_factor = np.clip(distance_factor, 0, 1)  # 0 at near, 1 at far
-        # Blend in more LiDAR weight at distance
-        lidar_weight = lidar_weight + distance_factor * (1 - lidar_weight) * 0.5
-
-    # Reduce LiDAR weight where interpolation is far from actual LiDAR points
-    interpolation_confidence = 1.0 - np.clip(
-        gaussian_filter((~valid_mask).astype(float), sigma=density_sigma) * 2, 0, 1
-    )
-    lidar_weight = lidar_weight * interpolation_confidence
+        lidar_weight = lidar_weight + distance_factor * (1 - lidar_weight) * 0.3
 
     # Clip to valid range
     lidar_weight = np.clip(lidar_weight, min_lidar_weight, max_lidar_weight)
 
-    # Step 5: Fuse depths
-    fused_depth = lidar_weight * interpolated_lidar + (1 - lidar_weight) * camera_depth
+    # Fuse depths
+    fused_depth = lidar_weight * lidar_depth_map + (1 - lidar_weight) * camera_depth
 
-    # Handle edge cases
-    fused_depth = np.where(
-        (interpolated_lidar > 0.1) & (camera_depth > 0.1),
-        fused_depth,
-        np.maximum(interpolated_lidar, camera_depth)  # Use whichever is valid
-    )
+    # Where LiDAR depth is 0, use camera depth
+    fused_depth = np.where(lidar_depth_map > 0.1, fused_depth, camera_depth)
 
-    return fused_depth, lidar_weight.astype(np.float32), interpolated_lidar.astype(np.float32)
+    return fused_depth, lidar_weight.astype(np.float32), lidar_depth_map.astype(np.float32)
