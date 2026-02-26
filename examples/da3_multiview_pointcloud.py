@@ -1,14 +1,22 @@
 #!/usr/bin/env python3
 """
 Multi-view DA3 depth estimation and PLY point cloud fusion.
-No LiDAR alignment - uses pure DA3 relative depth.
+Uses calibrated camera poses for accurate point cloud fusion.
 
 Usage:
+    # Relative depth (da3-giant)
     python examples/da3_multiview_pointcloud.py \
         --data_root /mnt/car_road_data_TianJin \
         --scene 001_car0325_road0327_t1 \
         --timestamp 1742877031036 \
         --output_dir ./output_da3_ply
+
+    # Metric depth (da3nested-giant-large)
+    python examples/da3_multiview_pointcloud.py \
+        --scene 001_car0325_road0327_t1 \
+        --timestamp 1742877031036 \
+        --metric \
+        --output_dir ./output_da3_metric
 """
 
 import argparse
@@ -100,14 +108,10 @@ def depth_to_pointcloud(
     points_cam = np.stack([x, y, z], axis=1)
 
     # Transform to world coordinates
-    # extrinsics is world-to-camera, we need camera-to-world
+    # extrinsics is world-to-camera: p_cam = R @ p_world + t
+    # So p_world = R^T @ (p_cam - t)
     R = extrinsics[:3, :3]
     t = extrinsics[:3, 3]
-
-    # Camera-to-world: p_world = R^T @ (p_cam - t) = R^T @ p_cam - R^T @ t
-    # But actually extrinsics convention varies. Let's check.
-    # If extrinsics is w2c: p_cam = R @ p_world + t
-    # Then p_world = R^T @ (p_cam - t)
     R_inv = R.T
     t_inv = -R_inv @ t
 
@@ -161,13 +165,21 @@ def main():
     parser.add_argument("--scene", type=str, required=True)
     parser.add_argument("--timestamp", type=str, required=True)
     parser.add_argument("--output_dir", type=str, default="./output_da3_ply")
-    parser.add_argument("--model", type=str, default="da3-giant")
+    parser.add_argument("--model", type=str, default="da3-giant",
+                        help="Model: da3-giant, da3-large, da3nested-giant-large")
+    parser.add_argument("--metric", action="store_true",
+                        help="Use metric depth model (da3nested-giant-large)")
     parser.add_argument("--process_res", type=int, default=518)
-    parser.add_argument("--downsample", type=int, default=2, help="Downsample factor for point cloud")
+    parser.add_argument("--downsample", type=int, default=2, help="Downsample factor")
     parser.add_argument("--conf_threshold", type=float, default=0.3, help="Confidence threshold")
-    parser.add_argument("--max_depth", type=float, default=50.0, help="Max depth in relative units")
-    parser.add_argument("--depth_scale", type=float, default=1.0, help="Manual depth scale factor")
+    parser.add_argument("--max_depth", type=float, default=100.0, help="Max depth (meters)")
+    parser.add_argument("--depth_scale", type=float, default=1.0, help="Manual depth scale")
     args = parser.parse_args()
+
+    # Override model if metric flag is set
+    if args.metric:
+        args.model = "da3nested-giant-large"
+        print("Using metric depth model: da3nested-giant-large")
 
     # Create output directory
     output_dir = os.path.join(args.output_dir, args.scene, args.timestamp)
@@ -184,11 +196,17 @@ def main():
         "da3-large": "depth-anything/DA3-LARGE",
         "da3-base": "depth-anything/DA3-BASE",
         "da3-small": "depth-anything/DA3-SMALL",
+        "da3nested-giant-large": "depth-anything/DA3NESTED-GIANT-LARGE",
+        "da3metric-large": "depth-anything/DA3METRIC-LARGE",
     }
     repo_id = model_repo_map.get(args.model.lower(), args.model)
+    print(f"Loading from: {repo_id}")
     model = DepthAnything3.from_pretrained(repo_id)
     model.to("cuda")
     model.eval()
+
+    is_metric = "nested" in args.model.lower() or "metric" in args.model.lower()
+    print(f"Metric depth: {is_metric}")
 
     # Get pinhole camera IDs
     pinhole_camera_ids = ["0", "3", "6", "9"]
@@ -210,7 +228,7 @@ def main():
         print("ERROR: No images found!")
         return
 
-    # Get calibration
+    # Get calibration (using our accurate calibrated poses)
     intrinsics_all, extrinsics_all = loader.get_camera_arrays(available_cameras)
 
     # Collect all points and colors
@@ -255,12 +273,12 @@ def main():
         else:
             conf_resized = None
 
-        # Get calibration for this camera
+        # Get calibration for this camera (our accurate calibrated poses)
         K = intrinsics_all[i]  # (3, 3)
         E = extrinsics_all[i]  # (4, 4)
 
-        print(f"Intrinsics:\n{K}")
-        print(f"Extrinsics (w2c):\n{E}")
+        print(f"Using calibrated intrinsics:\n{K}")
+        print(f"Using calibrated extrinsics (w2c):\n{E}")
 
         # Convert to point cloud
         print("Converting to point cloud...")
