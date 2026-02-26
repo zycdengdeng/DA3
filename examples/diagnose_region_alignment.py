@@ -54,6 +54,100 @@ def colorize_depth(depth, vmin=None, vmax=None, cmap='turbo'):
     return depth_color
 
 
+def depth_to_pointcloud(
+    depth: np.ndarray,
+    rgb: np.ndarray,
+    intrinsics: np.ndarray,
+    extrinsics: np.ndarray,
+    confidence: np.ndarray = None,
+    max_depth: float = 150.0,
+    conf_threshold: float = 0.3,
+    max_points: int = 500000,
+):
+    """
+    Convert depth map to colored point cloud in world coordinates.
+
+    Args:
+        depth: (H, W) metric depth
+        rgb: (H, W, 3) RGB image
+        intrinsics: (3, 3) camera intrinsics
+        extrinsics: (4, 4) world-to-camera transform
+        confidence: (H, W) optional confidence map
+        max_depth: maximum depth to keep
+        conf_threshold: minimum confidence
+        max_points: maximum points to output
+
+    Returns:
+        points: (N, 3) world coordinates
+        colors: (N, 3) RGB colors (0-255)
+    """
+    H, W = depth.shape
+
+    # Create pixel grid
+    u, v = np.meshgrid(np.arange(W), np.arange(H))
+    u = u.flatten().astype(np.float32)
+    v = v.flatten().astype(np.float32)
+    z = depth.flatten()
+
+    # Filter valid depth
+    valid = (z > 0.1) & (z < max_depth) & np.isfinite(z)
+
+    # Filter by confidence
+    if confidence is not None:
+        conf = confidence.flatten()
+        conf_thresh = np.percentile(conf[conf > 0], conf_threshold * 100) if (conf > 0).any() else 0
+        valid &= conf >= conf_thresh
+
+    u, v, z = u[valid], v[valid], z[valid]
+
+    # Subsample if too many
+    if len(z) > max_points:
+        indices = np.random.choice(len(z), max_points, replace=False)
+        u, v, z = u[indices], v[indices], z[indices]
+
+    # Unproject to camera space
+    fx, fy = intrinsics[0, 0], intrinsics[1, 1]
+    cx, cy = intrinsics[0, 2], intrinsics[1, 2]
+
+    x_cam = (u - cx) * z / fx
+    y_cam = (v - cy) * z / fy
+    z_cam = z
+
+    points_cam = np.stack([x_cam, y_cam, z_cam, np.ones_like(z_cam)], axis=1)  # (N, 4)
+
+    # Transform to world space
+    c2w = np.linalg.inv(extrinsics)
+    points_world = (c2w @ points_cam.T).T[:, :3]  # (N, 3)
+
+    # Get colors
+    u_int, v_int = u.astype(int), v.astype(int)
+    colors = rgb[v_int, u_int]  # (N, 3)
+
+    return points_world, colors
+
+
+def save_ply(filepath: str, points: np.ndarray, colors: np.ndarray):
+    """Save point cloud as PLY file."""
+    with open(filepath, 'w') as f:
+        f.write("ply\n")
+        f.write("format ascii 1.0\n")
+        f.write(f"element vertex {len(points)}\n")
+        f.write("property float x\n")
+        f.write("property float y\n")
+        f.write("property float z\n")
+        f.write("property uchar red\n")
+        f.write("property uchar green\n")
+        f.write("property uchar blue\n")
+        f.write("end_header\n")
+
+        for i in range(len(points)):
+            x, y, z = points[i]
+            r, g, b = colors[i].astype(int)
+            f.write(f"{x:.6f} {y:.6f} {z:.6f} {r} {g} {b}\n")
+
+    print(f"  Saved PLY: {filepath} ({len(points):,} points)")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Diagnose region-wise depth alignment")
 
@@ -67,6 +161,10 @@ def main():
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--sam_checkpoint", type=str, default=None,
                         help="Path to SAM checkpoint (auto-detect if not specified)")
+    parser.add_argument("--max_depth", type=float, default=150.0,
+                        help="Maximum depth for point cloud (meters)")
+    parser.add_argument("--max_points", type=int, default=500000,
+                        help="Maximum points in output PLY")
 
     args = parser.parse_args()
 
@@ -245,6 +343,33 @@ def main():
         else:
             print(f"  Region {region_id:3d}: scale={scale:.3f}, shift={shift:+.2f}, anchors={n_anchors:4d} (fallback)")
 
+    # Generate point cloud
+    print(f"\n[6/6] Generating point cloud...")
+    points, colors = depth_to_pointcloud(
+        depth=result.aligned_depth,
+        rgb=image_resized,
+        intrinsics=K_scaled,
+        extrinsics=extrinsics,
+        confidence=confidence,
+        max_depth=args.max_depth,
+        conf_threshold=0.3,
+        max_points=args.max_points,
+    )
+
+    save_ply(str(output_dir / "pointcloud.ply"), points, colors)
+
+    # Also save depth as NPZ for further analysis
+    np.savez(
+        output_dir / "depth_data.npz",
+        relative_depth=relative_depth,
+        aligned_depth=result.aligned_depth,
+        region_masks=result.region_masks,
+        confidence=confidence,
+        intrinsics=K_scaled,
+        extrinsics=extrinsics,
+    )
+    print(f"  Saved depth data: {output_dir / 'depth_data.npz'}")
+
     print(f"\n{'='*60}")
     print(f"Done! Results saved to: {output_dir}")
     print(f"{'='*60}")
@@ -255,6 +380,8 @@ def main():
     print(f"  - sam_regions.png: SAM segmentation")
     print(f"  - scale_map.png: Per-region scale factors")
     print(f"  - lidar_sparse.png: LiDAR anchor points")
+    print(f"  - pointcloud.ply: 3D point cloud (open in MeshLab/CloudCompare)")
+    print(f"  - depth_data.npz: Raw depth arrays for analysis")
 
 
 if __name__ == "__main__":
