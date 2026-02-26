@@ -20,6 +20,7 @@ inference, and export capabilities. It supports both single and nested model arc
 
 from __future__ import annotations
 
+import os
 import time
 from typing import Optional, Sequence
 import numpy as np
