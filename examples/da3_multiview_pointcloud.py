@@ -2,21 +2,22 @@
 """
 Multi-view DA3 depth estimation and PLY point cloud fusion.
 Uses calibrated camera poses for accurate point cloud fusion.
+Supports LiDAR alignment to convert relative depth to metric depth.
 
 Usage:
-    # Relative depth (da3-giant)
+    # Relative depth with LiDAR alignment (recommended)
     python examples/da3_multiview_pointcloud.py \
         --data_root /mnt/car_road_data_TianJin \
         --scene 001_car0325_road0327_t1 \
         --timestamp 1742877031036 \
+        --lidar_align \
         --output_dir ./output_da3_ply
 
-    # Metric depth (da3nested-giant-large)
+    # Relative depth only (no alignment)
     python examples/da3_multiview_pointcloud.py \
         --scene 001_car0325_road0327_t1 \
         --timestamp 1742877031036 \
-        --metric \
-        --output_dir ./output_da3_metric
+        --output_dir ./output_da3_ply
 """
 
 import argparse
@@ -31,6 +32,116 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from depth_anything_3.api import DepthAnything3
 from depth_anything_3.datasets.car_road_dataset import CarRoadDatasetLoader
+
+
+def project_lidar_to_camera(
+    lidar_points: np.ndarray,
+    intrinsics: np.ndarray,
+    extrinsics: np.ndarray,
+    img_width: int,
+    img_height: int,
+) -> tuple:
+    """
+    Project LiDAR points to camera image plane.
+
+    Args:
+        lidar_points: (N, 3) LiDAR points in world coordinates
+        intrinsics: (3, 3) camera intrinsic matrix
+        extrinsics: (4, 4) world-to-camera transformation
+        img_width: image width
+        img_height: image height
+
+    Returns:
+        uv: (M, 2) pixel coordinates of valid projections
+        depths: (M,) depth values at those pixels
+    """
+    # Transform to camera coordinates
+    N = lidar_points.shape[0]
+    pts_homo = np.hstack([lidar_points, np.ones((N, 1))])  # (N, 4)
+    pts_cam = (extrinsics @ pts_homo.T).T[:, :3]  # (N, 3)
+
+    # Filter points behind the camera
+    valid_depth = pts_cam[:, 2] > 0.1
+    pts_cam = pts_cam[valid_depth]
+
+    if len(pts_cam) == 0:
+        return np.array([]).reshape(0, 2), np.array([])
+
+    # Project to image plane
+    pts_2d = (intrinsics @ pts_cam.T).T  # (M, 3)
+    uv = pts_2d[:, :2] / pts_2d[:, 2:3]  # (M, 2)
+    depths = pts_cam[:, 2]  # (M,)
+
+    # Filter points outside image
+    valid_uv = (
+        (uv[:, 0] >= 0) & (uv[:, 0] < img_width) &
+        (uv[:, 1] >= 0) & (uv[:, 1] < img_height)
+    )
+    uv = uv[valid_uv]
+    depths = depths[valid_uv]
+
+    return uv, depths
+
+
+def align_depth_with_lidar(
+    pred_depth: np.ndarray,
+    lidar_uv: np.ndarray,
+    lidar_depths: np.ndarray,
+    method: str = "scale_shift",
+) -> tuple:
+    """
+    Align predicted depth with LiDAR ground truth using least squares.
+
+    Args:
+        pred_depth: (H, W) predicted relative depth
+        lidar_uv: (M, 2) pixel coordinates of LiDAR projections
+        lidar_depths: (M,) LiDAR depth values
+        method: "scale_shift" for affine alignment, "scale" for scale only
+
+    Returns:
+        aligned_depth: (H, W) aligned depth map
+        scale: fitted scale factor
+        shift: fitted shift (0 if method="scale")
+    """
+    if len(lidar_uv) < 10:
+        print(f"  Warning: Only {len(lidar_uv)} LiDAR points, using default scale")
+        return pred_depth, 1.0, 0.0
+
+    # Sample predicted depth at LiDAR locations
+    u = lidar_uv[:, 0].astype(int)
+    v = lidar_uv[:, 1].astype(int)
+    pred_at_lidar = pred_depth[v, u]
+
+    # Filter out invalid predictions
+    valid = pred_at_lidar > 0
+    pred_at_lidar = pred_at_lidar[valid]
+    lidar_d = lidar_depths[valid]
+
+    if len(pred_at_lidar) < 10:
+        print(f"  Warning: Only {len(pred_at_lidar)} valid matches, using default scale")
+        return pred_depth, 1.0, 0.0
+
+    if method == "scale_shift":
+        # Solve: lidar_d = scale * pred_at_lidar + shift
+        # Using least squares: [pred, 1] @ [scale, shift]^T = lidar_d
+        A = np.vstack([pred_at_lidar, np.ones_like(pred_at_lidar)]).T
+        result, _, _, _ = np.linalg.lstsq(A, lidar_d, rcond=None)
+        scale, shift = result
+    else:
+        # Scale only: lidar_d = scale * pred_at_lidar
+        scale = np.median(lidar_d / pred_at_lidar)
+        shift = 0.0
+
+    # Apply alignment
+    aligned_depth = pred_depth * scale + shift
+    aligned_depth = np.maximum(aligned_depth, 0)  # No negative depths
+
+    # Calculate alignment error
+    aligned_at_lidar = aligned_depth[v[valid], u[valid]]
+    mae = np.mean(np.abs(aligned_at_lidar - lidar_d))
+    print(f"  LiDAR alignment: scale={scale:.4f}, shift={shift:.4f}, MAE={mae:.4f}m")
+
+    return aligned_depth, scale, shift
 
 
 def depth_to_pointcloud(
@@ -167,8 +278,8 @@ def main():
     parser.add_argument("--output_dir", type=str, default="./output_da3_ply")
     parser.add_argument("--model", type=str, default="da3-giant",
                         help="Model: da3-giant, da3-large, da3nested-giant-large")
-    parser.add_argument("--metric", action="store_true",
-                        help="Use metric depth model (da3nested-giant-large)")
+    parser.add_argument("--lidar_align", action="store_true",
+                        help="Align depth with LiDAR (recommended)")
     parser.add_argument("--process_res", type=int, default=518)
     parser.add_argument("--downsample", type=int, default=2, help="Downsample factor")
     parser.add_argument("--conf_threshold", type=float, default=0.3, help="Confidence threshold")
@@ -176,10 +287,8 @@ def main():
     parser.add_argument("--depth_scale", type=float, default=1.0, help="Manual depth scale")
     args = parser.parse_args()
 
-    # Override model if metric flag is set
-    if args.metric:
-        args.model = "da3nested-giant-large-1.1"
-        print("Using metric depth model: da3nested-giant-large-1.1")
+    if args.lidar_align:
+        print("LiDAR alignment enabled - will convert relative depth to metric depth")
 
     # Create output directory
     output_dir = os.path.join(args.output_dir, args.scene, args.timestamp)
@@ -212,15 +321,21 @@ def main():
     # Get pinhole camera IDs
     pinhole_camera_ids = ["0", "3", "6", "9"]
 
-    # Load scene data
+    # Load scene data (with LiDAR if alignment enabled)
     print(f"\nLoading scene: {args.scene} @ {args.timestamp}")
     scene_data = loader.load_scene_data(
         scene_name=args.scene,
         timestamp=args.timestamp,
         camera_ids=pinhole_camera_ids,
-        load_merged_lidar=False,
+        load_merged_lidar=args.lidar_align,
         load_individual_lidars=False,
     )
+
+    # Get merged LiDAR points if available
+    lidar_points = None
+    if args.lidar_align and scene_data.merged_lidar is not None:
+        lidar_points = scene_data.merged_lidar[:, :3]  # (N, 3) xyz
+        print(f"Loaded merged LiDAR: {len(lidar_points):,} points")
 
     available_cameras = sorted(scene_data.images.keys())
     print(f"Available cameras: {available_cameras}")
@@ -277,6 +392,18 @@ def main():
         # Get calibration for this camera (our accurate calibrated poses)
         K = intrinsics_all[i]  # (3, 3)
         E = extrinsics_all[i]  # (4, 4)
+
+        # LiDAR alignment if enabled
+        if lidar_points is not None:
+            print("Aligning depth with LiDAR...")
+            lidar_uv, lidar_depths = project_lidar_to_camera(
+                lidar_points, K, E, img.shape[1], img.shape[0]
+            )
+            print(f"  Projected {len(lidar_uv)} LiDAR points to camera")
+            depth_resized, scale, shift = align_depth_with_lidar(
+                depth_resized, lidar_uv, lidar_depths, method="scale_shift"
+            )
+            print(f"  Aligned depth range: [{depth_resized.min():.4f}, {depth_resized.max():.4f}]")
 
         print(f"Using calibrated intrinsics:\n{K}")
         print(f"Using calibrated extrinsics (w2c):\n{E}")
