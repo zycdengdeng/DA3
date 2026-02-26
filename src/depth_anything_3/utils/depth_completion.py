@@ -242,23 +242,25 @@ class DepthCompleter:
             dense_depth[holes] = dense_nearest[holes]
 
         # Edge-aware smoothing using bilateral filter
-        rgb_gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY) if rgb.shape[-1] == 3 else rgb
         dense_depth = dense_depth.astype(np.float32)
 
-        # Normalize for bilateral filter
+        # Normalize for bilateral filter (needs 8u or 32f)
         depth_norm = dense_depth / (self.max_depth + 1e-6)
-        depth_norm = np.clip(depth_norm, 0, 1)
+        depth_norm = np.clip(depth_norm, 0, 1).astype(np.float32)
 
-        # Apply bilateral filter (edge-preserving smoothing)
+        # Apply bilateral filter (edge-preserving smoothing) - use 32f format
         depth_filtered = cv2.bilateralFilter(
-            (depth_norm * 65535).astype(np.uint16),
-            d=9, sigmaColor=75, sigmaSpace=75
-        ).astype(np.float32) / 65535 * self.max_depth
+            depth_norm,
+            d=9, sigmaColor=0.1, sigmaSpace=75
+        )
+
+        # Scale back to metric depth
+        depth_filtered = depth_filtered * self.max_depth
 
         # Preserve original sparse depth values
         depth_filtered[mask] = sparse_depth[mask]
 
-        return depth_filtered
+        return depth_filtered.astype(np.float32)
 
     def _complete_completionformer(
         self,
