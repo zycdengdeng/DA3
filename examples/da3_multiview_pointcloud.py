@@ -219,6 +219,7 @@ def depth_to_pointcloud(
     conf: np.ndarray = None,
     conf_threshold: float = 0.3,
     max_depth: float = 100.0,
+    max_view_angle: float = 90.0,
     downsample: int = 1,
 ) -> tuple:
     """
@@ -232,6 +233,9 @@ def depth_to_pointcloud(
         conf: (H, W) confidence map (optional)
         conf_threshold: Minimum confidence to keep points
         max_depth: Maximum depth to keep
+        max_view_angle: Maximum angle (degrees) from optical axis.
+                       Points outside this cone are filtered.
+                       Set to 90 to disable. Try 50-70 for roadside.
         downsample: Downsample factor for points
 
     Returns:
@@ -281,6 +285,18 @@ def depth_to_pointcloud(
 
     x = (u - cx) * z / fx
     y = (v - cy) * z / fy
+
+    # Filter by view angle: only keep points within max_view_angle of optical axis
+    # This removes noise from peripheral regions and opposite-side cameras
+    if max_view_angle < 90.0:
+        lateral_dist = np.sqrt(x**2 + y**2)
+        view_angle = np.degrees(np.arctan2(lateral_dist, z))
+        angle_valid = view_angle <= max_view_angle
+
+        x = x[angle_valid]
+        y = y[angle_valid]
+        z = z[angle_valid]
+        colors = colors[angle_valid]
 
     # Stack to (N, 3) camera coordinates
     points_cam = np.stack([x, y, z], axis=1)
@@ -360,6 +376,9 @@ def main():
     parser.add_argument("--downsample", type=int, default=2, help="Downsample factor")
     parser.add_argument("--conf_threshold", type=float, default=0.3, help="Confidence threshold")
     parser.add_argument("--max_depth", type=float, default=100.0, help="Max depth (meters)")
+    parser.add_argument("--max_view_angle", type=float, default=90.0,
+                        help="Max view angle from optical axis (degrees). "
+                             "Filters peripheral noise. Try 50-70 for roadside. Default: 90 (no filter)")
     parser.add_argument("--depth_scale", type=float, default=1.0, help="Manual depth scale")
     args = parser.parse_args()
 
@@ -496,7 +515,7 @@ def main():
         print(f"Using calibrated extrinsics (w2c):\n{E}")
 
         # Convert to point cloud
-        print("Converting to point cloud...")
+        print(f"Converting to point cloud (max_view_angle={args.max_view_angle}°)...")
         points, colors = depth_to_pointcloud(
             depth=depth_resized,
             image=img_rgb,
@@ -505,6 +524,7 @@ def main():
             conf=conf_resized,
             conf_threshold=args.conf_threshold,
             max_depth=args.max_depth,
+            max_view_angle=args.max_view_angle,
             downsample=args.downsample,
         )
 
