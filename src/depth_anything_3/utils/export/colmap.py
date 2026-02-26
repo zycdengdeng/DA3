@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import os
-import pycolmap
 import cv2 as cv
 import numpy as np
 
@@ -32,6 +31,8 @@ def export_to_colmap(
     conf_thresh_percentile: float = 40.0,
     process_res_method: str = "upper_bound_resize",
 ) -> None:
+    import pycolmap  # Lazy import to avoid CUDA library conflicts
+
     # 1. Data preparation
     conf_thresh = np.percentile(prediction.conf, conf_thresh_percentile)
     points, colors = _depths_to_world_points_with_colors(
