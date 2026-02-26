@@ -418,24 +418,293 @@ def diagnose_single_camera(
     }
 
 
+def diagnose_car_road_dataset(
+    data_root: str,
+    scene: str,
+    timestamp: str,
+    camera_id: str,
+    output_dir: str,
+    model_name: str = "da3-giant",
+    device: str = "cuda",
+):
+    """
+    Diagnose using car_road dataset structure.
+
+    Example:
+        diagnose_car_road_dataset(
+            data_root="/mnt/car_road_data_fix",
+            scene="001_car0325_road0327_t1",
+            timestamp="1742877031036",
+            camera_id="0",
+            output_dir="./diagnosis_output",
+        )
+    """
+    from depth_anything_3.datasets.car_road_dataset import CarRoadDatasetLoader
+
+    print(f"\n{'='*60}")
+    print(f"Car-Road Dataset Diagnosis")
+    print(f"{'='*60}")
+    print(f"Data root: {data_root}")
+    print(f"Scene: {scene}")
+    print(f"Timestamp: {timestamp}")
+    print(f"Camera: {camera_id}")
+
+    # Load dataset
+    loader = CarRoadDatasetLoader(data_root=data_root)
+
+    # Get camera calibration
+    cam = loader.cameras[camera_id]
+    intrinsics = cam.intrinsics
+    extrinsics = cam.extrinsics_w2c
+
+    # Load image
+    image, image_path = loader.load_image(scene, camera_id, timestamp)
+    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    print(f"Image: {image_path}")
+
+    # Load merged LiDAR
+    lidar_points = loader.load_merged_points(scene, timestamp)
+    print(f"LiDAR: {len(lidar_points):,} points")
+
+    # Find annotation
+    annotation_path = os.path.join(
+        data_root, scene, "road_labels",
+        "interpolation_labels", f"{timestamp}.json"
+    )
+    if not os.path.exists(annotation_path):
+        annotation_path = os.path.join(
+            data_root, scene, "road_labels",
+            "ori_labels", f"{timestamp}.json"
+        )
+    print(f"Annotation: {annotation_path}")
+
+    if not os.path.exists(annotation_path):
+        raise FileNotFoundError(f"Annotation not found: {annotation_path}")
+
+    # Load annotations
+    bboxes = load_annotations(annotation_path)
+    dynamic_bboxes = [b for b in bboxes if b.label in DYNAMIC_CATEGORIES]
+    print(f"Bboxes: {len(bboxes)} total, {len(dynamic_bboxes)} dynamic")
+
+    # Create output directory
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Save RGB
+    Image.fromarray(image).save(output_dir / "rgb.png")
+
+    H, W = image.shape[:2]
+
+    # Run DA3
+    print(f"\nRunning DA3 ({model_name})...")
+    model = DepthAnything3.from_pretrained(
+        {"da3-giant": "depth-anything/DA3-GIANT",
+         "da3-large": "depth-anything/DA3-LARGE"}.get(model_name, model_name)
+    )
+    model.to(device)
+    model.eval()
+
+    prediction = model.inference(image=[image], process_res=518)
+    da3_depth_raw = prediction.depth[0]
+    da3_conf = prediction.conf[0]
+    proc_image = prediction.processed_images[0]
+
+    proc_H, proc_W = da3_depth_raw.shape
+    print(f"DA3 output: {proc_W}x{proc_H}")
+
+    # Scale intrinsics
+    scale_x = proc_W / W
+    scale_y = proc_H / H
+    K_scaled = intrinsics.copy()
+    K_scaled[0, :] *= scale_x
+    K_scaled[1, :] *= scale_y
+
+    # Save raw depth
+    depth_raw_color = colorize_depth(da3_depth_raw)
+    Image.fromarray(depth_raw_color).save(output_dir / "depth_raw_relative.png")
+
+    # LiDAR alignment
+    print("\nLiDAR alignment...")
+    from depth_anything_3.utils.lidar_alignment import align_depth_with_lidar as align_fn
+    align_result = align_fn(
+        predicted_depth=da3_depth_raw,
+        lidar_points=lidar_points,
+        intrinsics=K_scaled,
+        extrinsics=extrinsics,
+        confidence=da3_conf,
+        use_ransac=True,
+    )
+    da3_depth_scaled = align_result.aligned_depth
+    print(f"Scale: {align_result.scale_factor:.4f}")
+    print(f"Inliers: {align_result.inlier_ratio:.1%}")
+
+    depth_scaled_color = colorize_depth(da3_depth_scaled, vmin=0, vmax=150)
+    Image.fromarray(depth_scaled_color).save(output_dir / "depth_scaled.png")
+
+    # Resize image
+    proc_image_resized = cv2.resize(image, (proc_W, proc_H))
+
+    # SAM masks
+    print("\nGenerating SAM masks...")
+    sam_backend = get_available_sam_backend() if SAM_AVAILABLE else None
+    print(f"SAM backend: {sam_backend or 'NOT AVAILABLE'}")
+
+    sam_generator = None
+    if sam_backend:
+        sam_generator = SAMGuidedMaskGenerator(sam_backend="auto", device=device)
+        if sam_generator.sam_available:
+            sam_generator.set_image(proc_image_resized)
+
+    # Visualize masks
+    colors = [(255,0,0), (0,255,0), (0,0,255), (255,255,0), (255,0,255), (0,255,255)]
+    mask_overlay = proc_image_resized.copy()
+    convex_overlay = proc_image_resized.copy()
+
+    for i, bbox in enumerate(dynamic_bboxes):
+        color = colors[i % len(colors)]
+        corners_3d = bbox.get_corners()
+
+        # Convex hull
+        convex_mask = project_bbox_to_2d(bbox, K_scaled, extrinsics, (proc_H, proc_W))
+        if convex_mask is not None:
+            convex_overlay = overlay_mask(convex_overlay, convex_mask, color, 0.3)
+
+        # SAM mask
+        if sam_generator and sam_generator.sam_available:
+            sam_mask = sam_generator.generate_mask(
+                bbox_3d_corners=corners_3d,
+                intrinsics=K_scaled,
+                extrinsics=extrinsics,
+                image_hw=(proc_H, proc_W),
+            )
+            if sam_mask is not None:
+                mask_overlay = overlay_mask(mask_overlay, sam_mask, color, 0.4)
+                mask_vis = np.zeros((proc_H, proc_W, 3), dtype=np.uint8)
+                mask_vis[sam_mask] = color
+                Image.fromarray(mask_vis).save(output_dir / f"sam_mask_{i}_{bbox.label}.png")
+                print(f"  {bbox.label}: SAM={sam_mask.sum():,}px, convex={convex_mask.sum() if convex_mask is not None else 0:,}px")
+
+    Image.fromarray(mask_overlay).save(output_dir / "sam_masks_overlay.png")
+    Image.fromarray(convex_overlay).save(output_dir / "convex_hull_overlay.png")
+
+    # Depth completion
+    print("\nDepth completion...")
+    completer = SemanticDepthCompleter(
+        max_depth=300.0,
+        use_sam=(sam_generator is not None and sam_generator.sam_available),
+        device=device,
+    )
+
+    depth_completed, info = completer.complete(
+        rgb=proc_image_resized,
+        lidar_points=lidar_points,
+        bboxes=bboxes,
+        intrinsics=K_scaled,
+        extrinsics=extrinsics,
+        da3_depth=da3_depth_scaled,
+    )
+
+    depth_completed_color = colorize_depth(depth_completed, vmin=0, vmax=150)
+    Image.fromarray(depth_completed_color).save(output_dir / "depth_completed.png")
+
+    # Difference
+    depth_diff = np.abs(depth_completed - da3_depth_scaled)
+    diff_max = np.percentile(depth_diff[depth_diff > 0], 95) if (depth_diff > 0).any() else 10
+    diff_norm = np.clip(depth_diff / diff_max, 0, 1)
+    diff_color = (plt.get_cmap('hot')(diff_norm)[:, :, :3] * 255).astype(np.uint8)
+    diff_color[depth_diff < 0.1] = 0
+    Image.fromarray(diff_color).save(output_dir / "depth_diff.png")
+
+    # Summary figure
+    fig, axes = plt.subplots(2, 4, figsize=(20, 10))
+    axes[0, 0].imshow(proc_image_resized)
+    axes[0, 0].set_title("RGB")
+    axes[0, 0].axis('off')
+
+    axes[0, 1].imshow(depth_raw_color)
+    axes[0, 1].set_title("DA3 Raw (Relative)")
+    axes[0, 1].axis('off')
+
+    axes[0, 2].imshow(depth_scaled_color)
+    axes[0, 2].set_title(f"Scaled (s={align_result.scale_factor:.3f})")
+    axes[0, 2].axis('off')
+
+    axes[0, 3].imshow(depth_completed_color)
+    axes[0, 3].set_title("Completed")
+    axes[0, 3].axis('off')
+
+    axes[1, 0].imshow(convex_overlay)
+    axes[1, 0].set_title("Convex Hull")
+    axes[1, 0].axis('off')
+
+    axes[1, 1].imshow(mask_overlay)
+    axes[1, 1].set_title(f"SAM ({sam_backend or 'N/A'})")
+    axes[1, 1].axis('off')
+
+    axes[1, 2].imshow(diff_color)
+    axes[1, 2].set_title("Diff (completion)")
+    axes[1, 2].axis('off')
+
+    conf_color = colorize_depth(da3_conf, cmap='viridis')
+    axes[1, 3].imshow(conf_color)
+    axes[1, 3].set_title("Confidence")
+    axes[1, 3].axis('off')
+
+    plt.tight_layout()
+    plt.savefig(output_dir / "diagnosis_summary.png", dpi=150)
+    plt.close()
+
+    print(f"\n{'='*60}")
+    print(f"Done! Results: {output_dir}")
+    print(f"{'='*60}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Diagnose depth completion and SAM segmentation")
-    parser.add_argument("--image", type=str, required=True, help="Path to image")
-    parser.add_argument("--lidar", type=str, required=True, help="Path to LiDAR points")
-    parser.add_argument("--annotation", type=str, required=True, help="Path to annotation JSON")
-    parser.add_argument("--intrinsics", type=str, required=True, help="Path to intrinsics (txt or npy)")
-    parser.add_argument("--extrinsics", type=str, required=True, help="Path to extrinsics (txt or npy)")
+
+    # Mode 1: Car-road dataset (simpler)
+    parser.add_argument("--data_root", type=str, default="/mnt/car_road_data_fix",
+                        help="Car-road dataset root")
+    parser.add_argument("--scene", type=str, help="Scene name (e.g., 001_car0325_road0327_t1)")
+    parser.add_argument("--timestamp", type=str, help="Timestamp (e.g., 1742877031036)")
+    parser.add_argument("--camera_id", type=str, default="0", help="Camera ID (0, 3, 6, or 9)")
+
+    # Mode 2: Manual paths
+    parser.add_argument("--image", type=str, help="Path to image")
+    parser.add_argument("--lidar", type=str, help="Path to LiDAR points")
+    parser.add_argument("--annotation", type=str, help="Path to annotation JSON")
+    parser.add_argument("--intrinsics", type=str, help="Path to intrinsics (txt or npy)")
+    parser.add_argument("--extrinsics", type=str, help="Path to extrinsics (txt or npy)")
+
+    # Common
     parser.add_argument("--output", type=str, required=True, help="Output directory")
     parser.add_argument("--model", type=str, default="da3-giant", help="DA3 model name")
     parser.add_argument("--device", type=str, default="cuda", help="Device")
 
     args = parser.parse_args()
 
+    # Mode 1: Car-road dataset
+    if args.scene and args.timestamp:
+        diagnose_car_road_dataset(
+            data_root=args.data_root,
+            scene=args.scene,
+            timestamp=args.timestamp,
+            camera_id=args.camera_id,
+            output_dir=args.output,
+            model_name=args.model,
+            device=args.device,
+        )
+        return
+
+    # Mode 2: Manual paths
+    if not all([args.image, args.lidar, args.annotation, args.intrinsics, args.extrinsics]):
+        parser.error("Either provide --scene/--timestamp OR all manual paths")
+
     # Load calibration
     if args.intrinsics.endswith('.npy'):
         intrinsics = np.load(args.intrinsics)
         if intrinsics.ndim == 3:
-            intrinsics = intrinsics[0]  # Take first camera
+            intrinsics = intrinsics[0]
     else:
         intrinsics = np.loadtxt(args.intrinsics).reshape(3, 3)
 
