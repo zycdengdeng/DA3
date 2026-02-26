@@ -432,7 +432,7 @@ def diagnose_car_road_dataset(
 
     Example:
         diagnose_car_road_dataset(
-            data_root="/mnt/car_road_data_fix",
+            data_root="/mnt/car_road_data_TianJin",
             scene="001_car0325_road0327_t1",
             timestamp="1742877031036",
             camera_id="0",
@@ -663,7 +663,7 @@ def main():
     parser = argparse.ArgumentParser(description="Diagnose depth completion and SAM segmentation")
 
     # Mode 1: Car-road dataset (simpler)
-    parser.add_argument("--data_root", type=str, default="/mnt/car_road_data_fix",
+    parser.add_argument("--data_root", type=str, default="/mnt/car_road_data_TianJin",
                         help="Car-road dataset root")
     parser.add_argument("--scene", type=str, help="Scene name (e.g., 001_car0325_road0327_t1)")
     parser.add_argument("--timestamp", type=str, help="Timestamp (e.g., 1742877031036)")
