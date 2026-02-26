@@ -246,7 +246,7 @@ def main():
             extrinsics=extrinsics,
         )
 
-        print(f"    Regions: {result.num_regions}, Aligned: {result.num_aligned_regions}")
+        print(f"    Regions: {result.num_regions}, Coverage: {result.coverage*100:.1f}%")
 
         # Convert to point cloud
         points, colors = depth_to_pointcloud(
