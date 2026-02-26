@@ -281,6 +281,10 @@ def main():
                         help="Confidence threshold percentile (default: 30)")
     parser.add_argument("--no_ransac", action="store_true",
                         help="Disable RANSAC for LiDAR alignment")
+    parser.add_argument("--max_view_angle", type=float, default=70.0,
+                        help="Max angle (degrees) from optical axis. Filters peripheral noise. (default: 70)")
+    parser.add_argument("--max_depth", type=float, default=150.0,
+                        help="Max depth in meters. Filters distant points. (default: 150)")
     parser.add_argument("--create_example_calib", action="store_true",
                         help="Create example calibration files and exit")
 
@@ -324,6 +328,9 @@ def main():
     print(f"RANSAC: {'disabled' if args.no_ransac else 'enabled'}")
 
     # Run reconstruction
+    print(f"Max view angle: {args.max_view_angle}°")
+    print(f"Max depth: {args.max_depth}m")
+
     result = reconstruct_intersection(
         images=images,
         intrinsics=intrinsics,
@@ -333,6 +340,8 @@ def main():
         export_dir=args.output_dir,
         conf_threshold_percentile=args.conf_threshold,
         use_ransac=not args.no_ransac,
+        max_view_angle=args.max_view_angle,
+        max_depth=args.max_depth,
     )
 
     # Print summary
