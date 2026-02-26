@@ -36,6 +36,10 @@ from depth_anything_3.utils.lidar_alignment import (
     adaptive_depth_fusion,
     lidar_anchored_depth,
 )
+from depth_anything_3.utils.depth_completion import (
+    DepthCompleter,
+    create_sparse_depth_from_lidar,
+)
 
 
 def project_lidar_to_camera(
@@ -392,6 +396,13 @@ def main():
                              "constraint, camera only fills gaps. RECOMMENDED for best quality.")
     parser.add_argument("--use_ground_plane", action="store_true", default=True,
                         help="Enable ground plane constraint (default: True)")
+    parser.add_argument("--depth_completion", type=str, default=None,
+                        choices=["completionformer", "simple"],
+                        help="Use depth completion network instead of DA3. "
+                             "Input: sparse LiDAR + RGB -> Output: dense metric depth. "
+                             "Recommended: 'completionformer' for best quality, 'simple' as fallback.")
+    parser.add_argument("--completion_model", type=str, default=None,
+                        help="Path to depth completion model weights")
     parser.add_argument("--density_sigma", type=float, default=15.0,
                         help="Density smoothing sigma for adaptive fusion (default: 15)")
     parser.add_argument("--distance_threshold", type=float, default=30.0,
@@ -409,25 +420,42 @@ def main():
     print("Loading dataset...")
     loader = CarRoadDatasetLoader(args.data_root)
 
-    # Load model
-    print(f"\nLoading DA3 model: {args.model}")
-    model_repo_map = {
-        "da3-giant": "depth-anything/DA3-GIANT",
-        "da3-large": "depth-anything/DA3-LARGE",
-        "da3-base": "depth-anything/DA3-BASE",
-        "da3-small": "depth-anything/DA3-SMALL",
-        "da3nested-giant-large": "depth-anything/DA3NESTED-GIANT-LARGE",
-        "da3nested-giant-large-1.1": "depth-anything/DA3NESTED-GIANT-LARGE-1.1",
-        "da3metric-large": "depth-anything/DA3METRIC-LARGE",
-    }
-    repo_id = model_repo_map.get(args.model.lower(), args.model)
-    print(f"Loading from: {repo_id}")
-    model = DepthAnything3.from_pretrained(repo_id)
-    model.to("cuda")
-    model.eval()
+    # Initialize depth estimation model
+    model = None
+    depth_completer = None
+    is_metric = False
 
-    is_metric = "nested" in args.model.lower() or "metric" in args.model.lower()
-    print(f"Metric depth: {is_metric}")
+    if args.depth_completion:
+        # Use depth completion network (sparse LiDAR + RGB -> dense depth)
+        print(f"\nUsing depth completion: {args.depth_completion}")
+        depth_completer = DepthCompleter(
+            method=args.depth_completion,
+            model_path=args.completion_model,
+            device="cuda",
+            max_depth=args.max_depth,
+        )
+        is_metric = True  # Depth completion outputs metric depth
+        print("Depth completion outputs METRIC depth (no alignment needed)")
+    else:
+        # Load DA3 model
+        print(f"\nLoading DA3 model: {args.model}")
+        model_repo_map = {
+            "da3-giant": "depth-anything/DA3-GIANT",
+            "da3-large": "depth-anything/DA3-LARGE",
+            "da3-base": "depth-anything/DA3-BASE",
+            "da3-small": "depth-anything/DA3-SMALL",
+            "da3nested-giant-large": "depth-anything/DA3NESTED-GIANT-LARGE",
+            "da3nested-giant-large-1.1": "depth-anything/DA3NESTED-GIANT-LARGE-1.1",
+            "da3metric-large": "depth-anything/DA3METRIC-LARGE",
+        }
+        repo_id = model_repo_map.get(args.model.lower(), args.model)
+        print(f"Loading from: {repo_id}")
+        model = DepthAnything3.from_pretrained(repo_id)
+        model.to("cuda")
+        model.eval()
+
+        is_metric = "nested" in args.model.lower() or "metric" in args.model.lower()
+        print(f"Metric depth: {is_metric}")
 
     # Get pinhole camera IDs
     pinhole_camera_ids = ["0", "3", "6", "9"]
@@ -477,87 +505,111 @@ def main():
         img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         print(f"Image size: {img.shape[1]}x{img.shape[0]}")
 
-        # Run DA3 inference
-        print(f"Running DA3 inference (process_res={args.process_res})...")
-        prediction = model.inference(
-            image=[img_path],
-            process_res=args.process_res,
-        )
-
-        depth = prediction.depth[0]  # (H, W)
-        conf = prediction.conf[0] if prediction.conf is not None else None
-
-        print(f"Depth shape: {depth.shape}")
-        print(f"Depth range: [{depth.min():.4f}, {depth.max():.4f}]")
-
-        # Apply manual scale
-        depth = depth * args.depth_scale
-
-        # Resize depth to original image size
-        depth_resized = cv2.resize(depth, (img.shape[1], img.shape[0]))
-        if conf is not None:
-            conf_resized = cv2.resize(conf, (img.shape[1], img.shape[0]))
-        else:
-            conf_resized = None
-
-        # Get calibration for this camera (our accurate calibrated poses)
+        # Get calibration for this camera
         K = intrinsics_all[i]  # (3, 3)
         E = extrinsics_all[i]  # (4, 4)
 
-        # LiDAR-based depth processing
-        if lidar_points is not None:
-            if args.lidar_anchored:
-                # NEW: LiDAR-anchored depth (recommended)
-                # LiDAR = ground truth, ground plane = geometric truth, camera fills gaps
-                print(f"Using LiDAR-anchored depth (ground_plane={args.use_ground_plane})...")
-                depth_resized, source_map, info = lidar_anchored_depth(
-                    camera_depth=depth_resized,  # Raw relative depth
-                    lidar_points=lidar_points,
-                    intrinsics=K,
-                    extrinsics=E,
-                    use_ground_plane=args.use_ground_plane,
-                )
-                print(f"  Source: LiDAR={info['n_lidar']}, Ground={info['n_ground']}, Camera={info['n_camera']}")
-                print(f"  Anchored depth range: [{depth_resized.min():.4f}, {depth_resized.max():.4f}]")
+        conf = None
+        conf_resized = None
 
-            else:
-                # Original: scale alignment + optional adaptive fusion
-                print(f"Aligning depth with LiDAR (method={args.align_method})...")
-                lidar_uv, lidar_depths = project_lidar_to_camera(
-                    lidar_points, K, E, img.shape[1], img.shape[0]
-                )
-                print(f"  Projected {len(lidar_uv)} LiDAR points to camera")
+        if depth_completer is not None:
+            # Depth completion mode: sparse LiDAR + RGB -> dense depth
+            print(f"Running depth completion ({args.depth_completion})...")
 
-                # Build depth range if specified
-                depth_range = None
-                if args.align_depth_min is not None or args.align_depth_max is not None:
-                    depth_range = (
-                        args.align_depth_min if args.align_depth_min else 0.0,
-                        args.align_depth_max if args.align_depth_max else 1000.0,
-                    )
+            if lidar_points is None:
+                print("ERROR: Depth completion requires LiDAR! Use --lidar_align")
+                return
 
-                depth_resized, scale, shift = align_depth_with_lidar(
-                    depth_resized, lidar_uv, lidar_depths,
-                    method=args.align_method,
-                    depth_range=depth_range,
-                )
-                print(f"  Aligned depth range: [{depth_resized.min():.4f}, {depth_resized.max():.4f}]")
+            # Create sparse depth from LiDAR projection
+            sparse_depth, valid_mask = create_sparse_depth_from_lidar(
+                lidar_points, K, E, (img.shape[0], img.shape[1])
+            )
+            n_valid = valid_mask.sum()
+            print(f"  Sparse LiDAR: {n_valid} pixels ({n_valid/(img.shape[0]*img.shape[1])*100:.2f}%)")
 
-                # Adaptive fusion: use LiDAR where dense, camera where sparse
-                if args.adaptive_fusion:
-                    print(f"Applying adaptive camera/LiDAR fusion...")
-                    fused_depth, lidar_weight, _ = adaptive_depth_fusion(
-                        camera_depth=depth_resized,
+            # Complete depth
+            depth_resized = depth_completer.complete(img_rgb, sparse_depth, valid_mask)
+            print(f"  Completed depth range: [{depth_resized.min():.2f}, {depth_resized.max():.2f}]m")
+
+            # Skip further LiDAR processing (already metric)
+            lidar_points_for_camera = None
+
+        else:
+            # DA3 mode: run depth estimation
+            print(f"Running DA3 inference (process_res={args.process_res})...")
+            prediction = model.inference(
+                image=[img_path],
+                process_res=args.process_res,
+            )
+
+            depth = prediction.depth[0]  # (H, W)
+            conf = prediction.conf[0] if prediction.conf is not None else None
+
+            print(f"Depth shape: {depth.shape}")
+            print(f"Depth range: [{depth.min():.4f}, {depth.max():.4f}]")
+
+            # Apply manual scale
+            depth = depth * args.depth_scale
+
+            # Resize depth to original image size
+            depth_resized = cv2.resize(depth, (img.shape[1], img.shape[0]))
+            if conf is not None:
+                conf_resized = cv2.resize(conf, (img.shape[1], img.shape[0]))
+
+            # LiDAR-based depth processing (only for DA3 mode)
+            if lidar_points is not None:
+                if args.lidar_anchored:
+                    # NEW: LiDAR-anchored depth (recommended)
+                    # LiDAR = ground truth, ground plane = geometric truth, camera fills gaps
+                    print(f"Using LiDAR-anchored depth (ground_plane={args.use_ground_plane})...")
+                    depth_resized, source_map, info = lidar_anchored_depth(
+                        camera_depth=depth_resized,  # Raw relative depth
                         lidar_points=lidar_points,
                         intrinsics=K,
                         extrinsics=E,
-                        camera_confidence=conf_resized,
-                        density_sigma=args.density_sigma,
-                        distance_threshold=args.distance_threshold,
+                        use_ground_plane=args.use_ground_plane,
                     )
-                    depth_resized = fused_depth
-                    print(f"  LiDAR weight: mean={lidar_weight.mean():.2%}, max={lidar_weight.max():.2%}")
-                    print(f"  Fused depth range: [{depth_resized.min():.4f}, {depth_resized.max():.4f}]")
+                    print(f"  Source: LiDAR={info['n_lidar']}, Ground={info['n_ground']}, Camera={info['n_camera']}")
+                    print(f"  Anchored depth range: [{depth_resized.min():.4f}, {depth_resized.max():.4f}]")
+
+                else:
+                    # Original: scale alignment + optional adaptive fusion
+                    print(f"Aligning depth with LiDAR (method={args.align_method})...")
+                    lidar_uv, lidar_depths = project_lidar_to_camera(
+                        lidar_points, K, E, img.shape[1], img.shape[0]
+                    )
+                    print(f"  Projected {len(lidar_uv)} LiDAR points to camera")
+
+                    # Build depth range if specified
+                    depth_range = None
+                    if args.align_depth_min is not None or args.align_depth_max is not None:
+                        depth_range = (
+                            args.align_depth_min if args.align_depth_min else 0.0,
+                            args.align_depth_max if args.align_depth_max else 1000.0,
+                        )
+
+                    depth_resized, scale, shift = align_depth_with_lidar(
+                        depth_resized, lidar_uv, lidar_depths,
+                        method=args.align_method,
+                        depth_range=depth_range,
+                    )
+                    print(f"  Aligned depth range: [{depth_resized.min():.4f}, {depth_resized.max():.4f}]")
+
+                    # Adaptive fusion: use LiDAR where dense, camera where sparse
+                    if args.adaptive_fusion:
+                        print(f"Applying adaptive camera/LiDAR fusion...")
+                        fused_depth, lidar_weight, _ = adaptive_depth_fusion(
+                            camera_depth=depth_resized,
+                            lidar_points=lidar_points,
+                            intrinsics=K,
+                            extrinsics=E,
+                            camera_confidence=conf_resized,
+                            density_sigma=args.density_sigma,
+                            distance_threshold=args.distance_threshold,
+                        )
+                        depth_resized = fused_depth
+                        print(f"  LiDAR weight: mean={lidar_weight.mean():.2%}, max={lidar_weight.max():.2%}")
+                        print(f"  Fused depth range: [{depth_resized.min():.4f}, {depth_resized.max():.4f}]")
 
         print(f"Using calibrated intrinsics:\n{K}")
         print(f"Using calibrated extrinsics (w2c):\n{E}")
