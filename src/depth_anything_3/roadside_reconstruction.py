@@ -159,6 +159,8 @@ class RoadsideReconstructor:
         ransac_threshold: float = 0.15,
         export_dir: Optional[str] = None,
         max_points_per_camera: int = 500_000,
+        max_view_angle: float = 70.0,  # Filter points outside this angle from optical axis
+        max_depth: float = 150.0,  # Maximum depth to keep (meters)
     ) -> ReconstructionResult:
         """
         Reconstruct roadside scene from multi-camera images with LiDAR alignment.
@@ -175,6 +177,12 @@ class RoadsideReconstructor:
             ransac_threshold: RANSAC inlier threshold (relative to depth)
             export_dir: Optional directory to export results
             max_points_per_camera: Maximum points to keep per camera
+            max_view_angle: Maximum angle (degrees) from camera optical axis.
+                           Points outside this cone are filtered. This removes
+                           noise from peripheral regions and opposite-side cameras.
+                           Default: 70 degrees (keeps central ~140° FOV)
+            max_depth: Maximum depth in meters. Points beyond this are filtered.
+                       Default: 150m (appropriate for roadside scenarios)
 
         Returns:
             ReconstructionResult with depth maps, point clouds, and fusion
@@ -293,6 +301,7 @@ class RoadsideReconstructor:
             conf_thresh = np.percentile(conf[conf > 0], conf_threshold_percentile)
 
             # Create point cloud using scaled intrinsics
+            # Filter by view angle to remove noise from peripheral/opposite-side regions
             points, point_colors = self._depth_to_pointcloud(
                 depth=depth,
                 confidence=conf,
@@ -301,6 +310,8 @@ class RoadsideReconstructor:
                 extrinsics=extrinsics[cam_idx],
                 conf_threshold=conf_thresh,
                 max_points=max_points_per_camera,
+                max_depth=max_depth,
+                max_view_angle=max_view_angle,
             )
 
             point_clouds[cam_id] = points
@@ -352,6 +363,7 @@ class RoadsideReconstructor:
         conf_threshold: float = 0.5,
         max_points: int = 500_000,
         max_depth: float = 250.0,
+        max_view_angle: float = 70.0,  # Maximum angle from camera optical axis (degrees)
     ) -> Tuple[np.ndarray, np.ndarray]:
         """Convert depth map to world-space point cloud."""
 
@@ -381,6 +393,18 @@ class RoadsideReconstructor:
         x_cam = (u - cx) * z / fx
         y_cam = (v - cy) * z / fy
         z_cam = z
+
+        # Filter by view angle: only keep points within max_view_angle of optical axis
+        # This removes noise from peripheral regions and opposite-side cameras
+        if max_view_angle < 90.0:
+            # Compute angle from optical axis (z-axis in camera space)
+            # angle = arctan(sqrt(x^2 + y^2) / z)
+            lateral_dist = np.sqrt(x_cam**2 + y_cam**2)
+            view_angle = np.degrees(np.arctan2(lateral_dist, z_cam))
+            angle_valid = view_angle <= max_view_angle
+
+            x_cam, y_cam, z_cam = x_cam[angle_valid], y_cam[angle_valid], z_cam[angle_valid]
+            u, v, conf = u[angle_valid], v[angle_valid], conf[angle_valid]
 
         points_cam = np.stack([x_cam, y_cam, z_cam, np.ones_like(z_cam)], axis=1)  # (N, 4)
 
