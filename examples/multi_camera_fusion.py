@@ -1,9 +1,17 @@
 #!/usr/bin/env python3
 """
-Multi-Camera Point Cloud Fusion.
+Multi-Camera Point Cloud Fusion with LiDAR Depth Completion.
 
-Fuses depth from 4 pinhole cameras into a unified 3D point cloud.
-Each camera: DA3 → relative depth → region-wise alignment → world points → merge
+Pipeline:
+1. Project LiDAR points to each camera → sparse depth map
+2. Use depth completion to fill in dense depth (guided by RGB)
+3. Convert dense depth to point cloud
+4. Merge all cameras
+
+This approach is better than monocular depth estimation because:
+- LiDAR provides accurate metric depth (no scale ambiguity)
+- Depth completion preserves edges guided by RGB
+- Much better coverage for far-field regions
 """
 
 import argparse
@@ -18,12 +26,10 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from depth_anything_3.api import DepthAnything3
 from depth_anything_3.datasets.car_road_dataset import CarRoadDatasetLoader
-from depth_anything_3.utils.region_depth_alignment import (
-    RegionWiseDepthAligner,
-    project_lidar_to_image,
-    create_sparse_depth_map,
+from depth_anything_3.utils.depth_completion import (
+    DepthCompleter,
+    create_sparse_depth_from_lidar,
 )
 
 
@@ -50,10 +56,8 @@ def depth_to_pointcloud(
     rgb: np.ndarray,
     intrinsics: np.ndarray,
     extrinsics: np.ndarray,
-    confidence: np.ndarray = None,
-    max_depth: float = 150.0,
-    conf_threshold: float = 0.3,
-    max_points: int = 300000,
+    max_depth: float = 300.0,
+    min_depth: float = 0.5,
 ):
     """
     Convert depth map to colored point cloud in world coordinates.
@@ -63,10 +67,8 @@ def depth_to_pointcloud(
         rgb: (H, W, 3) RGB image
         intrinsics: (3, 3) camera intrinsics
         extrinsics: (4, 4) world-to-camera transform
-        confidence: (H, W) optional confidence map
         max_depth: maximum depth to keep
-        conf_threshold: minimum confidence percentile
-        max_points: maximum points to output
+        min_depth: minimum depth to keep
 
     Returns:
         points: (N, 3) world coordinates
@@ -81,20 +83,11 @@ def depth_to_pointcloud(
     z = depth.flatten()
 
     # Filter valid depth
-    valid = (z > 0.1) & (z < max_depth) & np.isfinite(z)
-
-    # Filter by confidence
-    if confidence is not None:
-        conf = confidence.flatten()
-        conf_thresh = np.percentile(conf[conf > 0], conf_threshold * 100) if (conf > 0).any() else 0
-        valid &= conf >= conf_thresh
-
+    valid = (z > min_depth) & (z < max_depth) & np.isfinite(z)
     u, v, z = u[valid], v[valid], z[valid]
 
-    # Subsample if too many (skip if max_points <= 0)
-    if max_points > 0 and len(z) > max_points:
-        indices = np.random.choice(len(z), max_points, replace=False)
-        u, v, z = u[indices], v[indices], z[indices]
+    if len(z) == 0:
+        return np.zeros((0, 3)), np.zeros((0, 3), dtype=np.uint8)
 
     # Unproject to camera space
     fx, fy = intrinsics[0, 0], intrinsics[1, 1]
@@ -140,7 +133,7 @@ def save_ply(filepath: str, points: np.ndarray, colors: np.ndarray):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Multi-camera point cloud fusion")
+    parser = argparse.ArgumentParser(description="Multi-camera point cloud fusion with LiDAR depth completion")
 
     parser.add_argument("--data_root", type=str, default="/mnt/car_road_data_TianJin")
     parser.add_argument("--scene", type=str, required=True)
@@ -148,15 +141,16 @@ def main():
     parser.add_argument("--cameras", type=str, default="0,3,6,9",
                         help="Comma-separated camera IDs (default: 0,3,6,9 for 4 pinhole)")
     parser.add_argument("--output", type=str, required=True)
-    parser.add_argument("--model", type=str, default="da3-giant")
+    parser.add_argument("--completion_method", type=str, default="simple",
+                        choices=["simple", "completionformer"],
+                        help="Depth completion method (default: simple)")
+    parser.add_argument("--completionformer_weights", type=str, default=None,
+                        help="Path to CompletionFormer weights (if using completionformer)")
+    parser.add_argument("--max_depth", type=float, default=300.0,
+                        help="Maximum depth (default: 300m)")
+    parser.add_argument("--process_res", type=int, default=None,
+                        help="Processing resolution (default: native)")
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--sam_checkpoint", type=str, default=None)
-    parser.add_argument("--sam_points_per_side", type=int, default=48,
-                        help="SAM grid density (higher = finer segmentation, default: 48)")
-    parser.add_argument("--max_depth", type=float, default=350.0,
-                        help="Maximum depth to include in point cloud (default: 350m)")
-    parser.add_argument("--max_points_per_cam", type=int, default=0,
-                        help="Max points per camera (0 = no limit, keep all)")
 
     args = parser.parse_args()
 
@@ -165,14 +159,16 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"\n{'='*60}")
-    print(f"Multi-Camera Point Cloud Fusion")
+    print(f"Multi-Camera Fusion with LiDAR Depth Completion")
     print(f"{'='*60}")
     print(f"  Scene: {args.scene}")
     print(f"  Timestamp: {args.timestamp}")
     print(f"  Cameras: {camera_ids}")
+    print(f"  Completion method: {args.completion_method}")
+    print(f"  Max depth: {args.max_depth}m")
 
     # Load data
-    print("\n[1/5] Loading dataset...")
+    print("\n[1/4] Loading dataset...")
     loader = CarRoadDatasetLoader(data_root=args.data_root)
 
     # Load merged LiDAR
@@ -182,30 +178,18 @@ def main():
           f"Y=[{lidar_points[:,1].min():.1f}, {lidar_points[:,1].max():.1f}], "
           f"Z=[{lidar_points[:,2].min():.1f}, {lidar_points[:,2].max():.1f}]")
 
-    # Load DA3 model
-    print("\n[2/5] Loading DA3 model...")
-    model = DepthAnything3.from_pretrained(
-        {"da3-giant": "depth-anything/DA3-GIANT",
-         "da3-large": "depth-anything/DA3-LARGE"}.get(args.model, args.model)
-    )
-    model.to(args.device)
-    model.eval()
-
-    # Initialize aligner
-    print("\n[3/5] Initializing SAM aligner...")
-    aligner = RegionWiseDepthAligner(
-        sam_checkpoint=args.sam_checkpoint,
+    # Initialize depth completer
+    print("\n[2/4] Initializing depth completer...")
+    completer = DepthCompleter(
+        method=args.completion_method,
+        model_path=args.completionformer_weights,
         device=args.device,
-        min_anchors_per_region=3,
-        sam_points_per_side=args.sam_points_per_side,
+        max_depth=args.max_depth,
     )
-
-    if not aligner.sam_available:
-        print("  WARNING: SAM not available!")
-        return
+    print(f"  Method: {args.completion_method}")
 
     # Process each camera
-    print("\n[4/5] Processing cameras...")
+    print("\n[3/4] Processing cameras...")
     all_points = []
     all_colors = []
 
@@ -221,63 +205,66 @@ def main():
             continue
 
         cam = loader.cameras[cam_id]
-        intrinsics = cam.intrinsics
+        intrinsics = cam.intrinsics.copy()
         extrinsics = cam.extrinsics_w2c
 
         H, W = image.shape[:2]
+        print(f"    Image: {W}x{H}")
 
-        # DA3 inference
-        prediction = model.inference(image=[image], process_res=518)
-        relative_depth = prediction.depth[0]
-        confidence = prediction.conf[0]
+        # Optionally resize
+        if args.process_res is not None and args.process_res != H:
+            scale = args.process_res / H
+            new_H = args.process_res
+            new_W = int(W * scale)
+            image = cv2.resize(image, (new_W, new_H))
+            intrinsics[0, :] *= scale
+            intrinsics[1, :] *= scale
+            H, W = new_H, new_W
+            print(f"    Resized to: {W}x{H}")
 
-        proc_H, proc_W = relative_depth.shape
-        print(f"    DA3: {proc_W}x{proc_H}")
-
-        # Scale intrinsics
-        scale_x = proc_W / W
-        scale_y = proc_H / H
-        K_scaled = intrinsics.copy()
-        K_scaled[0, :] *= scale_x
-        K_scaled[1, :] *= scale_y
-
-        # Resize image
-        image_resized = cv2.resize(image, (proc_W, proc_H))
-
-        # Region-wise alignment
-        result = aligner.align(
-            image=image_resized,
-            relative_depth=relative_depth,
-            lidar_points=lidar_points,
-            intrinsics=K_scaled,
+        # Step 1: Project LiDAR to camera → sparse depth
+        sparse_depth, valid_mask = create_sparse_depth_from_lidar(
+            lidar_points=lidar_points[:, :3],
+            intrinsics=intrinsics,
             extrinsics=extrinsics,
+            image_hw=(H, W),
         )
 
-        print(f"    Regions: {result.num_regions}, Coverage: {result.coverage*100:.1f}%")
+        n_sparse = valid_mask.sum()
+        sparse_ratio = n_sparse / (H * W) * 100
+        print(f"    Sparse depth: {n_sparse:,} points ({sparse_ratio:.2f}% coverage)")
 
-        # Debug: check aligned depth stats
-        ad = result.aligned_depth
-        valid_depth = ad[(ad > 0) & np.isfinite(ad)]
-        print(f"    Aligned depth: min={valid_depth.min():.2f}, max={valid_depth.max():.2f}, "
-              f"mean={valid_depth.mean():.2f}, valid_pixels={len(valid_depth)}")
+        if n_sparse < 100:
+            print(f"    WARNING: Very few LiDAR points visible, skipping")
+            continue
 
-        # Convert to point cloud (disable confidence filtering to keep all points)
+        sparse_depth_range = sparse_depth[valid_mask]
+        print(f"    Sparse depth range: [{sparse_depth_range.min():.1f}, {sparse_depth_range.max():.1f}]m")
+
+        # Step 2: Depth completion
+        dense_depth = completer.complete(
+            rgb=image,
+            sparse_depth=sparse_depth,
+            mask=valid_mask,
+        )
+
+        dense_valid = dense_depth > 0.1
+        print(f"    Dense depth: {dense_valid.sum():,} pixels ({dense_valid.sum()/(H*W)*100:.1f}% coverage)")
+        print(f"    Dense depth range: [{dense_depth[dense_valid].min():.1f}, {dense_depth[dense_valid].max():.1f}]m")
+
+        # Step 3: Convert to point cloud
         points, colors = depth_to_pointcloud(
-            depth=result.aligned_depth,
-            rgb=image_resized,
-            intrinsics=K_scaled,
+            depth=dense_depth,
+            rgb=image,
+            intrinsics=intrinsics,
             extrinsics=extrinsics,
-            confidence=None,  # Disable confidence filtering
             max_depth=args.max_depth,
-            conf_threshold=0.0,
-            max_points=0,  # No limit
         )
 
         print(f"    Points: {len(points):,}")
         if len(points) > 0:
             print(f"    Point cloud range: X=[{points[:,0].min():.1f}, {points[:,0].max():.1f}], "
-                  f"Y=[{points[:,1].min():.1f}, {points[:,1].max():.1f}], "
-                  f"Z=[{points[:,2].min():.1f}, {points[:,2].max():.1f}]")
+                  f"Y=[{points[:,1].min():.1f}, {points[:,1].max():.1f}]")
 
         all_points.append(points)
         all_colors.append(colors)
@@ -287,62 +274,42 @@ def main():
         cam_dir.mkdir(exist_ok=True)
 
         # 1. RGB image
-        Image.fromarray(image_resized).save(cam_dir / "1_rgb.png")
+        Image.fromarray(image).save(cam_dir / "1_rgb.png")
 
-        # 2. DA3 relative depth (normalized for visualization)
-        if result.relative_depth is not None:
-            rel_depth_vis = colorize_depth(result.relative_depth)
-            Image.fromarray(rel_depth_vis).save(cam_dir / "2_da3_relative_depth.png")
+        # 2. Sparse depth (LiDAR projection)
+        sparse_vis = image.copy()
+        ys, xs = np.where(valid_mask)
+        sparse_color = colorize_depth(sparse_depth, vmin=0, vmax=args.max_depth)
+        for y, x in zip(ys, xs):
+            cv2.circle(sparse_vis, (x, y), 2, sparse_color[y, x].tolist(), -1)
+        Image.fromarray(sparse_vis).save(cam_dir / "2_lidar_sparse.png")
 
-        # 3. SAM segmentation regions
-        region_vis = np.zeros((result.region_masks.shape[0], result.region_masks.shape[1], 3), dtype=np.uint8)
-        unique_regions = np.unique(result.region_masks)
-        np.random.seed(42)
-        for region_id in unique_regions:
-            if region_id == 0:
-                continue
-            color = np.random.randint(50, 255, 3)
-            region_vis[result.region_masks == region_id] = color
-        Image.fromarray(region_vis).save(cam_dir / "3_sam_regions.png")
-
-        # 4. LiDAR sparse depth
-        if result.lidar_depth is not None and result.lidar_mask is not None:
-            lidar_vis = np.zeros_like(image_resized)
-            lidar_depth_valid = result.lidar_depth.copy()
-            lidar_depth_valid[~result.lidar_mask] = 0
-            lidar_color = colorize_depth(lidar_depth_valid, vmin=0, vmax=args.max_depth)
-            # Overlay on RGB with larger markers
-            lidar_vis = image_resized.copy()
-            ys, xs = np.where(result.lidar_mask)
-            for y, x in zip(ys, xs):
-                cv2.circle(lidar_vis, (x, y), 3, lidar_color[y, x].tolist(), -1)
-            Image.fromarray(lidar_vis).save(cam_dir / "4_lidar_sparse.png")
-
-        # 5. Aligned metric depth
-        Image.fromarray(colorize_depth(result.aligned_depth, vmin=0, vmax=args.max_depth)).save(
-            cam_dir / "5_aligned_metric_depth.png"
+        # 3. Dense depth (completed)
+        Image.fromarray(colorize_depth(dense_depth, vmin=0, vmax=args.max_depth)).save(
+            cam_dir / "3_dense_depth.png"
         )
 
-        # 6. Depth difference (aligned vs LiDAR at anchor points)
-        if result.lidar_depth is not None and result.lidar_mask is not None:
-            diff_map = np.zeros_like(result.aligned_depth)
-            valid = result.lidar_mask & (result.aligned_depth > 0)
-            diff_map[valid] = np.abs(result.aligned_depth[valid] - result.lidar_depth[valid])
-            # Colorize difference: 0-5m range
-            diff_norm = np.clip(diff_map / 5.0, 0, 1)
-            diff_color = (plt.get_cmap('hot')(diff_norm)[:, :, :3] * 255).astype(np.uint8)
-            diff_color[~valid] = 0
-            Image.fromarray(diff_color).save(cam_dir / "6_depth_difference.png")
+        # 4. Depth error at LiDAR points
+        if valid_mask.any():
+            error_map = np.zeros_like(dense_depth)
+            error_map[valid_mask] = np.abs(dense_depth[valid_mask] - sparse_depth[valid_mask])
 
-            # Print error stats
-            if valid.any():
-                errors = np.abs(result.aligned_depth[valid] - result.lidar_depth[valid])
-                print(f"    Depth error: mean={errors.mean():.2f}m, median={np.median(errors):.2f}m, max={errors.max():.2f}m")
+            # Stats
+            errors = error_map[valid_mask]
+            print(f"    Completion error: mean={errors.mean():.2f}m, "
+                  f"median={np.median(errors):.2f}m, max={errors.max():.2f}m")
 
+            # Colorize (0-5m range)
+            error_norm = np.clip(error_map / 5.0, 0, 1)
+            error_color = (plt.get_cmap('hot')(error_norm)[:, :, :3] * 255).astype(np.uint8)
+            error_color[~valid_mask] = 0
+            Image.fromarray(error_color).save(cam_dir / "4_completion_error.png")
+
+        # 5. Save point cloud
         save_ply(str(cam_dir / "pointcloud.ply"), points, colors)
 
     # Merge all point clouds
-    print(f"\n[5/5] Merging point clouds...")
+    print(f"\n[4/4] Merging point clouds...")
 
     if len(all_points) == 0:
         print("  ERROR: No valid cameras!")
@@ -356,20 +323,22 @@ def main():
     # Save merged point cloud
     save_ply(str(output_dir / "merged_pointcloud.ply"), merged_points, merged_colors)
 
-    # Also save LiDAR as reference
-    lidar_colors = np.full((len(lidar_points), 3), [128, 128, 128], dtype=np.uint8)
+    # Also save LiDAR as reference (with colors based on height)
+    lidar_z = lidar_points[:, 2]
+    z_norm = (lidar_z - lidar_z.min()) / (lidar_z.max() - lidar_z.min() + 1e-6)
+    lidar_colors = (plt.get_cmap('viridis')(z_norm)[:, :3] * 255).astype(np.uint8)
     save_ply(str(output_dir / "lidar_reference.ply"), lidar_points[:, :3], lidar_colors)
 
     print(f"\n{'='*60}")
     print(f"Done! Results saved to: {output_dir}")
     print(f"{'='*60}")
     print(f"\nOutput files:")
-    print(f"  - merged_pointcloud.ply: Fused 4-camera point cloud")
-    print(f"  - lidar_reference.ply: Original LiDAR (gray)")
+    print(f"  - merged_pointcloud.ply: Fused camera point cloud (dense, colored)")
+    print(f"  - lidar_reference.ply: Original LiDAR (height-colored)")
     for cam_id in camera_ids:
-        print(f"  - cam{cam_id}/: Per-camera RGB, depth, pointcloud")
+        print(f"  - cam{cam_id}/: RGB, sparse depth, dense depth, error, pointcloud")
 
-    print(f"\nView in CloudCompare/MeshLab:")
+    print(f"\nView in CloudCompare:")
     print(f"  cloudcompare {output_dir}/merged_pointcloud.ply {output_dir}/lidar_reference.ply")
 
 
