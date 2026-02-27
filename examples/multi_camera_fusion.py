@@ -188,12 +188,12 @@ def main():
     # Initialize DA3 model (for relative depth)
     print("\n[2/5] Initializing DA3 model...")
     import torch
-    from depth_anything_3 import DepthAnything3
+    from depth_anything_3.api import DepthAnything3
 
     da3_model = DepthAnything3.from_pretrained(
-        f"depth-anything/Depth-Anything-3-{args.da3_encoder.capitalize()}-hf"
+        "depth-anything/DA3NESTED-GIANT-LARGE"
     ).to(args.device).eval()
-    print(f"  DA3 encoder: {args.da3_encoder}")
+    print(f"  DA3 model: DA3NESTED-GIANT-LARGE")
 
     # Initialize depth completer
     print("\n[3/5] Initializing depth completer...")
@@ -262,19 +262,15 @@ def main():
 
         # Step 2: DA3 relative depth inference
         print(f"    Running DA3...")
-        with torch.no_grad():
-            # Prepare input
-            image_tensor = torch.from_numpy(image).permute(2, 0, 1).float() / 255.0
-            image_tensor = image_tensor.unsqueeze(0).to(args.device)
+        prediction = da3_model.inference(image=[image], process_res=H)
+        da3_depth_raw = prediction.depth[0]  # Relative depth
 
-            # Inference
-            da3_output = da3_model(image_tensor)
-            da3_depth = da3_output.squeeze().cpu().numpy()
-
-            # DA3 outputs inverse depth, convert to depth
-            # (larger values = closer, we want larger values = farther)
-            da3_depth = 1.0 / (da3_depth + 1e-6)
-            da3_depth = da3_depth / da3_depth.max()  # Normalize to [0, 1]
+        # Resize DA3 output to match image size if needed
+        da3_H, da3_W = da3_depth_raw.shape
+        if da3_H != H or da3_W != W:
+            da3_depth = cv2.resize(da3_depth_raw, (W, H), interpolation=cv2.INTER_LINEAR)
+        else:
+            da3_depth = da3_depth_raw
 
         print(f"    DA3 depth range: [{da3_depth.min():.3f}, {da3_depth.max():.3f}] (relative)")
 
