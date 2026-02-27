@@ -52,8 +52,8 @@ def depth_to_pointcloud(
     extrinsics: np.ndarray,
     confidence: np.ndarray = None,
     max_depth: float = 150.0,
-    conf_threshold: float = 0.3,
-    max_points: int = 300000,
+    conf_threshold: float = 0.0,
+    max_points: int = 0,
 ):
     """
     Convert depth map to colored point cloud in world coordinates.
