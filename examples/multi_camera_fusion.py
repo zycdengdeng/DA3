@@ -151,8 +151,11 @@ def main():
     parser.add_argument("--model", type=str, default="da3-giant")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--sam_checkpoint", type=str, default=None)
-    parser.add_argument("--max_depth", type=float, default=150.0)
-    parser.add_argument("--max_points_per_cam", type=int, default=300000)
+    parser.add_argument("--sam_points_per_side", type=int, default=48,
+                        help="SAM grid density (higher = finer segmentation, default: 48)")
+    parser.add_argument("--max_depth", type=float, default=200.0,
+                        help="Maximum depth to include in point cloud (default: 200m)")
+    parser.add_argument("--max_points_per_cam", type=int, default=500000)
 
     args = parser.parse_args()
 
@@ -190,7 +193,7 @@ def main():
         sam_checkpoint=args.sam_checkpoint,
         device=args.device,
         min_anchors_per_region=3,
-        sam_points_per_side=32,
+        sam_points_per_side=args.sam_points_per_side,
     )
 
     if not aligner.sam_available:

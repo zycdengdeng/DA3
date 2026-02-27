@@ -253,6 +253,7 @@ def compute_region_alignment(
     lidar_mask: np.ndarray,
     region_mask: np.ndarray,
     min_points: int = 3,
+    use_ransac: bool = True,
 ) -> Optional[Tuple[float, float, Dict]]:
     """
     Compute affine alignment (ax + b) for a single region.
@@ -263,6 +264,7 @@ def compute_region_alignment(
         lidar_mask: (H, W) valid LiDAR pixels
         region_mask: (H, W) boolean mask for this region
         min_points: minimum LiDAR points required
+        use_ransac: use RANSAC for robust fitting (handles outliers)
 
     Returns:
         (scale, shift, stats) or None if not enough points
@@ -286,12 +288,16 @@ def compute_region_alignment(
     rel_values = rel_values[valid]
     lid_values = lid_values[valid]
 
-    # Solve least squares: lidar = scale * relative + shift
-    # Using numpy lstsq: [rel, 1] @ [scale, shift]^T = lidar
-    A = np.column_stack([rel_values, np.ones_like(rel_values)])
-    result = np.linalg.lstsq(A, lid_values, rcond=None)
-
-    scale, shift = result[0]
+    # Use RANSAC for robust fitting if enough points
+    if use_ransac and len(rel_values) >= 10:
+        scale, shift, inlier_mask = _ransac_affine_fit(rel_values, lid_values)
+        n_inliers = inlier_mask.sum()
+    else:
+        # Solve least squares: lidar = scale * relative + shift
+        A = np.column_stack([rel_values, np.ones_like(rel_values)])
+        result = np.linalg.lstsq(A, lid_values, rcond=None)
+        scale, shift = result[0]
+        n_inliers = len(rel_values)
 
     # Compute residual
     predicted = scale * rel_values + shift
@@ -301,6 +307,7 @@ def compute_region_alignment(
     # Compute stats
     stats = {
         'n_anchors': int(valid.sum()),
+        'n_inliers': int(n_inliers),
         'scale': float(scale),
         'shift': float(shift),
         'rmse': float(rmse),
@@ -311,6 +318,45 @@ def compute_region_alignment(
     return scale, shift, stats
 
 
+def _ransac_affine_fit(
+    x: np.ndarray,
+    y: np.ndarray,
+    n_iterations: int = 100,
+    threshold: float = 2.0,
+) -> Tuple[float, float, np.ndarray]:
+    """RANSAC-based affine fitting for robust scale/shift estimation."""
+    best_scale, best_shift = 1.0, 0.0
+    best_inliers = np.zeros(len(x), dtype=bool)
+
+    for _ in range(n_iterations):
+        # Random sample 2 points
+        idx = np.random.choice(len(x), 2, replace=False)
+        x_sample, y_sample = x[idx], y[idx]
+
+        # Fit line
+        if abs(x_sample[1] - x_sample[0]) < 1e-6:
+            continue
+        scale = (y_sample[1] - y_sample[0]) / (x_sample[1] - x_sample[0])
+        shift = y_sample[0] - scale * x_sample[0]
+
+        # Count inliers
+        pred = scale * x + shift
+        errors = np.abs(y - pred)
+        inliers = errors < threshold
+
+        if inliers.sum() > best_inliers.sum():
+            best_inliers = inliers
+            best_scale, best_shift = scale, shift
+
+    # Refit with all inliers
+    if best_inliers.sum() >= 2:
+        A = np.column_stack([x[best_inliers], np.ones(best_inliers.sum())])
+        result = np.linalg.lstsq(A, y[best_inliers], rcond=None)
+        best_scale, best_shift = result[0]
+
+    return best_scale, best_shift, best_inliers
+
+
 def align_depth_by_regions(
     relative_depth: np.ndarray,
     region_labels: np.ndarray,
@@ -319,6 +365,8 @@ def align_depth_by_regions(
     min_anchors_per_region: int = 3,
     fallback_to_global: bool = True,
     propagate_to_empty: bool = True,
+    depth_stratified: bool = True,
+    depth_bins: List[float] = None,
 ) -> RegionAlignmentResult:
     """
     Align relative depth to metric depth using per-region affine transforms.
@@ -331,6 +379,8 @@ def align_depth_by_regions(
         min_anchors_per_region: minimum LiDAR points per region
         fallback_to_global: use global alignment for regions without anchors
         propagate_to_empty: propagate alignment from neighbors to empty regions
+        depth_stratified: split large regions by depth range for better near-field alignment
+        depth_bins: depth boundaries for stratification (default: [0, 10, 25, 50, 100, 200])
 
     Returns:
         RegionAlignmentResult
@@ -339,6 +389,9 @@ def align_depth_by_regions(
     aligned_depth = np.zeros((H, W), dtype=np.float32)
     region_params = {}
     region_stats = {}
+
+    if depth_bins is None:
+        depth_bins = [0, 10, 25, 50, 100, 200]
 
     # Get unique regions
     unique_regions = np.unique(region_labels)
@@ -360,30 +413,54 @@ def align_depth_by_regions(
     # Process each region
     regions_aligned = 0
     regions_fallback = 0
+    regions_stratified = 0
 
     for region_id in unique_regions:
         region_mask = region_labels == region_id
         region_area = region_mask.sum()
 
-        # Try to compute region-specific alignment
-        result = compute_region_alignment(
-            relative_depth, lidar_depth, lidar_mask,
-            region_mask, min_points=min_anchors_per_region
+        # Check if depth stratification should be applied
+        # Apply to large regions (likely ground) with sufficient LiDAR coverage
+        lidar_in_region = (region_mask & lidar_mask).sum()
+        use_stratified = (
+            depth_stratified and
+            region_area > 5000 and  # Large region
+            lidar_in_region > 50    # Enough LiDAR points
         )
 
-        if result is not None:
-            scale, shift, stats = result
+        if use_stratified:
+            # Depth-stratified alignment for large regions (e.g., ground plane)
+            aligned_region, stats = _stratified_region_alignment(
+                relative_depth, lidar_depth, lidar_mask,
+                region_mask, depth_bins, min_anchors_per_region,
+                global_scale, global_shift
+            )
+            aligned_depth[region_mask] = aligned_region[region_mask]
+            region_params[region_id] = (stats.get('avg_scale', global_scale),
+                                        stats.get('avg_shift', global_shift))
+            region_stats[region_id] = stats
+            regions_stratified += 1
             regions_aligned += 1
         else:
-            # Fallback to global
-            scale, shift = global_scale, global_shift
-            stats = {'n_anchors': 0, 'fallback': 'global'}
-            regions_fallback += 1
+            # Standard single-scale alignment
+            result = compute_region_alignment(
+                relative_depth, lidar_depth, lidar_mask,
+                region_mask, min_points=min_anchors_per_region
+            )
 
-        # Apply alignment to this region
-        aligned_depth[region_mask] = scale * relative_depth[region_mask] + shift
-        region_params[region_id] = (scale, shift)
-        region_stats[region_id] = stats
+            if result is not None:
+                scale, shift, stats = result
+                regions_aligned += 1
+            else:
+                # Fallback to global
+                scale, shift = global_scale, global_shift
+                stats = {'n_anchors': 0, 'fallback': 'global'}
+                regions_fallback += 1
+
+            # Apply alignment to this region
+            aligned_depth[region_mask] = scale * relative_depth[region_mask] + shift
+            region_params[region_id] = (scale, shift)
+            region_stats[region_id] = stats
 
     # Handle unlabeled pixels (region_labels == 0)
     unlabeled = region_labels == 0
@@ -400,7 +477,7 @@ def align_depth_by_regions(
     valid_aligned = aligned_depth > 0
     coverage = valid_aligned.sum() / (H * W)
 
-    print(f"    Aligned: {regions_aligned}, Fallback: {regions_fallback}, Coverage: {coverage:.1%}")
+    print(f"    Aligned: {regions_aligned} (stratified: {regions_stratified}), Fallback: {regions_fallback}, Coverage: {coverage:.1%}")
 
     return RegionAlignmentResult(
         aligned_depth=aligned_depth,
@@ -410,6 +487,119 @@ def align_depth_by_regions(
         num_regions=len(unique_regions),
         coverage=coverage,
     )
+
+
+def _stratified_region_alignment(
+    relative_depth: np.ndarray,
+    lidar_depth: np.ndarray,
+    lidar_mask: np.ndarray,
+    region_mask: np.ndarray,
+    depth_bins: List[float],
+    min_points: int,
+    global_scale: float,
+    global_shift: float,
+) -> Tuple[np.ndarray, Dict]:
+    """
+    Depth-stratified alignment for large regions (e.g., ground plane).
+
+    Splits region by LiDAR depth ranges and computes separate scale/shift
+    for each depth stratum. This fixes the near-field ground depression issue
+    caused by DA3's non-linear relative depth.
+
+    Args:
+        relative_depth: (H, W) DA3 relative depth
+        lidar_depth: (H, W) sparse LiDAR depth
+        lidar_mask: (H, W) valid LiDAR pixels
+        region_mask: (H, W) mask for this region
+        depth_bins: depth boundaries [0, 10, 25, 50, 100, ...]
+        min_points: minimum points per stratum
+        global_scale, global_shift: fallback parameters
+
+    Returns:
+        aligned_region: (H, W) aligned depth (only region_mask pixels are valid)
+        stats: dict with per-stratum statistics
+    """
+    H, W = relative_depth.shape
+    aligned_region = np.zeros((H, W), dtype=np.float32)
+
+    # Get LiDAR anchors in this region
+    anchors = region_mask & lidar_mask
+    if anchors.sum() < min_points:
+        # Fallback to global
+        aligned_region[region_mask] = global_scale * relative_depth[region_mask] + global_shift
+        return aligned_region, {'fallback': 'global', 'n_strata': 0}
+
+    # Compute stratum params using LiDAR depth to determine boundaries
+    stratum_params = {}  # depth_bin_idx -> (scale, shift)
+
+    for i in range(len(depth_bins) - 1):
+        d_min, d_max = depth_bins[i], depth_bins[i + 1]
+
+        # Get anchors in this depth range
+        stratum_anchors = anchors & (lidar_depth >= d_min) & (lidar_depth < d_max)
+        n_anchors = stratum_anchors.sum()
+
+        if n_anchors >= min_points:
+            rel_vals = relative_depth[stratum_anchors]
+            lid_vals = lidar_depth[stratum_anchors]
+
+            valid = (rel_vals > 0) & np.isfinite(rel_vals)
+            if valid.sum() >= min_points:
+                rel_vals, lid_vals = rel_vals[valid], lid_vals[valid]
+
+                # RANSAC fit for robustness
+                if len(rel_vals) >= 10:
+                    scale, shift, _ = _ransac_affine_fit(rel_vals, lid_vals)
+                else:
+                    A = np.column_stack([rel_vals, np.ones_like(rel_vals)])
+                    result = np.linalg.lstsq(A, lid_vals, rcond=None)
+                    scale, shift = result[0]
+
+                stratum_params[i] = (scale, shift, n_anchors)
+
+    # If no strata computed, use global
+    if len(stratum_params) == 0:
+        aligned_region[region_mask] = global_scale * relative_depth[region_mask] + global_shift
+        return aligned_region, {'fallback': 'global', 'n_strata': 0}
+
+    # Apply per-stratum alignment to all pixels in region
+    # Use the relative depth to determine which stratum each pixel belongs to
+    # by finding the stratum whose fitted depth is closest
+
+    region_rel = relative_depth[region_mask]
+    region_aligned = np.zeros_like(region_rel)
+
+    # For each pixel, find best stratum based on relative depth interpolation
+    # Strategy: compute predicted depth for each stratum and use weighted blend
+
+    for i, (scale, shift, n_pts) in stratum_params.items():
+        d_min, d_max = depth_bins[i], depth_bins[i + 1]
+        pred = scale * region_rel + shift
+
+        # Pixels whose predicted depth falls in this stratum
+        in_stratum = (pred >= d_min) & (pred < d_max)
+        region_aligned[in_stratum] = pred[in_stratum]
+
+    # Handle pixels not covered by any stratum (use nearest or global)
+    uncovered = region_aligned == 0
+    if uncovered.any():
+        # Use global fallback for uncovered pixels
+        region_aligned[uncovered] = global_scale * region_rel[uncovered] + global_shift
+
+    aligned_region[region_mask] = region_aligned
+
+    # Compute stats
+    scales = [p[0] for p in stratum_params.values()]
+    shifts = [p[1] for p in stratum_params.values()]
+    stats = {
+        'n_strata': len(stratum_params),
+        'strata_depths': [(depth_bins[i], depth_bins[i+1]) for i in stratum_params.keys()],
+        'avg_scale': float(np.mean(scales)),
+        'avg_shift': float(np.mean(shifts)),
+        'stratified': True,
+    }
+
+    return aligned_region, stats
 
 
 def _propagate_from_neighbors(
