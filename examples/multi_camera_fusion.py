@@ -178,6 +178,9 @@ def main():
     # Load merged LiDAR
     lidar_points = loader.load_merged_points(args.scene, args.timestamp)
     print(f"  LiDAR: {len(lidar_points):,} points")
+    print(f"  LiDAR range: X=[{lidar_points[:,0].min():.1f}, {lidar_points[:,0].max():.1f}], "
+          f"Y=[{lidar_points[:,1].min():.1f}, {lidar_points[:,1].max():.1f}], "
+          f"Z=[{lidar_points[:,2].min():.1f}, {lidar_points[:,2].max():.1f}]")
 
     # Load DA3 model
     print("\n[2/5] Loading DA3 model...")
@@ -271,6 +274,10 @@ def main():
         )
 
         print(f"    Points: {len(points):,}")
+        if len(points) > 0:
+            print(f"    Point cloud range: X=[{points[:,0].min():.1f}, {points[:,0].max():.1f}], "
+                  f"Y=[{points[:,1].min():.1f}, {points[:,1].max():.1f}], "
+                  f"Z=[{points[:,2].min():.1f}, {points[:,2].max():.1f}]")
 
         all_points.append(points)
         all_colors.append(colors)
