@@ -152,6 +152,9 @@ def main():
                         help="Path to CompletionFormer weights (if using completionformer)")
     parser.add_argument("--max_depth", type=float, default=300.0,
                         help="Maximum depth (default: 300m)")
+    parser.add_argument("--da3_encoder", type=str, default="vitl",
+                        choices=["vits", "vitb", "vitl", "vitg"],
+                        help="DA3 encoder size (default: vitl)")
     parser.add_argument("--process_res", type=int, default=None,
                         help="Processing resolution (default: native)")
     parser.add_argument("--device", type=str, default="cuda")
@@ -182,8 +185,18 @@ def main():
           f"Y=[{lidar_points[:,1].min():.1f}, {lidar_points[:,1].max():.1f}], "
           f"Z=[{lidar_points[:,2].min():.1f}, {lidar_points[:,2].max():.1f}]")
 
+    # Initialize DA3 model (for relative depth)
+    print("\n[2/5] Initializing DA3 model...")
+    import torch
+    from depth_anything_3 import DepthAnything3
+
+    da3_model = DepthAnything3.from_pretrained(
+        f"depth-anything/Depth-Anything-3-{args.da3_encoder.capitalize()}-hf"
+    ).to(args.device).eval()
+    print(f"  DA3 encoder: {args.da3_encoder}")
+
     # Initialize depth completer
-    print("\n[2/4] Initializing depth completer...")
+    print("\n[3/5] Initializing depth completer...")
     model_path = args.sam_checkpoint if args.completion_method == "sam" else args.completionformer_weights
     completer = DepthCompleter(
         method=args.completion_method,
@@ -195,7 +208,7 @@ def main():
     print(f"  Method: {args.completion_method}")
 
     # Process each camera
-    print("\n[3/4] Processing cameras...")
+    print("\n[4/5] Processing cameras...")
     all_points = []
     all_colors = []
 
@@ -247,18 +260,37 @@ def main():
         sparse_depth_range = sparse_depth[valid_mask]
         print(f"    Sparse depth range: [{sparse_depth_range.min():.1f}, {sparse_depth_range.max():.1f}]m")
 
-        # Step 2: Depth completion (with debug info for SAM)
+        # Step 2: DA3 relative depth inference
+        print(f"    Running DA3...")
+        with torch.no_grad():
+            # Prepare input
+            image_tensor = torch.from_numpy(image).permute(2, 0, 1).float() / 255.0
+            image_tensor = image_tensor.unsqueeze(0).to(args.device)
+
+            # Inference
+            da3_output = da3_model(image_tensor)
+            da3_depth = da3_output.squeeze().cpu().numpy()
+
+            # DA3 outputs inverse depth, convert to depth
+            # (larger values = closer, we want larger values = farther)
+            da3_depth = 1.0 / (da3_depth + 1e-6)
+            da3_depth = da3_depth / da3_depth.max()  # Normalize to [0, 1]
+
+        print(f"    DA3 depth range: [{da3_depth.min():.3f}, {da3_depth.max():.3f}] (relative)")
+
+        # Step 3: Depth completion (SAM + DA3 + LiDAR)
         dense_depth, debug_info = completer.complete_with_debug(
             rgb=image,
             sparse_depth=sparse_depth,
             mask=valid_mask,
+            da3_depth=da3_depth,
         )
 
         dense_valid = dense_depth > 0.1
         print(f"    Dense depth: {dense_valid.sum():,} pixels ({dense_valid.sum()/(H*W)*100:.1f}% coverage)")
         print(f"    Dense depth range: [{dense_depth[dense_valid].min():.1f}, {dense_depth[dense_valid].max():.1f}]m")
 
-        # Step 3: Convert to point cloud
+        # Step 4: Convert to point cloud
         points, colors = depth_to_pointcloud(
             depth=dense_depth,
             rgb=image,
@@ -290,12 +322,16 @@ def main():
             cv2.circle(sparse_vis, (x, y), 2, sparse_color[y, x].tolist(), -1)
         Image.fromarray(sparse_vis).save(cam_dir / "2_lidar_sparse.png")
 
-        # 3. Dense depth (completed)
+        # 3. DA3 relative depth
+        da3_vis = colorize_depth(da3_depth, vmin=0, vmax=1.0)  # Relative depth [0,1]
+        Image.fromarray(da3_vis).save(cam_dir / "3_da3_relative.png")
+
+        # 4. Dense depth (completed)
         Image.fromarray(colorize_depth(dense_depth, vmin=0, vmax=args.max_depth)).save(
-            cam_dir / "3_dense_depth.png"
+            cam_dir / "4_dense_depth.png"
         )
 
-        # 3b. SAM debug visualizations (if available)
+        # 4b. SAM debug visualizations (if available)
         if debug_info:
             debug_dir = cam_dir / "debug_sam"
             debug_dir.mkdir(exist_ok=True)
@@ -331,19 +367,30 @@ def main():
                 completed = debug_info['completed_mask_before_fill'].astype(np.uint8) * 255
                 Image.fromarray(completed).save(debug_dir / "e_completed_regions.png")
 
+            # DA3 relative depth
+            if 'da3_depth' in debug_info:
+                da3_debug = colorize_depth(debug_info['da3_depth'], vmin=0, vmax=1.0)
+                Image.fromarray(da3_debug).save(debug_dir / "f_da3_relative.png")
+
             # Region statistics
             if 'region_point_counts' in debug_info:
                 counts = debug_info['region_point_counts']
+                scales = debug_info.get('region_scales', {})
                 with open(debug_dir / "region_stats.txt", 'w') as f:
                     f.write(f"Total regions: {debug_info.get('n_regions', 0)}\n")
-                    f.write(f"Regions with >= 3 points: {len([c for c in counts.values() if c >= 3])}\n")
-                    f.write(f"\nRegion point counts:\n")
+                    f.write(f"Regions with >= 5 points (local scale): {len(scales)}\n")
+                    f.write(f"Regions with < 5 points (global scale): {len([c for c in counts.values() if 0 < c < 5])}\n")
+                    f.write(f"\nRegion point counts and scales:\n")
                     for rid, cnt in sorted(counts.items(), key=lambda x: -x[1])[:50]:
-                        f.write(f"  Region {rid}: {cnt} points\n")
+                        scale = scales.get(rid, "global")
+                        if isinstance(scale, float):
+                            f.write(f"  Region {rid}: {cnt} points, scale={scale:.3f}\n")
+                        else:
+                            f.write(f"  Region {rid}: {cnt} points, scale={scale}\n")
 
             print(f"    Saved SAM debug to: {debug_dir}")
 
-        # 4. Depth error at LiDAR points
+        # 5. Depth error at LiDAR points
         if valid_mask.any():
             error_map = np.zeros_like(dense_depth)
             error_map[valid_mask] = np.abs(dense_depth[valid_mask] - sparse_depth[valid_mask])
@@ -357,13 +404,13 @@ def main():
             error_norm = np.clip(error_map / 5.0, 0, 1)
             error_color = (plt.get_cmap('hot')(error_norm)[:, :, :3] * 255).astype(np.uint8)
             error_color[~valid_mask] = 0
-            Image.fromarray(error_color).save(cam_dir / "4_completion_error.png")
+            Image.fromarray(error_color).save(cam_dir / "5_completion_error.png")
 
-        # 5. Save point cloud
+        # 6. Save point cloud
         save_ply(str(cam_dir / "pointcloud.ply"), points, colors)
 
     # Merge all point clouds
-    print(f"\n[4/4] Merging point clouds...")
+    print(f"\n[5/5] Merging point clouds...")
 
     if len(all_points) == 0:
         print("  ERROR: No valid cameras!")

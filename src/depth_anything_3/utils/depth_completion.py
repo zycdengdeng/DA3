@@ -195,6 +195,7 @@ class DepthCompleter:
         rgb: np.ndarray,  # (H, W, 3) uint8 or float32
         sparse_depth: np.ndarray,  # (H, W) sparse depth map
         mask: Optional[np.ndarray] = None,  # (H, W) valid depth mask
+        da3_depth: Optional[np.ndarray] = None,  # (H, W) DA3 relative depth
     ) -> np.ndarray:
         """
         Complete sparse depth to dense depth.
@@ -203,12 +204,13 @@ class DepthCompleter:
             rgb: RGB image (H, W, 3), uint8 [0-255] or float32 [0-1]
             sparse_depth: Sparse depth map (H, W), 0 where no depth
             mask: Optional validity mask (H, W), True where depth is valid
+            da3_depth: Optional DA3 relative depth (H, W), for SAM method
 
         Returns:
             dense_depth: Dense depth map (H, W) in meters
         """
         if self.method == "sam":
-            return self._complete_sam(rgb, sparse_depth, mask)
+            return self._complete_sam(rgb, sparse_depth, mask, da3_depth=da3_depth)
         elif self.method == "simple":
             return self._complete_simple(rgb, sparse_depth, mask)
         elif self.method == "completionformer":
@@ -221,20 +223,26 @@ class DepthCompleter:
         rgb: np.ndarray,
         sparse_depth: np.ndarray,
         mask: Optional[np.ndarray] = None,
+        da3_depth: Optional[np.ndarray] = None,
         return_debug: bool = False,
     ) -> np.ndarray:
         """
-        SAM-guided region-wise depth completion.
+        SAM-guided region-wise depth completion using DA3 relative depth.
 
         Key idea:
         1. SAM segments the image into regions (cars, poles, buildings, road, etc.)
-        2. For each region, interpolate depth ONLY using points within that region
-        3. This prevents depth bleeding across object boundaries
+        2. DA3 provides complete relative depth structure (no holes)
+        3. For each region with LiDAR points: compute scale/shift to align DA3 to LiDAR
+        4. Result: complete depth with clean object boundaries
 
-        Result: Clean object edges, no scattered points on cars/poles/buildings.
+        Args:
+            rgb: RGB image
+            sparse_depth: Sparse LiDAR depth
+            mask: Valid depth mask
+            da3_depth: DA3 relative depth (required for best results)
+            return_debug: Return debug info
         """
         import cv2
-        from scipy.interpolate import griddata
 
         H, W = sparse_depth.shape
         debug_info = {}
@@ -249,6 +257,11 @@ class DepthCompleter:
                 return sparse_depth.copy(), {}
             return sparse_depth.copy()
 
+        # Check DA3 depth
+        if da3_depth is None:
+            print("    WARNING: DA3 depth not provided, using interpolation fallback")
+            return self._complete_sam_interpolation(rgb, sparse_depth, mask, return_debug)
+
         # Step 1: Segment image with SAM
         print(f"    SAM segmenting image...")
         region_labels, masks_info = self.sam_segmenter.segment(rgb)
@@ -259,6 +272,7 @@ class DepthCompleter:
         debug_info['region_labels'] = region_labels.copy()
         debug_info['n_regions'] = n_regions
         debug_info['masks_info'] = masks_info
+        debug_info['da3_depth'] = da3_depth.copy()
 
         # Create colorful region visualization
         np.random.seed(42)
@@ -267,102 +281,104 @@ class DepthCompleter:
         region_vis = colors[region_labels]
         debug_info['region_vis'] = region_vis
 
-        # Step 2: Initialize output
-        dense_depth = np.zeros((H, W), dtype=np.float32)
-        completed_mask = np.zeros((H, W), dtype=bool)
-        region_point_counts = {}
+        # Step 2: Compute global scale/shift as fallback
+        da3_at_lidar = da3_depth[mask]
+        lidar_depths = sparse_depth[mask]
 
-        # Step 3: Complete each region independently
+        # Robust global alignment (RANSAC-like: use median)
+        valid_da3 = da3_at_lidar > 1e-6
+        if valid_da3.sum() > 10:
+            ratios = lidar_depths[valid_da3] / da3_at_lidar[valid_da3]
+            global_scale = np.median(ratios)
+            global_shift = 0.0  # Simple scale model
+        else:
+            global_scale = 1.0
+            global_shift = 0.0
+
+        print(f"    Global scale: {global_scale:.3f}")
+
+        # Step 3: Initialize output with globally scaled DA3
+        dense_depth = da3_depth * global_scale + global_shift
+        dense_depth = np.clip(dense_depth, 0, self.max_depth)
+
+        # Track which regions get local alignment
+        region_point_counts = {}
+        region_scales = {}
+        completed_mask = np.zeros((H, W), dtype=bool)
+
+        # Step 4: Per-region local alignment
+        min_points_for_local = 5  # Need at least 5 points for reliable local scale
+
         for region_id in range(1, n_regions + 1):
             region_mask = region_labels == region_id
 
             if region_mask.sum() < 10:
                 continue
 
-            # Get sparse points within this region
+            # Get LiDAR points within this region
             region_sparse_mask = mask & region_mask
             n_points = region_sparse_mask.sum()
             region_point_counts[region_id] = int(n_points)
 
-            if n_points < 3:
-                # Too few points in this region, will fill later with nearest
+            if n_points < min_points_for_local:
+                # Use global scale for this region (already applied)
+                completed_mask[region_mask] = True
                 continue
 
-            # Get coordinates and depths for this region
-            v_valid, u_valid = np.where(region_sparse_mask)
-            depths = sparse_depth[region_sparse_mask]
+            # Compute local scale for this region
+            da3_region = da3_depth[region_sparse_mask]
+            lidar_region = sparse_depth[region_sparse_mask]
 
-            # Target: all pixels in this region
-            v_target, u_target = np.where(region_mask)
-            target_points = np.stack([u_target, v_target], axis=1)
-            valid_coords = np.stack([u_valid, v_valid], axis=1)
-
-            # Interpolate within region
-            try:
-                region_depth = griddata(
-                    valid_coords, depths, target_points,
-                    method='linear', fill_value=0
-                )
-
-                # Fill holes with nearest
-                holes = region_depth <= 0
-                if holes.any():
-                    region_depth_nearest = griddata(
-                        valid_coords, depths, target_points,
-                        method='nearest'
-                    )
-                    region_depth[holes] = region_depth_nearest[holes]
-
-                # Write to output
-                dense_depth[v_target, u_target] = region_depth
-                completed_mask[v_target, u_target] = True
-
-            except Exception as e:
-                # Interpolation failed, skip this region
-                print(f"      Region {region_id} interpolation failed: {e}")
+            valid_da3 = da3_region > 1e-6
+            if valid_da3.sum() < 3:
+                completed_mask[region_mask] = True
                 continue
+
+            # Local scale (median for robustness)
+            local_ratios = lidar_region[valid_da3] / da3_region[valid_da3]
+            local_scale = np.median(local_ratios)
+
+            # Sanity check: scale shouldn't be too different from global
+            if local_scale < global_scale * 0.2 or local_scale > global_scale * 5:
+                # Suspicious, use global
+                local_scale = global_scale
+
+            region_scales[region_id] = float(local_scale)
+
+            # Apply local scale to this region
+            region_depth = da3_depth[region_mask] * local_scale
+            region_depth = np.clip(region_depth, 0, self.max_depth)
+            dense_depth[region_mask] = region_depth
+            completed_mask[region_mask] = True
 
         debug_info['region_point_counts'] = region_point_counts
+        debug_info['region_scales'] = region_scales
         debug_info['completed_mask_before_fill'] = completed_mask.copy()
-
-        # Step 4: Fill remaining uncompleted pixels using global nearest neighbor
-        uncompleted = ~completed_mask
-        n_uncompleted = uncompleted.sum()
-        print(f"    Regions completed: {completed_mask.sum()/(H*W)*100:.1f}%")
-        print(f"    Uncompleted pixels to fill: {n_uncompleted} ({n_uncompleted/(H*W)*100:.1f}%)")
-
-        if uncompleted.any() and mask.sum() > 0:
-            v_valid, u_valid = np.where(mask)
-            depths = sparse_depth[mask]
-            valid_coords = np.stack([u_valid, v_valid], axis=1)
-
-            v_target, u_target = np.where(uncompleted)
-            target_points = np.stack([u_target, v_target], axis=1)
-
-            if len(target_points) > 0:
-                fill_depth = griddata(
-                    valid_coords, depths, target_points,
-                    method='nearest'
-                )
-                dense_depth[v_target, u_target] = fill_depth
-
         debug_info['dense_before_smooth'] = dense_depth.copy()
 
-        # Step 5: Edge-aware smoothing per region (preserve edges)
-        # Apply bilateral filter but respect region boundaries
+        # Stats
+        n_local = len([s for s in region_scales.values()])
+        n_global = len([c for rid, c in region_point_counts.items()
+                       if c < min_points_for_local and c > 0])
+        print(f"    Regions with local scale: {n_local}")
+        print(f"    Regions with global scale: {n_global}")
+
+        # Step 5: Light smoothing within regions (optional)
         depth_smoothed = dense_depth.copy()
-        for region_id in range(1, min(n_regions + 1, 100)):  # Limit to avoid slowness
+
+        # Bilateral filter per region to smooth while preserving edges
+        for region_id in range(1, min(n_regions + 1, 200)):
             region_mask = region_labels == region_id
 
             if region_mask.sum() < 100:
                 continue
 
-            # Extract region
+            # Get bounding box
             ys, xs = np.where(region_mask)
             y_min, y_max = ys.min(), ys.max() + 1
             x_min, x_max = xs.min(), xs.max() + 1
 
-            # Get region patch
+            # Extract patch
             patch = dense_depth[y_min:y_max, x_min:x_max].copy()
             patch_mask = region_mask[y_min:y_max, x_min:x_max]
 
@@ -373,17 +389,17 @@ class DepthCompleter:
             patch_norm = patch / (self.max_depth + 1e-6)
             patch_norm = np.clip(patch_norm, 0, 1).astype(np.float32)
 
+            # Light bilateral filter
             patch_filtered = cv2.bilateralFilter(
-                patch_norm, d=5, sigmaColor=0.05, sigmaSpace=15
+                patch_norm, d=5, sigmaColor=0.02, sigmaSpace=10
             )
-
             patch_filtered = patch_filtered * self.max_depth
 
-            # Write back only within region
+            # Write back
             depth_smoothed[y_min:y_max, x_min:x_max][patch_mask] = \
                 patch_filtered[patch_mask]
 
-        # Preserve original sparse depth values
+        # Preserve original LiDAR values
         depth_smoothed[mask] = sparse_depth[mask]
 
         print(f"    Final completion: {(depth_smoothed > 0).sum()/(H*W)*100:.1f}%")
@@ -392,15 +408,80 @@ class DepthCompleter:
             return depth_smoothed.astype(np.float32), debug_info
         return depth_smoothed.astype(np.float32)
 
+    def _complete_sam_interpolation(
+        self,
+        rgb: np.ndarray,
+        sparse_depth: np.ndarray,
+        mask: np.ndarray,
+        return_debug: bool = False,
+    ) -> np.ndarray:
+        """Fallback: SAM + interpolation when DA3 is not available."""
+        from scipy.interpolate import griddata
+
+        H, W = sparse_depth.shape
+        debug_info = {}
+
+        # Segment with SAM
+        region_labels, masks_info = self.sam_segmenter.segment(rgb)
+        n_regions = len(masks_info)
+
+        debug_info['region_labels'] = region_labels.copy()
+        debug_info['n_regions'] = n_regions
+
+        # Initialize
+        dense_depth = np.zeros((H, W), dtype=np.float32)
+
+        # Per-region interpolation
+        for region_id in range(1, n_regions + 1):
+            region_mask = region_labels == region_id
+            region_sparse_mask = mask & region_mask
+
+            if region_sparse_mask.sum() < 3:
+                continue
+
+            v_valid, u_valid = np.where(region_sparse_mask)
+            depths = sparse_depth[region_sparse_mask]
+            v_target, u_target = np.where(region_mask)
+
+            target_points = np.stack([u_target, v_target], axis=1)
+            valid_coords = np.stack([u_valid, v_valid], axis=1)
+
+            try:
+                region_depth = griddata(
+                    valid_coords, depths, target_points,
+                    method='nearest'
+                )
+                dense_depth[v_target, u_target] = region_depth
+            except:
+                continue
+
+        # Fill remaining with global nearest
+        unfilled = dense_depth <= 0
+        if unfilled.any() and mask.sum() > 0:
+            v_valid, u_valid = np.where(mask)
+            depths = sparse_depth[mask]
+            v_target, u_target = np.where(unfilled)
+
+            target_points = np.stack([u_target, v_target], axis=1)
+            valid_coords = np.stack([u_valid, v_valid], axis=1)
+
+            fill_depth = griddata(valid_coords, depths, target_points, method='nearest')
+            dense_depth[v_target, u_target] = fill_depth
+
+        if return_debug:
+            return dense_depth.astype(np.float32), debug_info
+        return dense_depth.astype(np.float32)
+
     def complete_with_debug(
         self,
         rgb: np.ndarray,
         sparse_depth: np.ndarray,
         mask: Optional[np.ndarray] = None,
+        da3_depth: Optional[np.ndarray] = None,
     ) -> tuple:
         """Complete depth and return debug information."""
         if self.method == "sam":
-            return self._complete_sam(rgb, sparse_depth, mask, return_debug=True)
+            return self._complete_sam(rgb, sparse_depth, mask, da3_depth=da3_depth, return_debug=True)
         else:
             return self.complete(rgb, sparse_depth, mask), {}
 
