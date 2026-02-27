@@ -261,16 +261,16 @@ def main():
         print(f"    Aligned depth: min={valid_depth.min():.2f}, max={valid_depth.max():.2f}, "
               f"mean={valid_depth.mean():.2f}, valid_pixels={len(valid_depth)}")
 
-        # Convert to point cloud
+        # Convert to point cloud (disable confidence filtering to keep all points)
         points, colors = depth_to_pointcloud(
             depth=result.aligned_depth,
             rgb=image_resized,
             intrinsics=K_scaled,
             extrinsics=extrinsics,
-            confidence=confidence,
+            confidence=None,  # Disable confidence filtering
             max_depth=args.max_depth,
-            conf_threshold=0.3,
-            max_points=args.max_points_per_cam,
+            conf_threshold=0.0,
+            max_points=0,  # No limit
         )
 
         print(f"    Points: {len(points):,}")
