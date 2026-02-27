@@ -91,8 +91,8 @@ def depth_to_pointcloud(
 
     u, v, z = u[valid], v[valid], z[valid]
 
-    # Subsample if too many
-    if len(z) > max_points:
+    # Subsample if too many (skip if max_points <= 0)
+    if max_points > 0 and len(z) > max_points:
         indices = np.random.choice(len(z), max_points, replace=False)
         u, v, z = u[indices], v[indices], z[indices]
 
@@ -155,7 +155,8 @@ def main():
                         help="SAM grid density (higher = finer segmentation, default: 48)")
     parser.add_argument("--max_depth", type=float, default=350.0,
                         help="Maximum depth to include in point cloud (default: 350m)")
-    parser.add_argument("--max_points_per_cam", type=int, default=800000)
+    parser.add_argument("--max_points_per_cam", type=int, default=0,
+                        help="Max points per camera (0 = no limit, keep all)")
 
     args = parser.parse_args()
 
