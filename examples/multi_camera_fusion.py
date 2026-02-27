@@ -153,12 +153,9 @@ def main():
     parser.add_argument("--sam_checkpoint", type=str, default=None)
     parser.add_argument("--sam_points_per_side", type=int, default=48,
                         help="SAM grid density (higher = finer segmentation, default: 48)")
-    parser.add_argument("--fit_model", type=str, default="auto",
-                        choices=["affine", "inverse", "quadratic", "auto"],
-                        help="Depth fitting model (default: auto = try all, pick best)")
-    parser.add_argument("--max_depth", type=float, default=200.0,
-                        help="Maximum depth to include in point cloud (default: 200m)")
-    parser.add_argument("--max_points_per_cam", type=int, default=500000)
+    parser.add_argument("--max_depth", type=float, default=350.0,
+                        help="Maximum depth to include in point cloud (default: 350m)")
+    parser.add_argument("--max_points_per_cam", type=int, default=800000)
 
     args = parser.parse_args()
 
@@ -197,7 +194,6 @@ def main():
         device=args.device,
         min_anchors_per_region=3,
         sam_points_per_side=args.sam_points_per_side,
-        fit_model=args.fit_model,
     )
 
     if not aligner.sam_available:
