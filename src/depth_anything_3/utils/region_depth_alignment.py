@@ -52,6 +52,10 @@ class RegionAlignmentResult:
     region_stats: Dict[int, Dict]  # region_id -> stats
     num_regions: int
     coverage: float  # fraction of pixels with valid alignment
+    # Optional intermediate results for visualization
+    relative_depth: np.ndarray = None  # (H, W) original DA3 relative depth
+    lidar_depth: np.ndarray = None  # (H, W) sparse LiDAR depth
+    lidar_mask: np.ndarray = None  # (H, W) LiDAR validity mask
 
 
 class SAMAutoSegmenter:
@@ -714,6 +718,11 @@ class RegionWiseDepthAligner:
             lidar_mask=lidar_mask,
             min_anchors_per_region=self.min_anchors,
         )
+
+        # Store intermediate results for visualization
+        result.relative_depth = relative_depth
+        result.lidar_depth = lidar_depth
+        result.lidar_mask = lidar_mask
 
         return result
 

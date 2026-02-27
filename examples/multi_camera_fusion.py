@@ -273,10 +273,59 @@ def main():
         cam_dir = output_dir / f"cam{cam_id}"
         cam_dir.mkdir(exist_ok=True)
 
-        Image.fromarray(image_resized).save(cam_dir / "rgb.png")
+        # 1. RGB image
+        Image.fromarray(image_resized).save(cam_dir / "1_rgb.png")
+
+        # 2. DA3 relative depth (normalized for visualization)
+        if result.relative_depth is not None:
+            rel_depth_vis = colorize_depth(result.relative_depth)
+            Image.fromarray(rel_depth_vis).save(cam_dir / "2_da3_relative_depth.png")
+
+        # 3. SAM segmentation regions
+        region_vis = np.zeros((result.region_masks.shape[0], result.region_masks.shape[1], 3), dtype=np.uint8)
+        unique_regions = np.unique(result.region_masks)
+        np.random.seed(42)
+        for region_id in unique_regions:
+            if region_id == 0:
+                continue
+            color = np.random.randint(50, 255, 3)
+            region_vis[result.region_masks == region_id] = color
+        Image.fromarray(region_vis).save(cam_dir / "3_sam_regions.png")
+
+        # 4. LiDAR sparse depth
+        if result.lidar_depth is not None and result.lidar_mask is not None:
+            lidar_vis = np.zeros_like(image_resized)
+            lidar_depth_valid = result.lidar_depth.copy()
+            lidar_depth_valid[~result.lidar_mask] = 0
+            lidar_color = colorize_depth(lidar_depth_valid, vmin=0, vmax=args.max_depth)
+            # Overlay on RGB with larger markers
+            lidar_vis = image_resized.copy()
+            ys, xs = np.where(result.lidar_mask)
+            for y, x in zip(ys, xs):
+                cv2.circle(lidar_vis, (x, y), 3, lidar_color[y, x].tolist(), -1)
+            Image.fromarray(lidar_vis).save(cam_dir / "4_lidar_sparse.png")
+
+        # 5. Aligned metric depth
         Image.fromarray(colorize_depth(result.aligned_depth, vmin=0, vmax=args.max_depth)).save(
-            cam_dir / "depth.png"
+            cam_dir / "5_aligned_metric_depth.png"
         )
+
+        # 6. Depth difference (aligned vs LiDAR at anchor points)
+        if result.lidar_depth is not None and result.lidar_mask is not None:
+            diff_map = np.zeros_like(result.aligned_depth)
+            valid = result.lidar_mask & (result.aligned_depth > 0)
+            diff_map[valid] = np.abs(result.aligned_depth[valid] - result.lidar_depth[valid])
+            # Colorize difference: 0-5m range
+            diff_norm = np.clip(diff_map / 5.0, 0, 1)
+            diff_color = (plt.get_cmap('hot')(diff_norm)[:, :, :3] * 255).astype(np.uint8)
+            diff_color[~valid] = 0
+            Image.fromarray(diff_color).save(cam_dir / "6_depth_difference.png")
+
+            # Print error stats
+            if valid.any():
+                errors = np.abs(result.aligned_depth[valid] - result.lidar_depth[valid])
+                print(f"    Depth error: mean={errors.mean():.2f}m, median={np.median(errors):.2f}m, max={errors.max():.2f}m")
+
         save_ply(str(cam_dir / "pointcloud.ply"), points, colors)
 
     # Merge all point clouds
