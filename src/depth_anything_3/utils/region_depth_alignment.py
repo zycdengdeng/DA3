@@ -247,6 +247,83 @@ def create_sparse_depth_map(
     return sparse_depth, valid_mask
 
 
+class DepthFitModel:
+    """
+    Different models for mapping relative depth to metric depth.
+
+    DA3 outputs disparity-like values, so the relationship to real depth
+    may be non-linear. We try multiple models and pick the best.
+    """
+
+    @staticmethod
+    def fit_affine(x: np.ndarray, y: np.ndarray) -> Tuple[callable, np.ndarray, Dict]:
+        """Linear: depth = a*rel + b"""
+        A = np.column_stack([x, np.ones_like(x)])
+        params, residuals, _, _ = np.linalg.lstsq(A, y, rcond=None)
+        a, b = params
+
+        def predict(rel):
+            return a * rel + b
+
+        return predict, params, {'model': 'affine', 'a': float(a), 'b': float(b)}
+
+    @staticmethod
+    def fit_inverse(x: np.ndarray, y: np.ndarray) -> Tuple[callable, np.ndarray, Dict]:
+        """Inverse (disparity): depth = a/rel + b"""
+        # Avoid division by zero
+        x_safe = np.clip(x, 1e-6, None)
+        A = np.column_stack([1.0 / x_safe, np.ones_like(x)])
+        params, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
+        a, b = params
+
+        def predict(rel):
+            return a / np.clip(rel, 1e-6, None) + b
+
+        return predict, params, {'model': 'inverse', 'a': float(a), 'b': float(b)}
+
+    @staticmethod
+    def fit_quadratic(x: np.ndarray, y: np.ndarray) -> Tuple[callable, np.ndarray, Dict]:
+        """Quadratic: depth = a*rel² + b*rel + c"""
+        A = np.column_stack([x**2, x, np.ones_like(x)])
+        params, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
+        a, b, c = params
+
+        def predict(rel):
+            return a * rel**2 + b * rel + c
+
+        return predict, params, {'model': 'quadratic', 'a': float(a), 'b': float(b), 'c': float(c)}
+
+    @staticmethod
+    def fit_log(x: np.ndarray, y: np.ndarray) -> Tuple[callable, np.ndarray, Dict]:
+        """Logarithmic: depth = a*log(rel) + b"""
+        x_safe = np.clip(x, 1e-6, None)
+        A = np.column_stack([np.log(x_safe), np.ones_like(x)])
+        params, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
+        a, b = params
+
+        def predict(rel):
+            return a * np.log(np.clip(rel, 1e-6, None)) + b
+
+        return predict, params, {'model': 'log', 'a': float(a), 'b': float(b)}
+
+    @staticmethod
+    def fit_power(x: np.ndarray, y: np.ndarray) -> Tuple[callable, np.ndarray, Dict]:
+        """Power law: depth = a * rel^b (linearized via log-log)"""
+        x_safe = np.clip(x, 1e-6, None)
+        y_safe = np.clip(y, 1e-6, None)
+
+        # log(y) = log(a) + b*log(x)
+        A = np.column_stack([np.log(x_safe), np.ones_like(x)])
+        params, _, _, _ = np.linalg.lstsq(A, np.log(y_safe), rcond=None)
+        b, log_a = params
+        a = np.exp(log_a)
+
+        def predict(rel):
+            return a * np.power(np.clip(rel, 1e-6, None), b)
+
+        return predict, np.array([a, b]), {'model': 'power', 'a': float(a), 'b': float(b)}
+
+
 def compute_region_alignment(
     relative_depth: np.ndarray,
     lidar_depth: np.ndarray,
@@ -254,9 +331,10 @@ def compute_region_alignment(
     region_mask: np.ndarray,
     min_points: int = 3,
     use_ransac: bool = True,
+    fit_model: str = "auto",
 ) -> Optional[Tuple[float, float, Dict]]:
     """
-    Compute affine alignment (ax + b) for a single region.
+    Compute depth alignment for a single region.
 
     Args:
         relative_depth: (H, W) DA3 relative depth
@@ -265,9 +343,11 @@ def compute_region_alignment(
         region_mask: (H, W) boolean mask for this region
         min_points: minimum LiDAR points required
         use_ransac: use RANSAC for robust fitting (handles outliers)
+        fit_model: fitting model - "affine", "inverse", "quadratic", "log", "power", or "auto"
 
     Returns:
         (scale, shift, stats) or None if not enough points
+        Note: For non-affine models, scale/shift are dummy values; use stats['predict_fn']
     """
     # Get LiDAR anchors in this region
     anchors = region_mask & lidar_mask
@@ -288,31 +368,110 @@ def compute_region_alignment(
     rel_values = rel_values[valid]
     lid_values = lid_values[valid]
 
-    # Use RANSAC for robust fitting if enough points
-    if use_ransac and len(rel_values) >= 10:
+    # Choose fitting model
+    if fit_model == "auto":
+        # Try multiple models and pick best by RMSE
+        best_rmse = float('inf')
+        best_result = None
+
+        for model_name in ["affine", "inverse", "quadratic"]:
+            try:
+                result = _fit_model(rel_values, lid_values, model_name, use_ransac)
+                if result is not None and result[2]['rmse'] < best_rmse:
+                    best_rmse = result[2]['rmse']
+                    best_result = result
+            except Exception:
+                continue
+
+        if best_result is None:
+            return None
+
+        scale, shift, stats = best_result
+    else:
+        result = _fit_model(rel_values, lid_values, fit_model, use_ransac)
+        if result is None:
+            return None
+        scale, shift, stats = result
+
+    stats['n_anchors'] = int(valid.sum())
+    stats['rel_range'] = (float(rel_values.min()), float(rel_values.max()))
+    stats['lid_range'] = (float(lid_values.min()), float(lid_values.max()))
+
+    return scale, shift, stats
+
+
+def _fit_model(
+    rel_values: np.ndarray,
+    lid_values: np.ndarray,
+    model_name: str,
+    use_ransac: bool,
+) -> Optional[Tuple[float, float, Dict]]:
+    """Fit a specific model and return results."""
+
+    # Get fitting function
+    fit_funcs = {
+        'affine': DepthFitModel.fit_affine,
+        'inverse': DepthFitModel.fit_inverse,
+        'quadratic': DepthFitModel.fit_quadratic,
+        'log': DepthFitModel.fit_log,
+        'power': DepthFitModel.fit_power,
+    }
+
+    if model_name not in fit_funcs:
+        model_name = 'affine'
+
+    fit_func = fit_funcs[model_name]
+
+    # Use RANSAC for affine model
+    if use_ransac and model_name == 'affine' and len(rel_values) >= 10:
         scale, shift, inlier_mask = _ransac_affine_fit(rel_values, lid_values)
         n_inliers = inlier_mask.sum()
-    else:
-        # Solve least squares: lidar = scale * relative + shift
-        A = np.column_stack([rel_values, np.ones_like(rel_values)])
-        result = np.linalg.lstsq(A, lid_values, rcond=None)
-        scale, shift = result[0]
-        n_inliers = len(rel_values)
+
+        # Compute residual
+        predicted = scale * rel_values + shift
+        residual = lid_values - predicted
+        rmse = np.sqrt(np.mean(residual ** 2))
+
+        stats = {
+            'model': 'affine',
+            'n_inliers': int(n_inliers),
+            'scale': float(scale),
+            'shift': float(shift),
+            'rmse': float(rmse),
+            'a': float(scale),
+            'b': float(shift),
+        }
+
+        # Create predict function
+        def predict(rel):
+            return scale * rel + shift
+        stats['predict_fn'] = predict
+
+        return scale, shift, stats
+
+    # Standard fitting
+    try:
+        predict_fn, params, model_info = fit_func(rel_values, lid_values)
+    except Exception:
+        return None
 
     # Compute residual
-    predicted = scale * rel_values + shift
+    predicted = predict_fn(rel_values)
     residual = lid_values - predicted
     rmse = np.sqrt(np.mean(residual ** 2))
 
-    # Compute stats
+    # For compatibility, extract scale/shift for affine
+    if model_name == 'affine':
+        scale, shift = params[0], params[1]
+    else:
+        # Use dummy values; actual prediction uses predict_fn
+        scale, shift = 1.0, 0.0
+
     stats = {
-        'n_anchors': int(valid.sum()),
-        'n_inliers': int(n_inliers),
-        'scale': float(scale),
-        'shift': float(shift),
+        **model_info,
         'rmse': float(rmse),
-        'rel_range': (float(rel_values.min()), float(rel_values.max())),
-        'lid_range': (float(lid_values.min()), float(lid_values.max())),
+        'n_inliers': len(rel_values),
+        'predict_fn': predict_fn,
     }
 
     return scale, shift, stats
@@ -367,9 +526,10 @@ def align_depth_by_regions(
     propagate_to_empty: bool = True,
     depth_stratified: bool = True,
     depth_bins: List[float] = None,
+    fit_model: str = "auto",
 ) -> RegionAlignmentResult:
     """
-    Align relative depth to metric depth using per-region affine transforms.
+    Align relative depth to metric depth using per-region transforms.
 
     Args:
         relative_depth: (H, W) DA3 relative depth
@@ -381,6 +541,7 @@ def align_depth_by_regions(
         propagate_to_empty: propagate alignment from neighbors to empty regions
         depth_stratified: split large regions by depth range for better near-field alignment
         depth_bins: depth boundaries for stratification (default: [0, 10, 25, 50, 100, 200])
+        fit_model: fitting model - "affine", "inverse", "quadratic", "auto" (pick best)
 
     Returns:
         RegionAlignmentResult
@@ -401,14 +562,17 @@ def align_depth_by_regions(
 
     # Compute global alignment as fallback
     global_scale, global_shift = 1.0, 0.0
+    global_predict_fn = None
     if fallback_to_global:
         global_result = compute_region_alignment(
             relative_depth, lidar_depth, lidar_mask,
-            np.ones((H, W), dtype=bool), min_points=10
+            np.ones((H, W), dtype=bool), min_points=10, fit_model=fit_model
         )
         if global_result is not None:
-            global_scale, global_shift, _ = global_result
-            print(f"    Global fallback: scale={global_scale:.4f}, shift={global_shift:.4f}")
+            global_scale, global_shift, global_stats = global_result
+            global_predict_fn = global_stats.get('predict_fn')
+            model_name = global_stats.get('model', 'affine')
+            print(f"    Global fallback ({model_name}): scale={global_scale:.4f}, shift={global_shift:.4f}")
 
     # Process each region
     regions_aligned = 0
@@ -445,27 +609,41 @@ def align_depth_by_regions(
             # Standard single-scale alignment
             result = compute_region_alignment(
                 relative_depth, lidar_depth, lidar_mask,
-                region_mask, min_points=min_anchors_per_region
+                region_mask, min_points=min_anchors_per_region,
+                fit_model=fit_model
             )
 
             if result is not None:
                 scale, shift, stats = result
                 regions_aligned += 1
+
+                # Use predict_fn if available (for non-linear models)
+                if 'predict_fn' in stats:
+                    aligned_depth[region_mask] = stats['predict_fn'](relative_depth[region_mask])
+                else:
+                    aligned_depth[region_mask] = scale * relative_depth[region_mask] + shift
             else:
                 # Fallback to global
                 scale, shift = global_scale, global_shift
                 stats = {'n_anchors': 0, 'fallback': 'global'}
                 regions_fallback += 1
+                if global_predict_fn is not None:
+                    aligned_depth[region_mask] = global_predict_fn(relative_depth[region_mask])
+                else:
+                    aligned_depth[region_mask] = scale * relative_depth[region_mask] + shift
 
-            # Apply alignment to this region
-            aligned_depth[region_mask] = scale * relative_depth[region_mask] + shift
             region_params[region_id] = (scale, shift)
-            region_stats[region_id] = stats
+            # Remove predict_fn before storing (not serializable)
+            stats_clean = {k: v for k, v in stats.items() if k != 'predict_fn'}
+            region_stats[region_id] = stats_clean
 
     # Handle unlabeled pixels (region_labels == 0)
     unlabeled = region_labels == 0
     if unlabeled.any():
-        aligned_depth[unlabeled] = global_scale * relative_depth[unlabeled] + global_shift
+        if global_predict_fn is not None:
+            aligned_depth[unlabeled] = global_predict_fn(relative_depth[unlabeled])
+        else:
+            aligned_depth[unlabeled] = global_scale * relative_depth[unlabeled] + global_shift
 
     # Propagate to regions without anchors from neighbors
     if propagate_to_empty and regions_fallback > 0:
@@ -640,6 +818,7 @@ class RegionWiseDepthAligner:
         device: str = "cuda",
         min_anchors_per_region: int = 3,
         sam_points_per_side: int = 32,
+        fit_model: str = "auto",
     ):
         """
         Initialize region-wise depth aligner.
@@ -649,9 +828,11 @@ class RegionWiseDepthAligner:
             device: Device for SAM
             min_anchors_per_region: Minimum LiDAR anchors per region
             sam_points_per_side: SAM grid density
+            fit_model: Fitting model - "affine", "inverse", "quadratic", "auto"
         """
         self.device = device
         self.min_anchors = min_anchors_per_region
+        self.fit_model = fit_model
 
         # Initialize SAM auto segmenter
         self.segmenter = SAMAutoSegmenter(
@@ -713,6 +894,7 @@ class RegionWiseDepthAligner:
             lidar_depth=lidar_depth,
             lidar_mask=lidar_mask,
             min_anchors_per_region=self.min_anchors,
+            fit_model=self.fit_model,
         )
 
         return result
