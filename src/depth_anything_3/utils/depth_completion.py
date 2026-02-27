@@ -72,43 +72,65 @@ class DepthCompleter:
     Unified interface for depth completion methods.
 
     Supports:
+    - sam: SAM-guided region-wise completion (best quality, requires SAM)
     - completionformer: CompletionFormer (CVPR 2023)
     - nlspn: NLSPN (ECCV 2020)
     - simple: Simple interpolation fallback (no external deps)
     """
 
-    SUPPORTED_METHODS = ["completionformer", "nlspn", "simple"]
+    SUPPORTED_METHODS = ["sam", "completionformer", "nlspn", "simple"]
 
     def __init__(
         self,
-        method: str = "completionformer",
+        method: str = "sam",
         model_path: Optional[str] = None,
         device: str = "cuda",
         max_depth: float = 100.0,
+        sam_points_per_side: int = 32,
     ):
         """
         Initialize depth completer.
 
         Args:
-            method: Completion method ("completionformer", "nlspn", "simple")
-            model_path: Path to pretrained weights
+            method: Completion method ("sam", "completionformer", "nlspn", "simple")
+            model_path: Path to pretrained weights (SAM or CompletionFormer)
             device: Device to run on ("cuda" or "cpu")
             max_depth: Maximum depth value (meters)
+            sam_points_per_side: SAM grid density (higher = finer segmentation)
         """
         self.method = method.lower()
         self.model_path = model_path
         self.device = device
         self.max_depth = max_depth
         self.model = None
+        self.sam_segmenter = None
+        self.sam_points_per_side = sam_points_per_side
 
         if self.method not in self.SUPPORTED_METHODS:
             raise ValueError(f"Unknown method: {method}. Supported: {self.SUPPORTED_METHODS}")
 
-        if self.method == "completionformer":
+        if self.method == "sam":
+            self._init_sam()
+        elif self.method == "completionformer":
             self._init_completionformer()
         elif self.method == "nlspn":
             self._init_nlspn()
         # "simple" doesn't need initialization
+
+    def _init_sam(self):
+        """Initialize SAM for region-wise completion."""
+        from depth_anything_3.utils.region_depth_alignment import SAMAutoSegmenter
+
+        self.sam_segmenter = SAMAutoSegmenter(
+            checkpoint_path=self.model_path,
+            device=self.device,
+            points_per_side=self.sam_points_per_side,
+            min_mask_region_area=50,
+        )
+
+        if not self.sam_segmenter.is_available:
+            print("WARNING: SAM not available, falling back to 'simple' method")
+            self.method = "simple"
 
     def _init_completionformer(self):
         """Initialize CompletionFormer model."""
@@ -185,12 +207,160 @@ class DepthCompleter:
         Returns:
             dense_depth: Dense depth map (H, W) in meters
         """
-        if self.method == "simple":
+        if self.method == "sam":
+            return self._complete_sam(rgb, sparse_depth, mask)
+        elif self.method == "simple":
             return self._complete_simple(rgb, sparse_depth, mask)
         elif self.method == "completionformer":
             return self._complete_completionformer(rgb, sparse_depth, mask)
         elif self.method == "nlspn":
             return self._complete_nlspn(rgb, sparse_depth, mask)
+
+    def _complete_sam(
+        self,
+        rgb: np.ndarray,
+        sparse_depth: np.ndarray,
+        mask: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        """
+        SAM-guided region-wise depth completion.
+
+        Key idea:
+        1. SAM segments the image into regions (cars, poles, buildings, road, etc.)
+        2. For each region, interpolate depth ONLY using points within that region
+        3. This prevents depth bleeding across object boundaries
+
+        Result: Clean object edges, no scattered points on cars/poles/buildings.
+        """
+        import cv2
+        from scipy.interpolate import griddata
+
+        H, W = sparse_depth.shape
+
+        # Get valid depth points
+        if mask is None:
+            mask = sparse_depth > 0.1
+
+        if mask.sum() < 10:
+            print("Warning: Too few valid depth points for completion")
+            return sparse_depth.copy()
+
+        # Step 1: Segment image with SAM
+        print(f"    SAM segmenting image...")
+        region_labels, masks_info = self.sam_segmenter.segment(rgb)
+        n_regions = len(masks_info)
+        print(f"    SAM found {n_regions} regions")
+
+        # Step 2: Initialize output
+        dense_depth = np.zeros((H, W), dtype=np.float32)
+        completed_mask = np.zeros((H, W), dtype=bool)
+
+        # Step 3: Complete each region independently
+        for region_id in range(1, n_regions + 1):
+            region_mask = region_labels == region_id
+
+            if region_mask.sum() < 10:
+                continue
+
+            # Get sparse points within this region
+            region_sparse_mask = mask & region_mask
+            n_points = region_sparse_mask.sum()
+
+            if n_points < 3:
+                # Too few points in this region, will fill later with nearest
+                continue
+
+            # Get coordinates and depths for this region
+            v_valid, u_valid = np.where(region_sparse_mask)
+            depths = sparse_depth[region_sparse_mask]
+
+            # Target: all pixels in this region
+            v_target, u_target = np.where(region_mask)
+            target_points = np.stack([u_target, v_target], axis=1)
+            valid_coords = np.stack([u_valid, v_valid], axis=1)
+
+            # Interpolate within region
+            try:
+                region_depth = griddata(
+                    valid_coords, depths, target_points,
+                    method='linear', fill_value=0
+                )
+
+                # Fill holes with nearest
+                holes = region_depth <= 0
+                if holes.any():
+                    region_depth_nearest = griddata(
+                        valid_coords, depths, target_points,
+                        method='nearest'
+                    )
+                    region_depth[holes] = region_depth_nearest[holes]
+
+                # Write to output
+                dense_depth[v_target, u_target] = region_depth
+                completed_mask[v_target, u_target] = True
+
+            except Exception as e:
+                # Interpolation failed, skip this region
+                continue
+
+        # Step 4: Fill remaining uncompleted pixels using global nearest neighbor
+        uncompleted = ~completed_mask
+        if uncompleted.any() and mask.sum() > 0:
+            v_valid, u_valid = np.where(mask)
+            depths = sparse_depth[mask]
+            valid_coords = np.stack([u_valid, v_valid], axis=1)
+
+            v_target, u_target = np.where(uncompleted)
+            target_points = np.stack([u_target, v_target], axis=1)
+
+            if len(target_points) > 0:
+                fill_depth = griddata(
+                    valid_coords, depths, target_points,
+                    method='nearest'
+                )
+                dense_depth[v_target, u_target] = fill_depth
+
+        # Step 5: Edge-aware smoothing per region (preserve edges)
+        # Apply bilateral filter but respect region boundaries
+        depth_smoothed = dense_depth.copy()
+        for region_id in range(1, min(n_regions + 1, 100)):  # Limit to avoid slowness
+            region_mask = region_labels == region_id
+
+            if region_mask.sum() < 100:
+                continue
+
+            # Extract region
+            ys, xs = np.where(region_mask)
+            y_min, y_max = ys.min(), ys.max() + 1
+            x_min, x_max = xs.min(), xs.max() + 1
+
+            # Get region patch
+            patch = dense_depth[y_min:y_max, x_min:x_max].copy()
+            patch_mask = region_mask[y_min:y_max, x_min:x_max]
+
+            if patch.max() <= 0:
+                continue
+
+            # Normalize and filter
+            patch_norm = patch / (self.max_depth + 1e-6)
+            patch_norm = np.clip(patch_norm, 0, 1).astype(np.float32)
+
+            patch_filtered = cv2.bilateralFilter(
+                patch_norm, d=5, sigmaColor=0.05, sigmaSpace=15
+            )
+
+            patch_filtered = patch_filtered * self.max_depth
+
+            # Write back only within region
+            depth_smoothed[y_min:y_max, x_min:x_max][patch_mask] = \
+                patch_filtered[patch_mask]
+
+        # Preserve original sparse depth values
+        depth_smoothed[mask] = sparse_depth[mask]
+
+        print(f"    Completed: {completed_mask.sum()/(H*W)*100:.1f}% via region interpolation")
+
+        return depth_smoothed.astype(np.float32)
 
     def _complete_simple(
         self,

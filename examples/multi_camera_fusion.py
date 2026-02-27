@@ -141,9 +141,13 @@ def main():
     parser.add_argument("--cameras", type=str, default="0,3,6,9",
                         help="Comma-separated camera IDs (default: 0,3,6,9 for 4 pinhole)")
     parser.add_argument("--output", type=str, required=True)
-    parser.add_argument("--completion_method", type=str, default="simple",
-                        choices=["simple", "completionformer"],
-                        help="Depth completion method (default: simple)")
+    parser.add_argument("--completion_method", type=str, default="sam",
+                        choices=["sam", "simple", "completionformer"],
+                        help="Depth completion method (default: sam)")
+    parser.add_argument("--sam_checkpoint", type=str, default=None,
+                        help="Path to SAM checkpoint (auto-download if not provided)")
+    parser.add_argument("--sam_points_per_side", type=int, default=32,
+                        help="SAM grid density for segmentation (higher = finer, default: 32)")
     parser.add_argument("--completionformer_weights", type=str, default=None,
                         help="Path to CompletionFormer weights (if using completionformer)")
     parser.add_argument("--max_depth", type=float, default=300.0,
@@ -180,11 +184,13 @@ def main():
 
     # Initialize depth completer
     print("\n[2/4] Initializing depth completer...")
+    model_path = args.sam_checkpoint if args.completion_method == "sam" else args.completionformer_weights
     completer = DepthCompleter(
         method=args.completion_method,
-        model_path=args.completionformer_weights,
+        model_path=model_path,
         device=args.device,
         max_depth=args.max_depth,
+        sam_points_per_side=args.sam_points_per_side,
     )
     print(f"  Method: {args.completion_method}")
 
