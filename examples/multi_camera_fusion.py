@@ -247,8 +247,8 @@ def main():
         sparse_depth_range = sparse_depth[valid_mask]
         print(f"    Sparse depth range: [{sparse_depth_range.min():.1f}, {sparse_depth_range.max():.1f}]m")
 
-        # Step 2: Depth completion
-        dense_depth = completer.complete(
+        # Step 2: Depth completion (with debug info for SAM)
+        dense_depth, debug_info = completer.complete_with_debug(
             rgb=image,
             sparse_depth=sparse_depth,
             mask=valid_mask,
@@ -294,6 +294,54 @@ def main():
         Image.fromarray(colorize_depth(dense_depth, vmin=0, vmax=args.max_depth)).save(
             cam_dir / "3_dense_depth.png"
         )
+
+        # 3b. SAM debug visualizations (if available)
+        if debug_info:
+            debug_dir = cam_dir / "debug_sam"
+            debug_dir.mkdir(exist_ok=True)
+
+            # SAM region visualization (colored regions)
+            if 'region_vis' in debug_info:
+                Image.fromarray(debug_info['region_vis']).save(debug_dir / "a_sam_regions.png")
+
+            # Region labels as grayscale
+            if 'region_labels' in debug_info:
+                labels = debug_info['region_labels']
+                labels_norm = (labels / max(labels.max(), 1) * 255).astype(np.uint8)
+                Image.fromarray(labels_norm).save(debug_dir / "b_region_labels.png")
+
+            # Sparse points overlaid on regions
+            if 'region_vis' in debug_info:
+                overlay = debug_info['region_vis'].copy()
+                ys, xs = np.where(valid_mask)
+                for y, x in zip(ys, xs):
+                    cv2.circle(overlay, (x, y), 3, (255, 255, 255), -1)
+                    cv2.circle(overlay, (x, y), 2, sparse_color[y, x].tolist(), -1)
+                Image.fromarray(overlay).save(debug_dir / "c_regions_with_sparse.png")
+
+            # Depth before smoothing
+            if 'dense_before_smooth' in debug_info:
+                Image.fromarray(colorize_depth(debug_info['dense_before_smooth'],
+                                               vmin=0, vmax=args.max_depth)).save(
+                    debug_dir / "d_depth_before_smooth.png"
+                )
+
+            # Completed mask (regions with enough points)
+            if 'completed_mask_before_fill' in debug_info:
+                completed = debug_info['completed_mask_before_fill'].astype(np.uint8) * 255
+                Image.fromarray(completed).save(debug_dir / "e_completed_regions.png")
+
+            # Region statistics
+            if 'region_point_counts' in debug_info:
+                counts = debug_info['region_point_counts']
+                with open(debug_dir / "region_stats.txt", 'w') as f:
+                    f.write(f"Total regions: {debug_info.get('n_regions', 0)}\n")
+                    f.write(f"Regions with >= 3 points: {len([c for c in counts.values() if c >= 3])}\n")
+                    f.write(f"\nRegion point counts:\n")
+                    for rid, cnt in sorted(counts.items(), key=lambda x: -x[1])[:50]:
+                        f.write(f"  Region {rid}: {cnt} points\n")
+
+            print(f"    Saved SAM debug to: {debug_dir}")
 
         # 4. Depth error at LiDAR points
         if valid_mask.any():

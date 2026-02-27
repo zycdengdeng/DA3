@@ -221,6 +221,7 @@ class DepthCompleter:
         rgb: np.ndarray,
         sparse_depth: np.ndarray,
         mask: Optional[np.ndarray] = None,
+        return_debug: bool = False,
     ) -> np.ndarray:
         """
         SAM-guided region-wise depth completion.
@@ -236,6 +237,7 @@ class DepthCompleter:
         from scipy.interpolate import griddata
 
         H, W = sparse_depth.shape
+        debug_info = {}
 
         # Get valid depth points
         if mask is None:
@@ -243,6 +245,8 @@ class DepthCompleter:
 
         if mask.sum() < 10:
             print("Warning: Too few valid depth points for completion")
+            if return_debug:
+                return sparse_depth.copy(), {}
             return sparse_depth.copy()
 
         # Step 1: Segment image with SAM
@@ -251,9 +255,22 @@ class DepthCompleter:
         n_regions = len(masks_info)
         print(f"    SAM found {n_regions} regions")
 
+        # Save debug info
+        debug_info['region_labels'] = region_labels.copy()
+        debug_info['n_regions'] = n_regions
+        debug_info['masks_info'] = masks_info
+
+        # Create colorful region visualization
+        np.random.seed(42)
+        colors = np.random.randint(50, 255, size=(n_regions + 1, 3), dtype=np.uint8)
+        colors[0] = [0, 0, 0]  # Background is black
+        region_vis = colors[region_labels]
+        debug_info['region_vis'] = region_vis
+
         # Step 2: Initialize output
         dense_depth = np.zeros((H, W), dtype=np.float32)
         completed_mask = np.zeros((H, W), dtype=bool)
+        region_point_counts = {}
 
         # Step 3: Complete each region independently
         for region_id in range(1, n_regions + 1):
@@ -265,6 +282,7 @@ class DepthCompleter:
             # Get sparse points within this region
             region_sparse_mask = mask & region_mask
             n_points = region_sparse_mask.sum()
+            region_point_counts[region_id] = int(n_points)
 
             if n_points < 3:
                 # Too few points in this region, will fill later with nearest
@@ -301,10 +319,18 @@ class DepthCompleter:
 
             except Exception as e:
                 # Interpolation failed, skip this region
+                print(f"      Region {region_id} interpolation failed: {e}")
                 continue
+
+        debug_info['region_point_counts'] = region_point_counts
+        debug_info['completed_mask_before_fill'] = completed_mask.copy()
 
         # Step 4: Fill remaining uncompleted pixels using global nearest neighbor
         uncompleted = ~completed_mask
+        n_uncompleted = uncompleted.sum()
+        print(f"    Regions completed: {completed_mask.sum()/(H*W)*100:.1f}%")
+        print(f"    Uncompleted pixels to fill: {n_uncompleted} ({n_uncompleted/(H*W)*100:.1f}%)")
+
         if uncompleted.any() and mask.sum() > 0:
             v_valid, u_valid = np.where(mask)
             depths = sparse_depth[mask]
@@ -319,6 +345,8 @@ class DepthCompleter:
                     method='nearest'
                 )
                 dense_depth[v_target, u_target] = fill_depth
+
+        debug_info['dense_before_smooth'] = dense_depth.copy()
 
         # Step 5: Edge-aware smoothing per region (preserve edges)
         # Apply bilateral filter but respect region boundaries
@@ -358,9 +386,23 @@ class DepthCompleter:
         # Preserve original sparse depth values
         depth_smoothed[mask] = sparse_depth[mask]
 
-        print(f"    Completed: {completed_mask.sum()/(H*W)*100:.1f}% via region interpolation")
+        print(f"    Final completion: {(depth_smoothed > 0).sum()/(H*W)*100:.1f}%")
 
+        if return_debug:
+            return depth_smoothed.astype(np.float32), debug_info
         return depth_smoothed.astype(np.float32)
+
+    def complete_with_debug(
+        self,
+        rgb: np.ndarray,
+        sparse_depth: np.ndarray,
+        mask: Optional[np.ndarray] = None,
+    ) -> tuple:
+        """Complete depth and return debug information."""
+        if self.method == "sam":
+            return self._complete_sam(rgb, sparse_depth, mask, return_debug=True)
+        else:
+            return self.complete(rgb, sparse_depth, mask), {}
 
     def _complete_simple(
         self,
