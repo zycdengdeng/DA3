@@ -252,6 +252,12 @@ def main():
 
         print(f"    Regions: {result.num_regions}, Coverage: {result.coverage*100:.1f}%")
 
+        # Debug: check aligned depth stats
+        ad = result.aligned_depth
+        valid_depth = ad[(ad > 0) & np.isfinite(ad)]
+        print(f"    Aligned depth: min={valid_depth.min():.2f}, max={valid_depth.max():.2f}, "
+              f"mean={valid_depth.mean():.2f}, valid_pixels={len(valid_depth)}")
+
         # Convert to point cloud
         points, colors = depth_to_pointcloud(
             depth=result.aligned_depth,
