@@ -319,8 +319,8 @@ def main():
             cv2.circle(sparse_vis, (x, y), 2, sparse_color[y, x].tolist(), -1)
         Image.fromarray(sparse_vis).save(cam_dir / "2_lidar_sparse.png")
 
-        # 3. DA3 relative depth
-        da3_vis = colorize_depth(da3_depth, vmin=0, vmax=1.0)  # Relative depth [0,1]
+        # 3. DA3 relative depth (auto range based on actual values)
+        da3_vis = colorize_depth(da3_depth)  # Auto vmin/vmax from actual data
         Image.fromarray(da3_vis).save(cam_dir / "3_da3_relative.png")
 
         # 4. Dense depth (completed)
@@ -364,9 +364,9 @@ def main():
                 completed = debug_info['completed_mask_before_fill'].astype(np.uint8) * 255
                 Image.fromarray(completed).save(debug_dir / "e_completed_regions.png")
 
-            # DA3 relative depth
+            # DA3 relative depth (auto range)
             if 'da3_depth' in debug_info:
-                da3_debug = colorize_depth(debug_info['da3_depth'], vmin=0, vmax=1.0)
+                da3_debug = colorize_depth(debug_info['da3_depth'])  # Auto range
                 Image.fromarray(da3_debug).save(debug_dir / "f_da3_relative.png")
 
             # Region statistics
