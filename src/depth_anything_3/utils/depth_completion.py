@@ -306,23 +306,40 @@ class DepthCompleter:
         region_scales = {}
         completed_mask = np.zeros((H, W), dtype=bool)
 
-        # Step 4: Per-region local alignment
+        # Step 4: Per-region local alignment (two-pass)
         min_points_for_local = 5  # Need at least 5 points for reliable local scale
 
+        # Store region info for neighbor-based scale propagation
+        region_info = {}  # region_id -> {mask, center, da3_mean, n_points}
+        regions_needing_neighbor_scale = []  # regions with < 5 LiDAR points
+
+        # First pass: compute local scales for regions with enough LiDAR points
         for region_id in range(1, n_regions + 1):
             region_mask = region_labels == region_id
 
             if region_mask.sum() < 10:
                 continue
 
+            # Compute region center for neighbor finding
+            ys, xs = np.where(region_mask)
+            center_y, center_x = np.mean(ys), np.mean(xs)
+            da3_mean = np.mean(da3_depth[region_mask])
+
             # Get LiDAR points within this region
             region_sparse_mask = mask & region_mask
             n_points = region_sparse_mask.sum()
             region_point_counts[region_id] = int(n_points)
 
+            region_info[region_id] = {
+                'mask': region_mask,
+                'center': (center_y, center_x),
+                'da3_mean': da3_mean,
+                'n_points': n_points,
+            }
+
             if n_points < min_points_for_local:
-                # Use global scale for this region (already applied)
-                completed_mask[region_mask] = True
+                # Mark for second pass (neighbor-based scale)
+                regions_needing_neighbor_scale.append(region_id)
                 continue
 
             # Compute local scale for this region
@@ -331,7 +348,7 @@ class DepthCompleter:
 
             valid_da3 = da3_region > 1e-6
             if valid_da3.sum() < 3:
-                completed_mask[region_mask] = True
+                regions_needing_neighbor_scale.append(region_id)
                 continue
 
             # Local scale (median for robustness)
@@ -344,9 +361,65 @@ class DepthCompleter:
                 local_scale = global_scale
 
             region_scales[region_id] = float(local_scale)
+            region_info[region_id]['scale'] = local_scale
 
             # Apply local scale to this region
             region_depth = da3_depth[region_mask] * local_scale
+            region_depth = np.clip(region_depth, 0, self.max_depth)
+            dense_depth[region_mask] = region_depth
+            completed_mask[region_mask] = True
+
+        # Second pass: assign scales to regions without enough LiDAR points
+        # Use weighted average of nearby regions with known scales
+        n_neighbor_scale = 0
+        for region_id in regions_needing_neighbor_scale:
+            info = region_info[region_id]
+            region_mask = info['mask']
+            center = info['center']
+            da3_mean = info['da3_mean']
+
+            # Find nearby regions with known scales
+            neighbor_scales = []
+            neighbor_weights = []
+
+            for other_id, other_info in region_info.items():
+                if other_id == region_id:
+                    continue
+                if 'scale' not in other_info:
+                    continue
+
+                # Compute distance (spatial + depth similarity)
+                other_center = other_info['center']
+                spatial_dist = np.sqrt(
+                    (center[0] - other_center[0])**2 +
+                    (center[1] - other_center[1])**2
+                )
+
+                # Depth similarity: prefer regions with similar DA3 depth
+                depth_diff = abs(da3_mean - other_info['da3_mean'])
+                depth_weight = np.exp(-depth_diff / max(da3_mean, 0.1))
+
+                # Spatial weight: closer is better
+                spatial_weight = np.exp(-spatial_dist / 200)  # 200 pixels decay
+
+                weight = spatial_weight * depth_weight
+                if weight > 0.01:  # Only consider reasonably close/similar regions
+                    neighbor_scales.append(other_info['scale'])
+                    neighbor_weights.append(weight)
+
+            if neighbor_scales:
+                # Weighted average of neighbor scales
+                neighbor_weights = np.array(neighbor_weights)
+                neighbor_weights /= neighbor_weights.sum()
+                neighbor_scale = np.sum(np.array(neighbor_scales) * neighbor_weights)
+                region_scales[region_id] = float(neighbor_scale)
+                n_neighbor_scale += 1
+            else:
+                # No neighbors found, use global scale
+                neighbor_scale = global_scale
+
+            # Apply scale to this region
+            region_depth = da3_depth[region_mask] * neighbor_scale
             region_depth = np.clip(region_depth, 0, self.max_depth)
             dense_depth[region_mask] = region_depth
             completed_mask[region_mask] = True
@@ -357,10 +430,11 @@ class DepthCompleter:
         debug_info['dense_before_smooth'] = dense_depth.copy()
 
         # Stats
-        n_local = len([s for s in region_scales.values()])
-        n_global = len([c for rid, c in region_point_counts.items()
-                       if c < min_points_for_local and c > 0])
+        n_local = len([rid for rid, info in region_info.items()
+                      if 'scale' in info and rid not in regions_needing_neighbor_scale])
+        n_global = len(regions_needing_neighbor_scale) - n_neighbor_scale
         print(f"    Regions with local scale: {n_local}")
+        print(f"    Regions with neighbor scale: {n_neighbor_scale}")
         print(f"    Regions with global scale: {n_global}")
 
         # Step 5: Light smoothing within regions (optional)
