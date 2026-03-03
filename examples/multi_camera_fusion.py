@@ -190,10 +190,11 @@ def main():
     import torch
     from depth_anything_3.api import DepthAnything3
 
+    # Use DA3-GIANT instead of NESTED to avoid cublas SIGFPE crash
     da3_model = DepthAnything3.from_pretrained(
-        "depth-anything/DA3NESTED-GIANT-LARGE"
+        "depth-anything/DA3-GIANT"
     ).to(args.device).eval()
-    print(f"  DA3 model: DA3NESTED-GIANT-LARGE")
+    print(f"  DA3 model: DA3-GIANT")
 
     # Initialize depth completer
     print("\n[3/5] Initializing depth completer...")
