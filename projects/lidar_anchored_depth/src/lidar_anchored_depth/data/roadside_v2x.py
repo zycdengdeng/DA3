@@ -275,6 +275,44 @@ class RoadsideV2XLoader(BaseDataset):
             self._build_index()
         return self._scenes
 
+    def find_frame_idx(
+        self, scene_id: str, ts_ms: int, cam_id: str
+    ) -> int:
+        """Map ``(scene_id, ts_ms, cam_id)`` to the flat index used by
+        :meth:`get_frame`. Raises ``ValueError`` when no match is found.
+
+        Accepts either a full scene name or a numeric prefix like
+        ``"008"`` for ``scene_id``.
+        """
+        if not self._index_built:
+            self._build_index()
+        if cam_id not in self.cameras:
+            raise ValueError(
+                f"camera {cam_id!r} not in loader.cameras = {self.cameras}"
+            )
+        cam_i = self.cameras.index(cam_id)
+        n_cams = len(self.cameras)
+
+        running = 0
+        for s in self._scenes:
+            match = (
+                s.scene_id == scene_id
+                or s.scene_id.startswith(scene_id + "_")
+            )
+            if not match:
+                running += len(s) * n_cams
+                continue
+            try:
+                ts_i = s.timestamps_ms.index(int(ts_ms))
+            except ValueError as exc:
+                first = s.timestamps_ms[:3]
+                raise ValueError(
+                    f"timestamp {ts_ms} not in scene {s.scene_id} "
+                    f"(first 3: {first})"
+                ) from exc
+            return running + ts_i * n_cams + cam_i
+        raise ValueError(f"scene matching {scene_id!r} not found")
+
     # ------------------------------------------------------------------ #
     # BaseDataset interface
     # ------------------------------------------------------------------ #

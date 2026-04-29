@@ -159,6 +159,18 @@ def test_get_frame_with_empty_data_root_index_is_empty(tmp_path):
         loader.get_frame(0)
 
 
+def test_find_frame_idx_rejects_unknown_camera(tmp_path):
+    loader = RoadsideV2XLoader(data_root=str(tmp_path))
+    with pytest.raises(ValueError, match="not in loader.cameras"):
+        loader.find_frame_idx("008", 1742877031036, "2")
+
+
+def test_find_frame_idx_rejects_unknown_scene(tmp_path):
+    loader = RoadsideV2XLoader(data_root=str(tmp_path))
+    with pytest.raises(ValueError, match="scene matching"):
+        loader.find_frame_idx("nope", 1, "3")
+
+
 def test_read_annotation_entry_roundtrip(tmp_path):
     payload = {
         "timestamp": "1742877031036",
