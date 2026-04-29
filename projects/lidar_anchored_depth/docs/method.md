@@ -115,6 +115,43 @@ calibration error proportional to range.
 
 ## 3. Method: Height-Anchored Depth (HAD)
 
+### 3.0 Empirical justification of the linear assumption
+
+HAD assumes the foundation depth model's relative output ``d̃`` is linear
+in metric depth: ``z = a · d̃ + b``. We tested this on the THICV-R2A
+test bed (8 frames, scene 008, 2 timestamps × 4 pinhole cameras) by
+fitting three candidate models on all (d̃, z_lidar) pairs and comparing
+RMSE in z-space:
+
+| Model | Median RMSE (m) | Worst RMSE (m) |
+|---|---:|---:|
+| linear ``z = a · d̃ + b`` | 14.7 | 16.9 |
+| inverse ``1/z = a · d̃ + b`` | 1576 | 4448 |
+| quadratic ``z = a · d̃² + b · d̃ + c`` | 14.6 | 16.9 |
+
+Two findings drive the design:
+
+1. **DA3 is depth-like, not disparity.** The inverse fit's RMSE is
+   ≈100× the linear fit's. The 1/z fit reliably blows up near
+   ``d̃ ≈ 5–6`` (where the fitted ``a · d̃ + b`` crosses zero) — clear
+   evidence that the inverse model is mis-specified.
+2. **Quadratic offers no real improvement.** Across all 8 frames
+   the margin between quadratic and linear is < 1 % (median 0.13 %).
+   The extra parameter is statistical noise; the linear form survives.
+
+So ``z = a · d̃ + b`` is empirically validated as the right form for our
+deployment. (No g_φ calibration MLP is needed — see ``docs/method.md``
+§9 for what would have triggered one.)
+
+The 11–17 m global-affine RMSE per camera is *much larger* than what we
+expect per-instance: each SAM mask covers a narrow z range (1–2 m for a
+ground vehicle), so a *local* affine is well-conditioned. Closing this
+gap — global ≈ 15 m → per-instance ≈ 1 m — is the central claim of the
+HAD ablation table.
+
+The diagnostic walkthrough is in ``docs/da3_diagnostic.md``; raw scatter
+plots and JSON summaries live under ``preview/diag/``.
+
 ### 3.1 Inputs
 
 For a single roadside frame:

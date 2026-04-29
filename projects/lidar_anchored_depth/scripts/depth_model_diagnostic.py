@@ -134,7 +134,9 @@ def make_figure(
     rng = np.random.default_rng(0)
     sub = rng.choice(len(d), n_plot, replace=False)
 
-    # Left: scatter (d, z) with three fits overlaid
+    # Left: scatter (d, z) with three fits overlaid. Clip y-axis to data
+    # range with a small margin so the inverse fit's blow-up doesn't
+    # squash the actual point cloud into a bottom strip.
     ax = axes[0]
     ax.scatter(d[sub], z[sub], s=2, alpha=0.25, color="0.5", label=f"data (N={len(d)})")
     d_grid = np.linspace(float(np.percentile(d, 1)), float(np.percentile(d, 99)), 300)
@@ -159,6 +161,8 @@ def make_figure(
     )
     ax.legend(loc="best", fontsize=9)
     ax.grid(True, alpha=0.3)
+    z_top = float(np.percentile(z, 99.5))
+    ax.set_ylim(min(0.0, float(z.min())), z_top * 1.05)
 
     # Right: residuals vs z, log-y for visibility
     ax2 = axes[1]
@@ -185,6 +189,16 @@ def make_figure(
     ax2.set_title("Per-sample residual by model")
     ax2.legend(loc="best", fontsize=9)
     ax2.grid(True, alpha=0.3)
+    # Clip residual y-axis to a meaningful range; the inverse model's
+    # outliers near the d̃ → 1/0 region can be many km and squash the
+    # informative part of the plot.
+    lin_resid = fits[0]["z_pred"] - z
+    quad_resid = fits[2]["z_pred"] - z
+    ref = np.concatenate([np.abs(lin_resid), np.abs(quad_resid)])
+    if np.isfinite(ref).any():
+        ymax = float(np.percentile(ref[np.isfinite(ref)], 99.9)) * 1.5
+        ymax = max(ymax, 5.0)
+        ax2.set_ylim(-ymax, ymax)
 
     fig.tight_layout()
     fig.savefig(out_path, dpi=120)
@@ -275,7 +289,15 @@ def main() -> int:
     if uv.size == 0:
         raise SystemExit("no LiDAR points project in front of the camera")
 
-    # Sample d̃ and conf at LiDAR pixel locations
+    # Sample d̃ and conf at LiDAR pixel locations.
+    # Filter NaN/Inf from uv first (cv2.projectPoints with strong distortion
+    # can yield non-finite values for points near the unprojection boundary).
+    finite = np.isfinite(uv).all(axis=1)
+    uv = uv[finite]
+    z_lidar = z_lidar[finite]
+    if uv.size == 0:
+        raise SystemExit("no finite uv after distortion projection")
+
     uv_int = np.round(uv).astype(np.int64)
     in_image = (
         (uv_int[:, 0] >= 0) & (uv_int[:, 0] < W)
