@@ -21,6 +21,33 @@ commits. Reviewers can stop after any stage and have something coherent.
   `experiment/*`)
 - pytest configured; smoke tests pass on the real bits
 
+## Stage 1.2 — Dataset alignment *(this commit)*
+
+- `docs/dataset_guide.md` — verbatim copy of the user's THICV-R2A guide
+- `data.calibration` — parse `support_info/calib.json` into typed
+  `SceneCalibration`, including the world frame (= VirtualLidar),
+  per-camera intrinsics + distortion + `T_wc`, per-LiDAR `T_wL`, and
+  ZYX-Euler helper
+- `data.carid_lookup` — parse `support_info/carid.json` for ego-id
+  per-scene
+- `data.roadside_v2x` rewritten with the real format:
+  - `pinhole{N}/` ↔ `cam{3,6,9,0}_*.png` mapping pinned at module level
+  - ZYX Euler annotation parsing (not Rodrigues)
+  - `(scene_id, instance_id)` composite key for cross-scene uniqueness
+  - `STATIC_FIXTURE_CLASSES = {Bollards, Crash_bucket, Cone}` lifted
+    out of the per-frame dynamic stream into a scene-static table
+  - 500 ms PCD-timestamp tolerance constant
+- `scripts/sanity_check_dataset.py` — runs the §11 verification list
+  (data root, scene layout, annotations, calibration, pinhole mapping,
+  carid) once on a fresh server mount
+- `method.md` updated: framing is "roadside reconstruction" (mainline);
+  R2A control-signal feeding is application section only; THICV-R2A
+  test-bed and per-scene-overfit rationale documented
+
+Stage 1.2 ships only public APIs and dataclasses — actual file I/O
+(PCD reading, image decoding, full scene indexing) waits for Stage 3
+once the data is mounted on the build host.
+
 ## Stage 2 — Core algorithms
 
 - `alignment.projection` — port from prior `utils/lidar_alignment.py`
@@ -38,17 +65,19 @@ commits. Reviewers can stop after any stage and have something coherent.
 
 ## Stage 3 — Data adapters & end-to-end pipeline
 
-- `data.roadside_v2x` — implement parsing for the V2X annotation format
-  (`docs/data.md` §3): per-timestamp JSON, scene calibration, multi-camera
-  emission, occlusion / `num_points` filtering
-- `data.car_road` — port from prior branch, slim
-- `data.self_data` — adapter for the lidar-calibration snapshot
-- `data.generic` — for arbitrary roadside data; manifest-driven
-- `data.pseudo_gt` — multi-sweep accumulation for evaluation GT
-- `pipeline.roadside.RoadsidePipeline` — wires it all together; AA-HAD
-  is the default method
+- `data.roadside_v2x` — implement file I/O on the THICV-R2A mount:
+  - `_build_index` walks `/mnt/car_road_data_TianJin/` to enumerate
+    scenes, label JSONs, pinhole image paths, and merged-PCD paths
+  - `get_frame` decodes one (scene, ts, cam) into a populated `Frame`
+  - static-fixture pass on first encounter per scene
+  - PCD I/O via `open3d` (or `pypcd`); image I/O via `cv2`
+- `data.pseudo_gt` — multi-session LiDAR accumulation for dense GT
+  (the rig is fixed across all 89 sessions)
+- `pipeline.roadside.RoadsidePipeline` — wires DA3 + SAM + AA-HAD +
+  ground-field + multi-camera fusion; AA-HAD is the default method
 - `cli.infer`, `cli.evaluate`, `cli.ablate`
-- Integration test: B0–B6 + M1–M4 all run on synthetic frame end-to-end
+- Integration test: B0–B6 + M1–M4 all run on a synthetic frame
+  end-to-end; THICV-R2A smoke run gated on `--data-root` being present
 
 ## Stage 4 — Analysis, ablations, paper figures
 

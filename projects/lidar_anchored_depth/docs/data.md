@@ -61,6 +61,10 @@ These are consumed directly by AA-HAD as the height anchors (see
 
 ## 3. The roadside-V2X annotation JSON
 
+> The full canonical schema for our primary dataset (THICV-R2A) lives
+> in `docs/dataset_guide.md`. The summary below is the deployment-agnostic
+> abstraction the loader expects.
+
 Adapters that target deployments producing standard V2X 3D-detection
 logs should consume per-timestamp JSON entries in this canonical form:
 

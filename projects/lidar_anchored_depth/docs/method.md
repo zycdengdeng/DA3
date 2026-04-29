@@ -11,7 +11,26 @@ remarkable **relative** depth in the wild, but their **metric** outputs
 exhibit strong **scale drift** on out-of-distribution scenes — most notably
 roadside V2X cameras mounted at 5–10 m height with 15–45° down-tilt.
 
-Existing test-time corrections fall into two camps:
+The **deliverable** of this work is a dense, metric, colored point-cloud
+**reconstruction of a roadside intersection** from 4 wide-baseline pinhole
+cameras + 4 LiDARs + V2X 3D-detection annotations. The classical
+roadside-reconstruction problem statement is well established and the
+target market (HD maps, traffic monitoring, V2X-perception) is mature; we
+adopt this framing as our paper's primary one. (One downstream
+application — feeding dense control signals into a Roadside-to-Agent
+video diffusion pipeline — is discussed only as motivation in the
+application section.)
+
+Wide-baseline roadside is an **adversarial** regime for existing dense
+reconstruction stacks: 90°+ baseline angles between adjacent cameras
+collapse SIFT/ORB feature matching, so COLMAP / MVS / 3D-Gaussian-Splatting
+all fail to bootstrap. Naïvely fusing per-camera foundation depth fails
+too, because each camera self-normalizes its relative depth and the four
+clouds do not link up. We sidestep correspondence entirely by anchoring
+each camera independently to the same world frame.
+
+Existing test-time corrections for the metric-depth subproblem fall into
+two camps:
 
 1. **Global scale alignment.** Solve a single scalar `s` (or affine
    `(a, b)`) so that `s · d_pred ≈ d_lidar` over all overlapping pixels,
@@ -23,6 +42,26 @@ Both treat **camera-axis depth `z`** as the primitive and use **per-pixel
 LiDAR `z` measurements** as anchors. We argue this is the *wrong* primitive
 for roadside cameras and propose **height** (world-frame Z) as the right
 one.
+
+### 1.1 Test bed: THICV-R2A
+
+We evaluate on the THICV-R2A dataset (Tsinghua intersection, 89 ~22-second
+sessions over ~9 days, 12,891 roadside frames, 1.08 M annotated objects
+across 20 classes). The rig is **one fixed intersection** with 4 pinhole
+cameras (cam0 / 3 / 6 / 9), 4 LiDARs (merged in world frame), and 3D-bbox
+annotations per frame. The full schema is in `docs/dataset_guide.md`.
+
+Two properties of this setup matter for design:
+
+- **Single-intersection × multi-session**: per-scene overfitting (NeRF /
+  3DGS style) is *encouraged* — the static background is identical
+  across all 89 sessions, so any learned scene-specific component (the
+  ground field MLP, σ-uncertainty head) can pool training data across
+  the full 0.49-hour corpus.
+- **Static fixtures are pre-segmented**: 17 % of annotations
+  (`Bollards`, `Crash_bucket`, `Cone`) are scene-static; we anchor them
+  once per `(scene, instance_id)` and reuse the anchor across all
+  sessions, instead of re-solving an affine per frame.
 
 ## 2. Why height, not depth, is the right primitive for roadside
 
@@ -280,6 +319,12 @@ deployment that produces 3D detection logs.
   the global scale prior.
 - **Wrong `vx, vy` from the V2X tracker**: rare for vehicles after a
   few frames; can flag via `num_points` and `track_age` (if available).
+- **Static fixtures (Bollards, Crash_bucket, Cone)**: these classes are
+  annotated every frame but never move. The loader detects them by
+  class membership and lifts them out of the per-frame dynamic stream
+  into a scene-static `(scene_id, instance_id)` table; the affine
+  anchor is solved once per fixture and reused across sessions, both
+  for efficiency and to avoid frame-by-frame numerical noise.
 
 ## 5. Methods (ours), revised
 
