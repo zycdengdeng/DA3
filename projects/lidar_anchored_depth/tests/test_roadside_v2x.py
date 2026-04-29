@@ -139,8 +139,9 @@ def test_global_key_pairs_scene_with_id():
     assert loader._global_key("008", 1) != loader._global_key("009", 1)
 
 
-def test_index_not_built_returns_zero_length():
-    loader = RoadsideV2XLoader(data_root="/tmp")
+def test_index_not_built_returns_zero_length(tmp_path):
+    """Use an isolated empty tmp dir; ``/tmp`` may contain unreadable subdirs."""
+    loader = RoadsideV2XLoader(data_root=str(tmp_path))
     assert len(loader) == 0
 
 

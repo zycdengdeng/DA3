@@ -185,10 +185,15 @@ class RoadsideV2XLoader(BaseDataset):
                 f"data_root does not exist: {self.data_root}"
             )
 
-        scene_dirs = sorted(
-            d for d in self.data_root.iterdir()
-            if d.is_dir() and d.name != "support_info"
-        )
+        scene_dirs = []
+        for d in sorted(self.data_root.iterdir()):
+            if d.name == "support_info":
+                continue
+            try:
+                if d.is_dir():
+                    scene_dirs.append(d)
+            except PermissionError:
+                continue
         if self.scene_filter is not None:
             allowed = set(self.scene_filter)
             scene_dirs = [
@@ -204,9 +209,12 @@ class RoadsideV2XLoader(BaseDataset):
         for scene_dir in scene_dirs:
             scene_id = scene_dir.name
             label_dir = scene_dir / "road_labels" / "interpolation_labels"
-            if not label_dir.is_dir():
+            try:
+                if not label_dir.is_dir():
+                    continue
+                json_files = sorted(label_dir.glob("*.json"))
+            except PermissionError:
                 continue
-            json_files = sorted(label_dir.glob("*.json"))
             if not json_files:
                 continue
 
