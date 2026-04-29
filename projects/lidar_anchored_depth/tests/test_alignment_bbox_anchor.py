@@ -1,0 +1,143 @@
+"""Tests for ``alignment.bbox_anchor`` (M2 / M3 AA-HAD)."""
+
+from __future__ import annotations
+
+import numpy as np
+import pytest
+
+from lidar_anchored_depth.alignment.bbox_anchor import (
+    aa_had,
+    match_bboxes_to_masks,
+)
+from lidar_anchored_depth.data.base import DynamicObject
+
+from _synthetic import (  # type: ignore[import-not-found]
+    synthetic_d_image_consistent_with_mask,
+    synthetic_mask_from_world_box,
+)
+
+
+# --------------------------------------------------------------------- #
+# Bbox ↔ mask matching
+# --------------------------------------------------------------------- #
+def test_match_picks_high_iou_pair(synthetic_camera, synthetic_object):
+    K, T_wc = synthetic_camera
+    H, W = 1080, 1920
+    mask = synthetic_mask_from_world_box(
+        synthetic_object.xyz[0], synthetic_object.xyz[1], synthetic_object.xyz[2],
+        synthetic_object.lwh[0], synthetic_object.lwh[1], synthetic_object.lwh[2],
+        synthetic_object.yaw, K, T_wc, (H, W),
+    )
+    masks = mask[None, ...]
+    matches = match_bboxes_to_masks(
+        [synthetic_object], masks, K, T_wc, dist=None,
+        dt_seconds=0.0, iou_threshold=0.3,
+    )
+    assert len(matches) == 1
+    assert matches[0].iou > 0.9
+
+
+def test_match_rejects_when_iou_too_low(synthetic_camera, synthetic_object):
+    """Mask elsewhere in the image → IoU 0 → no match."""
+    K, T_wc = synthetic_camera
+    H, W = 1080, 1920
+    mask = np.zeros((H, W), dtype=bool)
+    mask[10:50, 10:50] = True  # far from where the bbox projects
+    masks = mask[None, ...]
+    matches = match_bboxes_to_masks(
+        [synthetic_object], masks, K, T_wc, dist=None,
+        dt_seconds=0.0, iou_threshold=0.3,
+    )
+    assert len(matches) == 0
+
+
+def test_match_motion_compensation_recovers_iou_when_dt_known(
+    synthetic_camera, synthetic_object,
+):
+    """Object moved, mask is at the moved position; correct dt restores IoU."""
+    K, T_wc = synthetic_camera
+    H, W = 1080, 1920
+
+    # Original object at LiDAR timestamp; mask is built from where the
+    # object is at camera timestamp (5 m later in +X)
+    obj = synthetic_object
+    obj.velocity_xy[:] = [5.0 / 0.1, 0.0]  # 50 m/s vx → moves 5 m in 100 ms
+    dt = 0.1
+
+    # Mask is at the object's CAMERA-time position
+    mask_at_camera_t = synthetic_mask_from_world_box(
+        obj.xyz[0] + 5.0, obj.xyz[1], obj.xyz[2],
+        obj.lwh[0], obj.lwh[1], obj.lwh[2], obj.yaw,
+        K, T_wc, (H, W),
+    )
+    masks = mask_at_camera_t[None, ...]
+
+    # Without compensation: bbox projects to LiDAR-time pose → low IoU
+    no_comp = match_bboxes_to_masks(
+        [obj], masks, K, T_wc, dist=None, dt_seconds=0.0,
+        iou_threshold=0.3,
+    )
+    # With compensation: IoU recovers
+    with_comp = match_bboxes_to_masks(
+        [obj], masks, K, T_wc, dist=None, dt_seconds=dt,
+        iou_threshold=0.3,
+    )
+
+    assert len(with_comp) == 1
+    assert with_comp[0].iou > 0.5
+    # Either no match without comp, or markedly worse IoU
+    if no_comp:
+        assert no_comp[0].iou < with_comp[0].iou
+
+
+# --------------------------------------------------------------------- #
+# Full AA-HAD recovery
+# --------------------------------------------------------------------- #
+def test_aa_had_recovers_known_affine(synthetic_camera, synthetic_object):
+    """The headline test: build a scene with z = a · d̃ + b and recover."""
+    K, T_wc = synthetic_camera
+    H, W = 1080, 1920
+    a_true, b_true = 0.4, 2.0
+
+    obj = synthetic_object
+    mask = synthetic_mask_from_world_box(
+        obj.xyz[0], obj.xyz[1], obj.xyz[2],
+        obj.lwh[0], obj.lwh[1], obj.lwh[2], obj.yaw,
+        K, T_wc, (H, W),
+    )
+    assert mask.any()
+    masks = mask[None, ...]
+
+    d_image = synthetic_d_image_consistent_with_mask(
+        mask=mask, K=K, T_wc=T_wc,
+        Z_min=obj.Z_min, Z_max=obj.Z_max,
+        a_true=a_true, b_true=b_true,
+    )
+
+    result = aa_had(
+        d_pred_image=d_image, K=K, T_wc=T_wc,
+        masks=masks, dynamic_objects=[obj],
+        dt_seconds=0.0, iou_threshold=0.3,
+    )
+
+    assert result.n_masks_solved == 1
+    a_rec = result.anchors[0].a
+    b_rec = result.anchors[0].b
+    assert a_rec == pytest.approx(a_true, rel=0.05)
+    assert b_rec == pytest.approx(b_true, abs=0.1)
+
+
+def test_aa_had_no_match_no_solve(synthetic_camera, synthetic_object):
+    """Mask in the wrong place → no match → no solve."""
+    K, T_wc = synthetic_camera
+    H, W = 1080, 1920
+    d_image = np.full((H, W), 1.0, dtype=np.float32)
+    masks = np.zeros((1, H, W), dtype=bool)
+    masks[0, 5:30, 5:30] = True
+    result = aa_had(
+        d_pred_image=d_image, K=K, T_wc=T_wc,
+        masks=masks, dynamic_objects=[synthetic_object],
+        dt_seconds=0.0, iou_threshold=0.3,
+    )
+    assert result.n_masks_solved == 0
+    assert len(result.anchors) == 0
