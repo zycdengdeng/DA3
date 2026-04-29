@@ -1,12 +1,9 @@
 """Read PCD point-cloud files.
 
-Strategy:
-- Primary: ``open3d.io.read_point_cloud`` (handles ascii / binary /
-  binary_compressed, all major fields).
-- Fallback (when open3d is unavailable): an in-house parser handling
-  ``DATA ascii`` and ``DATA binary`` (uncompressed). For
-  ``DATA binary_compressed`` we still require open3d, since LZF
-  decompression has no stdlib equivalent.
+Self-contained: handles ``DATA ascii``, ``DATA binary``, and
+``DATA binary_compressed`` without any compiled extensions. ``open3d``
+is preferred when available (faster on huge files); the in-house path
+covers environments where open3d cannot be installed (e.g. Python 3.13).
 
 Only XYZ is exposed; downstream code does not need intensity or RGB.
 """
@@ -64,12 +61,7 @@ def _read_pcd_native(path: Path) -> np.ndarray:
         if header["data"] == "binary":
             return _parse_binary_body(f, header, path)
         if header["data"] == "binary_compressed":
-            raise RuntimeError(
-                f"{path}: DATA=binary_compressed (LZF); install open3d "
-                "(`pip install open3d` or `conda install -c open3d-admin open3d`) "
-                "or feed the file to the project after running it through a "
-                "decompressor."
-            )
+            return _parse_binary_compressed_body(f, header, path)
         raise ValueError(f"{path}: unknown DATA kind {header['data']!r}")
 
 
@@ -229,3 +221,135 @@ def _parse_binary_body(
         out[:, axis_idx] = col.astype(np.float32, copy=False)
 
     return out
+
+
+# --------------------------------------------------------------------- #
+# binary_compressed support (LZF)
+# --------------------------------------------------------------------- #
+def _parse_binary_compressed_body(
+    f: IO[bytes], header: dict, path: Path
+) -> np.ndarray:
+    """Parse a ``DATA binary_compressed`` body using the in-house LZF decoder.
+
+    Layout after the ``DATA binary_compressed\\n`` line:
+
+        uint32 little-endian: compressed_size
+        uint32 little-endian: uncompressed_size
+        compressed_size bytes: LZF-compressed payload
+
+    The decompressed payload is in **struct-of-arrays** form: all x's
+    concatenated, then all y's, etc. (Different from ``DATA binary``,
+    which is array-of-structs.)
+    """
+    fields = header["fields"]
+    sizes = header["sizes"]
+    types = header["types"]
+    counts = header["counts"]
+    n_points = header["n_points"]
+
+    sz_hdr = f.read(8)
+    if len(sz_hdr) < 8:
+        raise ValueError(f"{path}: truncated LZF size header")
+    compressed_size = struct.unpack("<I", sz_hdr[:4])[0]
+    uncompressed_size = struct.unpack("<I", sz_hdr[4:])[0]
+
+    payload = f.read(compressed_size)
+    if len(payload) < compressed_size:
+        raise ValueError(
+            f"{path}: truncated LZF payload "
+            f"(expected {compressed_size} B, got {len(payload)} B)"
+        )
+
+    raw = _lzf_decompress(payload, uncompressed_size)
+
+    # SoA: field block sizes
+    field_block_sizes = [s * c * n_points for s, c in zip(sizes, counts)]
+    field_offsets = [0]
+    for sz in field_block_sizes[:-1]:
+        field_offsets.append(field_offsets[-1] + sz)
+
+    ix, iy, iz = _xyz_indices(fields, path)
+
+    out = np.empty((n_points, 3), dtype=np.float32)
+    for axis_idx, fi in zip(range(3), (ix, iy, iz)):
+        dtype = _NUMPY_DTYPE_FOR.get((types[fi], sizes[fi]))
+        if dtype is None:
+            raise ValueError(
+                f"{path}: unsupported field {fields[fi]!r} TYPE={types[fi]} "
+                f"SIZE={sizes[fi]}"
+            )
+        if counts[fi] != 1:
+            raise ValueError(
+                f"{path}: COUNT>1 unsupported for x/y/z (got {counts[fi]})"
+            )
+        offset = field_offsets[fi]
+        block = np.frombuffer(
+            raw, dtype=dtype, count=n_points, offset=offset
+        )
+        out[:, axis_idx] = block.astype(np.float32, copy=False)
+
+    return out
+
+
+def _lzf_decompress(data: bytes, expected_size: int) -> bytes:
+    """Decompress an LZF stream.
+
+    Pure-Python implementation of the liblzf stream format:
+
+    - ``ctrl`` byte ``< 0x20``: literal run of ``ctrl + 1`` bytes follows
+    - ``ctrl`` byte ``>= 0x20``: back-reference; high 3 bits of ctrl are
+      the run length (with ``7`` meaning "extra length byte follows"),
+      low 5 bits + the next byte are the back-distance minus 1.
+
+    Back-references with ``run > distance`` overlap their own output and
+    must be copied byte-by-byte (this is RLE-like extension).
+    """
+    out = bytearray(expected_size)
+    op = 0
+    ip = 0
+    n = len(data)
+
+    while ip < n:
+        ctrl = data[ip]
+        ip += 1
+
+        if ctrl < 0x20:  # literal run
+            run_len = ctrl + 1
+            if ip + run_len > n:
+                raise ValueError("LZF: truncated literal run")
+            if op + run_len > expected_size:
+                raise ValueError("LZF: literal run overflows output")
+            out[op : op + run_len] = data[ip : ip + run_len]
+            op += run_len
+            ip += run_len
+        else:  # back-reference
+            run_len = ctrl >> 5
+            if run_len == 7:
+                if ip >= n:
+                    raise ValueError("LZF: truncated extended length")
+                run_len += data[ip]
+                ip += 1
+            run_len += 2
+
+            if ip >= n:
+                raise ValueError("LZF: truncated back-reference offset")
+            ref_offset = ((ctrl & 0x1F) << 8) | data[ip]
+            ip += 1
+            ref_offset += 1
+
+            ref_pos = op - ref_offset
+            if ref_pos < 0:
+                raise ValueError("LZF: back-reference before output start")
+            if op + run_len > expected_size:
+                raise ValueError("LZF: back-reference overflows output")
+
+            # Byte-by-byte to handle overlap (run > offset: RLE-like)
+            for i in range(run_len):
+                out[op + i] = out[ref_pos + i]
+            op += run_len
+
+    if op != expected_size:
+        raise ValueError(
+            f"LZF: decoded {op} bytes, expected {expected_size}"
+        )
+    return bytes(out)
