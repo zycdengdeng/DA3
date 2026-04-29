@@ -1,0 +1,9 @@
+# Roadside V2X annotation-aware loader (target adapter for AA-HAD).
+# Set root / manifest / calib_path to match your deployment.
+_target_: lidar_anchored_depth.data.roadside_v2x.RoadsideV2XLoader
+root: ???
+manifest: ???       # path to JSONL or directory of per-timestamp JSON files
+calib_path: ???     # path to scene calibration JSON (per-camera K, T_wc, image size)
+cameras: null       # null = all cameras; or list e.g. [cam0, cam3, cam6]
+occlusion_max: 2
+min_num_points: 5

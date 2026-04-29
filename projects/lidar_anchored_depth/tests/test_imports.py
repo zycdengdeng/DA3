@@ -17,6 +17,7 @@ def test_top_level_imports():
     import lidar_anchored_depth.cli  # noqa: F401
     import lidar_anchored_depth.data  # noqa: F401
     import lidar_anchored_depth.data.base  # noqa: F401
+    import lidar_anchored_depth.data.roadside_v2x  # noqa: F401
     import lidar_anchored_depth.eval  # noqa: F401
     import lidar_anchored_depth.eval.metrics  # noqa: F401
     import lidar_anchored_depth.pipeline  # noqa: F401

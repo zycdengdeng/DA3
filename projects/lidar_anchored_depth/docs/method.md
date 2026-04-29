@@ -169,7 +169,131 @@ The full output depth map is assembled as:
 - Smooth seam at mask boundaries via guided filter or Poisson blending
   on `1/z` (TBD; falls under refinement)
 
-## 4. Baselines
+## 4. Annotation-Aware HAD (AA-HAD) — handling LiDAR-camera time offset
+
+### 4.1 The problem
+
+A roadside camera and roadside LiDAR are separate sensors with separate
+clocks and (often) separate sampling rates. For a fast-moving target,
+even a 50 ms offset induces a ≈ 1.5 m horizontal world displacement —
+enough to break the *assignment* between a SAM image-mask and the LiDAR
+points that nominally lie inside it. Per-pixel `z`-anchor methods are
+particularly vulnerable: a wrong assignment scrambles the depth
+distribution of the very anchors used to fit `(a, b)`.
+
+HAD is partially immune by construction: world-frame **height `Z` does
+not move under small horizontal displacements** (`v_z ≈ 0` for ground
+vehicles within the time scale of interest). The remaining vulnerability
+is the bbox ↔ mask **assignment** itself.
+
+### 4.2 The free lunch from V2X annotations
+
+In an actual roadside V2X deployment, the rig is already running 3D
+object detection + tracking on the LiDAR stream. The output is exactly
+what we need:
+
+```jsonc
+{
+  "timestamp": "1743645353317",
+  "object": [
+    {
+      "id": 1, "label": "Car",
+      "x": -61.96, "y": 14.01, "z": -1.46,        // bbox center, world frame, meters
+      "length": 4.45, "width": 2.43, "height": 1.97,
+      "yaw": -1.69,
+      "vx": 0.0, "vy": 0.0,                         // world-frame velocity, m/s
+      "occlusion": 0,                               // {0, 1, 2}
+      "num_points": 1472                            // points inside the bbox
+    },
+    ...
+  ]
+}
+```
+
+Two consequences:
+
+1. The bbox `height` field gives the **exact** world-frame height of
+   the object — no need to estimate `[Z_min, Z_max]` from the points
+   inside a SAM mask, no percentile / RANSAC rejection. From the bbox:
+   `Z_min = z - h/2`, `Z_max = z + h/2`. This is HAD's strongest input.
+2. `(vx, vy)` lets us compensate the bbox in world frame for the
+   LiDAR-camera time offset *without* tracking, *without* clustering,
+   *without* any LiDAR semantic segmentation.
+
+### 4.3 AA-HAD algorithm
+
+For a per-timestamp annotation entry with cameras `{c}`, LiDAR `P_world`,
+and dynamic objects `{o_j}`:
+
+```text
+Δt  = camera_ts - lidar_ts                 (often 0; configurable per dataset)
+
+# Dynamic / annotated branch
+for each object o_j:
+    if occlusion >= 2: skip
+    if num_points < N_min: skip
+    cx, cy = o_j.x + o_j.vx · Δt, o_j.y + o_j.vy · Δt    # XY motion-compensated
+    cz, h  = o_j.z, o_j.height                            # Z untouched (v_z ≈ 0)
+    Z_min, Z_max = cz - h/2, cz + h/2                     # FROM BBOX, not points
+    bbox_world(t_C) = box(cx, cy, cz, l, w, h, yaw)
+
+    for each camera c that potentially sees o_j:
+        bbox_uv = project_3d_bbox(bbox_world(t_C), K_c, T_cw_c)
+        mask_i  = argmax_i  IoU(bbox_uv, sam_mask_i^c)
+        if IoU < τ_iou: skip                              # assignment failed
+
+        # HAD: solve (a_i, b_i) so that v_top→Z_max and v_bot→Z_min
+        a_i, b_i = solve_per_instance_affine(d̃_c, K_c, T_wc_c,
+                                              mask_i, Z_min, Z_max)
+        z_pred_c[mask_i] = a_i · d̃_c[mask_i] + b_i
+
+# Static / background branch
+P_static = P_world  \  ⋃_j  bbox_interior(o_j)            # remove annotated objects
+# Optionally accumulate P_static across a temporal window (rig is fixed)
+# Run HAD-on-mask or ground-plane fit on regions not covered above.
+```
+
+`τ_iou`, `N_min`, the temporal window for static accumulation, and the
+choice of "covered region" → ground-vs-instance fall-through are all
+exposed as method config knobs.
+
+### 4.4 Why C2 is a clean second contribution
+
+The community has *separately* invested in: (a) roadside V2X 3D
+detection / tracking (mature, multiple SOTA models, real deployments),
+and (b) monocular metric depth (foundation models, the Marigold / DA-V2 /
+Metric3D line). Nobody — to our knowledge — has connected the two ends:
+**the V2X infrastructure already produces precisely the supervision a
+roadside metric-depth recovery needs.** AA-HAD is the link. It costs no
+new training, no new annotation, and it generalizes to any roadside
+deployment that produces 3D detection logs.
+
+### 4.5 Failure modes & honest limits
+
+- **Mask ambiguity**: two overlapping objects (truck behind car) project
+  to overlapping bbox-uv → IoU split. Mitigation: use SAM's
+  `predicted_iou` per mask plus `num_points` of the bbox; choose the
+  mask whose centroid lies closest to the bbox center.
+- **Cropped bbox at image border**: the height interval is no longer
+  bracketed by `v_top, v_bot` from a complete mask. Mitigation:
+  fall back to a single anchor (whichever extreme is in-image) plus
+  the global scale prior.
+- **Wrong `vx, vy` from the V2X tracker**: rare for vehicles after a
+  few frames; can flag via `num_points` and `track_age` (if available).
+
+## 5. Methods (ours), revised
+
+| ID | Name | Description |
+|----|------|-------------|
+| M1 | HAD-mask | Per-instance height extracted from LiDAR-in-mask returns (§3) |
+| M2 | HAD-bbox | Per-instance height taken directly from V2X bbox annotation (§4) — exact |
+| M3 | AA-HAD | M2 dynamic branch + ground-plane background branch + temporal accumulation for static |
+| M4 | AA-HAD + Adaptive | M3 with density-aware fusion at seams |
+
+`M3` is the headline; `M1` is reported for ablation against
+annotation-free deployment.
+
+## 6. Baselines
 
 | ID | Name | Description |
 |----|------|-------------|
@@ -179,16 +303,9 @@ The full output depth map is assembled as:
 | B3 | Global-RANSAC | LSQ with RANSAC outlier rejection |
 | B4 | Region-z-affine | Per-mask `(a, b)` fit on `(d̃, z_lidar)` pairs (prior work) |
 | B5 | Ground-only | Plane-back-project for ground pixels, fall back to B3 elsewhere |
+| B6 | Bbox-z-anchor | Use V2X bbox center `z` as a single per-object anchor (no height); ablates "bbox without height-as-primitive" |
 
-## 5. Methods (ours)
-
-| ID | Name | Description |
-|----|------|-------------|
-| M1 | HAD | Per-instance height-anchored fit (§3.2–§3.4) on instances; B0 elsewhere |
-| M2 | HAD + Ground | M1 plus ground-plane branch (§3.5) |
-| M3 | HAD + Ground + Adaptive | M2 with density-aware fusion at seams |
-
-## 6. Evaluation protocol
+## 7. Evaluation protocol
 
 Metrics (per-pixel, on pseudo-GT depth from accumulated LiDAR sweeps):
 
@@ -205,18 +322,26 @@ Point-cloud metrics (lifted depth → world points):
 
 Splits: scene-level train/val/test (no frame leakage). Fixed seed.
 
-## 7. Ablations
+## 8. Ablations
 
-- **Anchor primitive**: height vs. depth (M1 vs. B4)
-- **Ground branch**: with vs. without (M2 vs. M1)
+- **Anchor primitive**: height vs. depth (HAD-mask M1 vs. B4) — the central
+  scientific question
+- **Annotation source**: bbox (M2) vs. mask-derived height (M1) — measures
+  the gain from the V2X annotation free lunch
+- **Time compensation**: AA-HAD with `(vx, vy)` correction vs. without —
+  isolates the contribution of explicit motion correction
+- **Ground branch**: with vs. without (M3 vs. M2)
 - **LiDAR sparsity**: 100 % / 50 % / 25 % / 10 % retained points
-- **SAM quality**: Ground-truth masks vs. SAM-base vs. SAM-Huge vs. no segmentation (degenerates to global)
-- **Number of anchors per instance**: 1 (top only) / 2 (top+bot) / N (all
-  reliable LiDAR points within mask treated as anchors via robust fit)
+- **SAM quality**: Ground-truth masks vs. SAM-base vs. SAM-Huge vs. no
+  segmentation (degenerates to global)
+- **Per-object anchors count**: 1 (top only) / 2 (top+bot) / N (all
+  reliable returns within mask treated as anchors via robust fit)
 - **Range stratification**: gain attributable to height-anchor specifically
-  in the > 50 m range
+  at > 50 m
+- **Annotation degradation**: drop occluded objects vs. keep, vary
+  `num_points` threshold, simulate noisy bbox (perturb `(x, y, yaw)`)
 
-## 8. Open questions / future work
+## 9. Open questions / future work
 
 - **Differentiable HAD** — turning §3.4 into a loss for fine-tuning DA3
   itself on roadside data.

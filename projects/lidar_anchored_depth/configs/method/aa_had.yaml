@@ -1,0 +1,32 @@
+# M3: Annotation-Aware HAD — primary method. Uses V2X 3D bboxes for the
+# dynamic / annotated branch and ground-plane fitting for the
+# unannotated background.
+name: aa_had
+
+annotation:
+  enabled: true
+  occlusion_max: 2
+  min_num_points: 5
+  iou_threshold: 0.30           # bbox-to-mask matching IoU floor
+  motion_compensate: true       # apply (vx, vy) * dt; falls through to false if dt unknown
+
+instance:                       # mask-derived height fallback when annotation missing
+  enabled: true
+  height_percentile_lo: 5.0
+  height_percentile_hi: 95.0
+  min_lidar_per_instance: 5
+
+ground:
+  enabled: true
+  ransac_threshold_m: 0.20
+  ransac_iterations: 2000
+  refine_with_inliers: true
+
+fusion:
+  mode: adaptive                # instance / ground / annotation overlap → fused
+  seam_blur_px: 5
+
+sam:
+  enabled: true
+  model: vit_h
+  points_per_side: 32
