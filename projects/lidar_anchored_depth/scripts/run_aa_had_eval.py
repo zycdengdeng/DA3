@@ -103,6 +103,22 @@ def _filter_finite_inside_image(
     )
 
 
+def _load_sam_masks(
+    sam_dir: Path | None,
+    scene_id: str, ts_ms: int, cam_id: str,
+) -> dict[int, np.ndarray]:
+    """Load ``{bbox.id: (H, W) bool mask}`` from a SAM .npz, or {} if absent."""
+    if sam_dir is None:
+        return {}
+    p = sam_dir / f"{scene_id}_ts{ts_ms}_cam{cam_id}_sam.npz"
+    if not p.is_file():
+        return {}
+    data = np.load(p, allow_pickle=True)
+    ids = list(data["mask_ids"])
+    masks = data["masks"]
+    return {int(i): masks[k].astype(bool) for k, i in enumerate(ids)}
+
+
 def _eval_one_frame(
     loader: RoadsideV2XLoader,
     d_path: Path,
@@ -112,6 +128,7 @@ def _eval_one_frame(
     z_min: float,
     z_max: float,
     min_lidar_per_obj: int,
+    sam_dir: Path | None = None,
 ) -> tuple[list[dict], dict]:
     """Run AA-HAD on every dynamic object and compare to global baseline."""
     data = np.load(d_path, allow_pickle=True)
@@ -119,6 +136,7 @@ def _eval_one_frame(
     scene_id = str(data["scene_id"])
     ts_ms = int(data["ts_ms"])
     cam_id = str(data["cam_id"])
+    sam_masks = _load_sam_masks(sam_dir, scene_id, ts_ms, cam_id)
 
     idx = loader.find_frame_idx(scene_id, ts_ms, cam_id)
     frame = loader.get_frame(idx)
@@ -153,30 +171,55 @@ def _eval_one_frame(
         threshold_rel=0.10, threshold_abs=1.0, n_iterations=300, seed=0,
     )
 
-    # 2. Per-object loop
+    # 2. Per-object loop, with dropout counters for debugging
+    drops = {
+        "total": 0, "class_filter": 0, "behind_camera": 0, "empty_mask": 0,
+        "mask_no_topbot": 0, "d_nan": 0, "d_degenerate": 0,
+        "solver_singular": 0, "few_lidar_3d": 0, "few_lidar_in_image": 0,
+        "few_lidar_valid": 0,
+    }
+    n_sam_used = 0
+    n_aabb_fallback = 0
     rows: list[dict] = []
     for obj in frame.dynamic_objects or []:
+        drops["total"] += 1
         if classes is not None and obj.label not in classes:
+            drops["class_filter"] += 1
             continue
 
-        # 2a. Project bbox to image; build AABB mask
-        uv8, _ = project_3d_bbox(obj, K, T_wc, dist)
-        if uv8 is None:
-            continue
-        mask = _aabb_to_mask(uv8, (H, W))
+        # 2a. Mask source: SAM (if loaded for this bbox.id) else AABB.
+        if int(obj.id) in sam_masks:
+            mask = sam_masks[int(obj.id)]
+            if mask.shape != (H, W):
+                # Defensive — SAM mask must match the d_image / frame
+                # resolution we are about to read d̃ from.
+                drops["empty_mask"] += 1
+                continue
+            n_sam_used += 1
+        else:
+            uv8, _ = project_3d_bbox(obj, K, T_wc, dist)
+            if uv8 is None:
+                drops["behind_camera"] += 1
+                continue
+            mask = _aabb_to_mask(uv8, (H, W))
+            n_aabb_fallback += 1
         if not mask.any():
+            drops["empty_mask"] += 1
             continue
 
         # 2b. Solve (a_i, b_i) via AA-HAD's closed form
         topbot = mask_top_bottom_pixels(mask)
         if topbot is None:
+            drops["mask_no_topbot"] += 1
             continue
         uv_top, uv_bot = topbot
         d_top = float(d_image[int(uv_top[1]), int(uv_top[0])])
         d_bot = float(d_image[int(uv_bot[1]), int(uv_bot[0])])
         if not (np.isfinite(d_top) and np.isfinite(d_bot)):
+            drops["d_nan"] += 1
             continue
         if abs(d_top - d_bot) < 1e-9:
+            drops["d_degenerate"] += 1
             continue
         sol = solve_affine_from_height_anchors(
             K=K, T_wc=T_wc,
@@ -185,6 +228,7 @@ def _eval_one_frame(
             Z_max=obj.Z_max, Z_min=obj.Z_min,
         )
         if sol is None:
+            drops["solver_singular"] += 1
             continue
         a_i, b_i = sol
 
@@ -193,6 +237,7 @@ def _eval_one_frame(
             frame.lidar_world, obj, expand=bbox_expand,
         )
         if int(in_bbox_3d.sum()) < min_lidar_per_obj:
+            drops["few_lidar_3d"] += 1
             continue
 
         # 2d. Project those points; sample d̃; predict both ways
@@ -202,6 +247,7 @@ def _eval_one_frame(
             uv_obj, z_obj, (H, W)
         )
         if u_obj.size < min_lidar_per_obj:
+            drops["few_lidar_in_image"] += 1
             continue
 
         d_obj = d_image[v_obj, u_obj].astype(np.float64)
@@ -210,6 +256,7 @@ def _eval_one_frame(
             & (z_obj >= z_min) & (z_obj <= z_max)
         )
         if int(valid.sum()) < min_lidar_per_obj:
+            drops["few_lidar_valid"] += 1
             continue
         d_obj = d_obj[valid]
         z_obj = z_obj[valid].astype(np.float64)
@@ -232,12 +279,18 @@ def _eval_one_frame(
             "gain_x": float(gain),
             "occlusion": int(obj.occlusion),
             "num_points_v2x": int(obj.num_points),
+            "mask_source": "sam" if int(obj.id) in sam_masks else "aabb",
         })
 
     summary = {
         "scene_id": scene_id, "ts_ms": ts_ms, "cam_id": cam_id,
         "n_lidar_in_frame": int(valid_g.sum()),
         "n_objects_kept": len(rows),
+        "n_objects_total": drops["total"],
+        "drops": drops,
+        "n_sam_used": n_sam_used,
+        "n_aabb_fallback": n_aabb_fallback,
+        "n_sam_loaded": len(sam_masks),
         "global_a": float(fit_global.a),
         "global_b": float(fit_global.b),
         "global_rmse_full": float(fit_global.residual_rmse),
@@ -290,6 +343,23 @@ def _print_summary_stats(rows: list[dict]) -> dict:
                      f"{np.percentile(rmse_inst, 25):.2f} / {np.percentile(rmse_inst, 75):.2f} m"))
     print(fmt.format("p25 / p75 RMSE  global :",
                      f"{np.percentile(rmse_glob, 25):.2f} / {np.percentile(rmse_glob, 75):.2f} m"))
+
+    # Per-mask-source split (if SAM was used at all)
+    has_sam = any(r.get("mask_source") == "sam" for r in rows)
+    if has_sam:
+        print()
+        print("Split by mask source:")
+        fmt3 = "  {:<22} N={:>4}  AA-HAD {:>7}  global {:>7}  gain {:>5}"
+        for src in ("sam", "aabb"):
+            rs = [r for r in rows if r.get("mask_source") == src]
+            if not rs:
+                continue
+            print(fmt3.format(
+                f"mask_source={src}", len(rs),
+                f"{median(r['rmse_aa_had'] for r in rs):.2f} m",
+                f"{median(r['rmse_global'] for r in rs):.2f} m",
+                f"{median(r['gain_x'] for r in rs):.1f}×",
+            ))
 
     print()
     print("Per-class median RMSE:")
@@ -379,7 +449,15 @@ def main() -> int:
     parser.add_argument("--z-min", type=float, default=1.0)
     parser.add_argument("--z-max", type=float, default=200.0)
     parser.add_argument("--min-lidar-per-obj", type=int, default=10)
+    parser.add_argument(
+        "--sam-mask-dir", default=None,
+        help="directory containing per-frame SAM .npz files written by "
+        "run_sam_inference.py. When given, SAM masks are used; missing "
+        "ids fall back to the projected-bbox AABB (and tagged accordingly "
+        "in the per-object JSON).",
+    )
     args = parser.parse_args()
+    sam_dir = Path(args.sam_mask_dir) if args.sam_mask_dir else None
 
     paths = sorted(glob.glob(args.d_paths))
     if not paths:
@@ -401,14 +479,33 @@ def main() -> int:
             bbox_expand=args.bbox_expand,
             z_min=args.z_min, z_max=args.z_max,
             min_lidar_per_obj=args.min_lidar_per_obj,
+            sam_dir=sam_dir,
         )
         all_rows.extend(rows)
         all_summaries.append(summary)
-        print(
+        kept = summary.get("n_objects_kept", 0)
+        total = summary.get("n_objects_total", 0)
+        line = (
             f"  {Path(p).name:<60}  "
-            f"N_obj={summary.get('n_objects_kept', 0):<3}  "
+            f"N_obj={kept}/{total}  "
             f"global_RMSE={summary.get('global_rmse_full', float('nan')):.2f} m"
         )
+        if summary.get("n_sam_loaded", 0) > 0:
+            line += (
+                f"  SAM:{summary['n_sam_used']} "
+                f"AABB-fallback:{summary['n_aabb_fallback']}"
+            )
+        if kept == 0 and total > 0:
+            d = summary["drops"]
+            top = sorted(
+                ((k, v) for k, v in d.items() if k not in ("total",) and v > 0),
+                key=lambda x: -x[1],
+            )
+            top_str = ", ".join(f"{k}={v}" for k, v in top)
+            line += f"  ← all dropped: {top_str}"
+        elif kept == 0 and total == 0:
+            line += "  ← no annotated dynamic objects in this frame"
+        print(line)
 
     print()
     _print_per_object_table(all_rows)
