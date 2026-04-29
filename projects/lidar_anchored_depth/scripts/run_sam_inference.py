@@ -104,6 +104,11 @@ def main() -> int:
         help="chunk size for SAM batch prediction (default 64). Lower if "
         "you hit VRAM limits with many V2X bboxes per frame.",
     )
+    parser.add_argument(
+        "--loader-min-points", type=int, default=5,
+        help="V2X annotation filter: drop bboxes with num_points below "
+        "this. Set to 0 for interpolated frames where num_points is 0.",
+    )
     args = parser.parse_args()
 
     if "HF_ENDPOINT" not in os.environ:
@@ -130,6 +135,7 @@ def main() -> int:
     loader = RoadsideV2XLoader(
         data_root=args.data_root,
         scenes=[args.scene] if "_" in args.scene else None,
+        min_num_points=args.loader_min_points,
     )
     if "_" not in args.scene:
         loader.scene_filter = [args.scene]

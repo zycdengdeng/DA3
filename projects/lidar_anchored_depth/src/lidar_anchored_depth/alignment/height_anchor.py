@@ -55,12 +55,11 @@ def solve_affine_from_height_anchors(
         α_top · d̃_top · a + α_top · b = Z_max - β
         α_bot · d̃_bot · a + α_bot · b = Z_min - β
 
-    Returns
-    -------
-    (a, b) on success, or ``None`` when the system is singular (which
-    happens iff the top and bottom anchors share the same pixel ``α``
-    *and* the same ``d̃``, or any α equals 0 — typically meaning a
-    horizontally-aligned camera, which the project doesn't deploy in).
+    Returns ``(a, b)`` on success, or ``None`` when the system is
+    singular. **Sensitive to single-pixel ``d̃`` noise** — use
+    :func:`solve_affine_dense_lsq` on real data when a SAM mask is
+    available; reserve this 2-anchor form for synthetic / theoretical
+    work.
     """
     uv = np.asarray([uv_top, uv_bot], dtype=np.float64)
     alphas, beta = world_z_at_pixel_unit_depth(uv, K, T_wc)
@@ -80,6 +79,125 @@ def solve_affine_from_height_anchors(
     if abs(det) < 1e-12:
         return None
     sol = np.linalg.solve(A, rhs)
+    return float(sol[0]), float(sol[1])
+
+
+def solve_affine_dense_lsq(
+    K: np.ndarray,
+    T_wc: np.ndarray,
+    mask: np.ndarray,
+    d_pred_image: np.ndarray,
+    Z_max: float,
+    Z_min: float,
+    *,
+    robust_lo_pct: float = 0.0,
+    robust_hi_pct: float = 100.0,
+    min_pixels: int = 50,
+) -> tuple[float, float] | None:
+    """Robust HAD solver using **all** mask pixels (super-determined LSQ).
+
+    Replaces the 2-anchor closed-form (which reads ``d̃`` at exactly two
+    pixels and is fully exposed to single-pixel noise) with a stacked
+    LSQ over every mask pixel. The assumption is that within a mask, the
+    object's surface world-Z varies linearly with image row:
+
+        Z_target(v) = Z_max + (v − v_top_extent) / (v_bot_extent − v_top_extent) · (Z_min − Z_max)
+
+    where ``v_top_extent`` and ``v_bot_extent`` are the **true** mask
+    bounds (``rows.min(), rows.max()``) — they define the interpolation
+    line. The optional ``robust_lo_pct`` / ``robust_hi_pct`` percentiles
+    additionally **drop** rows outside the band from the LSQ for
+    robustness to a few stray edge pixels (default no drop). For each
+    surviving mask pixel:
+
+        α(u,v) · d̃(u,v) · a  +  α(u,v) · b  =  Z_target(v) - β
+
+    All such rows are stacked into a tall ``(N, 2) · (a, b) = N``
+    least-squares system and solved with ``np.linalg.lstsq``. Robust to
+    ``d̃`` noise (averaged over thousands of pixels) and to SAM masks
+    that are tighter than the bbox AABB (since the interpolation
+    extents are re-estimated per mask).
+
+    Parameters
+    ----------
+    K, T_wc : pinhole calibration.
+    mask : (H, W) bool — the SAM (or AABB) mask of one instance.
+    d_pred_image : (H, W) float — full-image relative depth (DA3 output).
+    Z_max, Z_min : world-Z extents of the object (from V2X bbox).
+    robust_lo_pct, robust_hi_pct : drop rows outside this percentile
+        band from the LSQ (DOES NOT change the interpolation; the linear
+        interp always uses the true ``rows.min/max``). Defaults
+        ``0 / 100`` = no drop. Try ``5 / 95`` on noisy real-data SAM
+        masks if some pixels at the silhouette boundary are unreliable.
+    min_pixels : reject masks with fewer pixels than this (returns
+        ``None``).
+
+    Returns
+    -------
+    (a, b) on success, or ``None`` if the mask is too small / d̃
+    invalid / system rank-deficient.
+    """
+    if mask.dtype != bool:
+        mask = mask.astype(bool)
+    H, W = mask.shape
+    if d_pred_image.shape != (H, W):
+        raise ValueError(
+            f"d_pred_image shape {d_pred_image.shape} must match mask {mask.shape}"
+        )
+    if not mask.any():
+        return None
+
+    rows, cols = np.where(mask)
+    if rows.size < min_pixels:
+        return None
+
+    # Interpolation extent always uses the true mask bounds.
+    v_top_extent = float(rows.min())
+    v_bot_extent = float(rows.max())
+    span = v_bot_extent - v_top_extent
+    if span < 2.0:
+        return None  # mask too thin vertically
+
+    # Optional row-band filter for robustness against silhouette edge noise.
+    if robust_lo_pct > 0.0 or robust_hi_pct < 100.0:
+        v_lo = float(np.percentile(rows, robust_lo_pct))
+        v_hi = float(np.percentile(rows, robust_hi_pct))
+        in_band = (rows >= v_lo) & (rows <= v_hi)
+        rows = rows[in_band]
+        cols = cols[in_band]
+        if rows.size < min_pixels:
+            return None
+
+    d_vals = d_pred_image[rows, cols].astype(np.float64)
+    finite = np.isfinite(d_vals) & (d_vals > 0)
+    if int(finite.sum()) < min_pixels:
+        return None
+    rows_f = rows[finite].astype(np.float64)
+    cols_f = cols[finite].astype(np.float64)
+    d_vals = d_vals[finite]
+
+    # Per-pixel α(u, v) and β
+    uv = np.stack([cols_f, rows_f], axis=1)
+    alphas, beta = world_z_at_pixel_unit_depth(uv, K, T_wc)
+    safe = np.abs(alphas) > 1e-9
+    if int(safe.sum()) < min_pixels:
+        return None
+    rows_f = rows_f[safe]
+    alphas = alphas[safe]
+    d_vals = d_vals[safe]
+
+    # Linear-Z-vs-v interpolation using the TRUE mask extent (no clamp,
+    # no drift from percentile-defined v_top to true row.min).
+    frac = (rows_f - v_top_extent) / span                # in [0, 1] for kept rows
+    z_target = Z_max + frac * (Z_min - Z_max)
+
+    # Build the LSQ system: A · [a; b] = rhs
+    A = np.stack([alphas * d_vals, alphas], axis=1)  # (N, 2)
+    rhs = z_target - beta                              # (N,)
+
+    sol, *_ = np.linalg.lstsq(A, rhs, rcond=None)
+    if sol.shape[0] != 2:
+        return None
     return float(sol[0]), float(sol[1])
 
 

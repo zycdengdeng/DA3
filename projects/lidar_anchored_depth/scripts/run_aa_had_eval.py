@@ -54,6 +54,7 @@ from lidar_anchored_depth.alignment.global_scale import (
 )
 from lidar_anchored_depth.alignment.height_anchor import (
     mask_top_bottom_pixels,
+    solve_affine_dense_lsq,
     solve_affine_from_height_anchors,
 )
 from lidar_anchored_depth.alignment.projection import (
@@ -129,6 +130,8 @@ def _eval_one_frame(
     z_max: float,
     min_lidar_per_obj: int,
     sam_dir: Path | None = None,
+    solver: str = "dense",
+    dense_min_pixels: int = 50,
 ) -> tuple[list[dict], dict]:
     """Run AA-HAD on every dynamic object and compare to global baseline."""
     data = np.load(d_path, allow_pickle=True)
@@ -207,30 +210,41 @@ def _eval_one_frame(
             drops["empty_mask"] += 1
             continue
 
-        # 2b. Solve (a_i, b_i) via AA-HAD's closed form
-        topbot = mask_top_bottom_pixels(mask)
-        if topbot is None:
-            drops["mask_no_topbot"] += 1
-            continue
-        uv_top, uv_bot = topbot
-        d_top = float(d_image[int(uv_top[1]), int(uv_top[0])])
-        d_bot = float(d_image[int(uv_bot[1]), int(uv_bot[0])])
-        if not (np.isfinite(d_top) and np.isfinite(d_bot)):
-            drops["d_nan"] += 1
-            continue
-        if abs(d_top - d_bot) < 1e-9:
-            drops["d_degenerate"] += 1
-            continue
-        sol = solve_affine_from_height_anchors(
-            K=K, T_wc=T_wc,
-            uv_top=uv_top, uv_bot=uv_bot,
-            d_pred_top=d_top, d_pred_bot=d_bot,
-            Z_max=obj.Z_max, Z_min=obj.Z_min,
-        )
-        if sol is None:
-            drops["solver_singular"] += 1
-            continue
-        a_i, b_i = sol
+        # 2b. Solve (a_i, b_i)
+        if solver == "dense":
+            sol = solve_affine_dense_lsq(
+                K=K, T_wc=T_wc, mask=mask, d_pred_image=d_image,
+                Z_max=obj.Z_max, Z_min=obj.Z_min,
+                min_pixels=dense_min_pixels,
+            )
+            if sol is None:
+                drops["solver_singular"] += 1
+                continue
+            a_i, b_i = sol
+        else:  # solver == "2anchor"
+            topbot = mask_top_bottom_pixels(mask)
+            if topbot is None:
+                drops["mask_no_topbot"] += 1
+                continue
+            uv_top, uv_bot = topbot
+            d_top = float(d_image[int(uv_top[1]), int(uv_top[0])])
+            d_bot = float(d_image[int(uv_bot[1]), int(uv_bot[0])])
+            if not (np.isfinite(d_top) and np.isfinite(d_bot)):
+                drops["d_nan"] += 1
+                continue
+            if abs(d_top - d_bot) < 1e-9:
+                drops["d_degenerate"] += 1
+                continue
+            sol = solve_affine_from_height_anchors(
+                K=K, T_wc=T_wc,
+                uv_top=uv_top, uv_bot=uv_bot,
+                d_pred_top=d_top, d_pred_bot=d_bot,
+                Z_max=obj.Z_max, Z_min=obj.Z_min,
+            )
+            if sol is None:
+                drops["solver_singular"] += 1
+                continue
+            a_i, b_i = sol
 
         # 2c. Find LiDAR points actually inside the 3D bbox
         in_bbox_3d = points_in_oriented_bbox(
@@ -450,11 +464,29 @@ def main() -> int:
     parser.add_argument("--z-max", type=float, default=200.0)
     parser.add_argument("--min-lidar-per-obj", type=int, default=10)
     parser.add_argument(
+        "--loader-min-points", type=int, default=5,
+        help="V2X annotation filter: drop bboxes with num_points below "
+        "this. Set to 0 for interpolated frames where num_points field "
+        "is always 0 (e.g. THICV-R2A's interpolation_labels at non-key "
+        "frames). Default 5.",
+    )
+    parser.add_argument(
         "--sam-mask-dir", default=None,
         help="directory containing per-frame SAM .npz files written by "
         "run_sam_inference.py. When given, SAM masks are used; missing "
         "ids fall back to the projected-bbox AABB (and tagged accordingly "
         "in the per-object JSON).",
+    )
+    parser.add_argument(
+        "--solver", default="dense", choices=["dense", "2anchor"],
+        help="HAD solver: 'dense' uses every mask pixel via LSQ (robust "
+        "to single-pixel d̃ noise; default), '2anchor' uses the original "
+        "closed-form on (v_top, v_bot) — only useful for ablation.",
+    )
+    parser.add_argument(
+        "--dense-min-pixels", type=int, default=50,
+        help="minimum mask pixel count for the dense solver to attempt "
+        "a fit (default 50)",
     )
     args = parser.parse_args()
     sam_dir = Path(args.sam_mask_dir) if args.sam_mask_dir else None
@@ -464,7 +496,10 @@ def main() -> int:
         raise SystemExit(f"no file matched --d-paths={args.d_paths!r}")
     print(f"[load] {len(paths)} .npz frames")
 
-    loader = RoadsideV2XLoader(data_root=args.data_root)
+    loader = RoadsideV2XLoader(
+        data_root=args.data_root,
+        min_num_points=args.loader_min_points,
+    )
     classes = set(args.classes) if args.classes else None
 
     out_dir = Path(args.output)
@@ -480,6 +515,8 @@ def main() -> int:
             z_min=args.z_min, z_max=args.z_max,
             min_lidar_per_obj=args.min_lidar_per_obj,
             sam_dir=sam_dir,
+            solver=args.solver,
+            dense_min_pixels=args.dense_min_pixels,
         )
         all_rows.extend(rows)
         all_summaries.append(summary)

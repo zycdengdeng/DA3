@@ -14,6 +14,7 @@ from lidar_anchored_depth.alignment.height_anchor import (
     had_mask,
     height_interval_from_lidar_in_mask,
     mask_top_bottom_pixels,
+    solve_affine_dense_lsq,
     solve_affine_from_height_anchors,
 )
 from lidar_anchored_depth.alignment.projection import (
@@ -182,6 +183,95 @@ def test_had_mask_recovers_known_affine(
     assert anchor.a == pytest.approx(a_true, rel=0.05)
     assert anchor.b == pytest.approx(b_true, abs=0.5)
     np.testing.assert_array_equal(result.coverage_mask, mask)
+
+
+def test_dense_lsq_recovers_known_affine(synthetic_camera, synthetic_object):
+    """The dense LSQ solver should also recover (a, b) on the synthetic scene."""
+    K, T_wc = synthetic_camera
+    obj = synthetic_object
+    H, W = 1080, 1920
+    a_true, b_true = 0.25, 1.0
+
+    mask = synthetic_mask_from_world_box(
+        obj.xyz[0], obj.xyz[1], obj.xyz[2],
+        obj.lwh[0], obj.lwh[1], obj.lwh[2], obj.yaw,
+        K, T_wc, (H, W),
+    )
+    assert mask.any()
+    d_image = synthetic_d_image_consistent_with_mask(
+        mask=mask, K=K, T_wc=T_wc,
+        Z_min=obj.Z_min, Z_max=obj.Z_max,
+        a_true=a_true, b_true=b_true,
+    )
+
+    sol = solve_affine_dense_lsq(
+        K=K, T_wc=T_wc,
+        mask=mask, d_pred_image=d_image,
+        Z_max=obj.Z_max, Z_min=obj.Z_min,
+    )
+    assert sol is not None
+    a_rec, b_rec = sol
+    assert a_rec == pytest.approx(a_true, rel=0.05)
+    assert b_rec == pytest.approx(b_true, abs=0.5)
+
+
+def test_dense_lsq_stable_under_noise(synthetic_camera, synthetic_object):
+    """Dense LSQ stays close to the truth across many noise realizations.
+
+    A unit test for the *implementation*: verify that injecting
+    Gaussian noise into the synthetic d̃ image does not break the
+    solver. Mean abs error of ``a`` over 20 seeds must stay bounded —
+    we don't compare against 2-anchor here because the synthetic AABB
+    is unrealistically ill-conditioned (d̃ varies only ~5 units across
+    a 100-row mask, giving 2-anchor an artificial advantage that
+    doesn't hold on real SAM masks). The cross-method comparison
+    happens at evaluation time on real data via run_aa_had_eval.py.
+    """
+    K, T_wc = synthetic_camera
+    obj = synthetic_object
+    H, W = 1080, 1920
+    a_true, b_true = 0.25, 1.0
+
+    mask = synthetic_mask_from_world_box(
+        obj.xyz[0], obj.xyz[1], obj.xyz[2],
+        obj.lwh[0], obj.lwh[1], obj.lwh[2], obj.yaw,
+        K, T_wc, (H, W),
+    )
+    d_clean = synthetic_d_image_consistent_with_mask(
+        mask=mask, K=K, T_wc=T_wc,
+        Z_min=obj.Z_min, Z_max=obj.Z_max,
+        a_true=a_true, b_true=b_true,
+    )
+
+    rng = np.random.default_rng(0)
+    err_a: list[float] = []
+    for _ in range(20):
+        noise = rng.normal(0, 0.5, d_clean.shape).astype(np.float32)
+        sol = solve_affine_dense_lsq(
+            K=K, T_wc=T_wc,
+            mask=mask, d_pred_image=d_clean + noise,
+            Z_max=obj.Z_max, Z_min=obj.Z_min,
+        )
+        assert sol is not None
+        err_a.append(abs(sol[0] - a_true))
+
+    mean_err = float(np.mean(err_a))
+    assert mean_err < 0.10, (
+        f"dense LSQ mean a-error {mean_err:.4f} > 0.10 under N(0, 0.5) noise"
+    )
+
+
+def test_dense_lsq_rejects_tiny_mask(synthetic_camera):
+    K, T_wc = synthetic_camera
+    H, W = 1080, 1920
+    mask = np.zeros((H, W), dtype=bool)
+    mask[100:103, 100:103] = True  # only 9 pixels
+    d_image = np.full((H, W), 1.0, dtype=np.float32)
+    sol = solve_affine_dense_lsq(
+        K=K, T_wc=T_wc, mask=mask, d_pred_image=d_image,
+        Z_max=1.5, Z_min=0.0, min_pixels=50,
+    )
+    assert sol is None
 
 
 def test_had_mask_skips_masks_without_enough_lidar(synthetic_camera):
