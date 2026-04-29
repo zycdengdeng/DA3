@@ -170,26 +170,217 @@ class RoadsideV2XLoader(BaseDataset):
         return self._scene_fixtures
 
     def _build_index(self) -> None:
-        """Walk ``data_root`` to enumerate scenes, timestamps, fixtures.
+        """Walk ``data_root`` to enumerate scenes and per-frame timestamps.
 
-        Implemented at Stage 3 once data is mounted. Stage 1.2 ships
-        only the API.
+        Cheap pass: only directory listing and ``int(stem)`` parsing of
+        annotation JSON filenames. Static-fixture deduplication is
+        deferred to ``get_frame`` (lazy) to keep this O(scenes + frames)
+        without reading any JSON contents.
         """
-        raise NotImplementedError(
-            "Stage 3: implement scene/timestamp indexing once data root is mounted"
+        if self._index_built:
+            return
+
+        if not self.data_root.is_dir():
+            raise FileNotFoundError(
+                f"data_root does not exist: {self.data_root}"
+            )
+
+        scene_dirs = sorted(
+            d for d in self.data_root.iterdir()
+            if d.is_dir() and d.name != "support_info"
         )
+        if self.scene_filter is not None:
+            allowed = set(self.scene_filter)
+            scene_dirs = [
+                d
+                for d in scene_dirs
+                if d.name in allowed
+                or any(d.name.startswith(prefix) for prefix in allowed)
+            ]
+
+        self._scenes = []
+        self._scene_fixtures = {}
+
+        for scene_dir in scene_dirs:
+            scene_id = scene_dir.name
+            label_dir = scene_dir / "road_labels" / "interpolation_labels"
+            if not label_dir.is_dir():
+                continue
+            json_files = sorted(label_dir.glob("*.json"))
+            if not json_files:
+                continue
+
+            timestamps: list[int] = []
+            kept_jsons: list[Path] = []
+            for jp in json_files:
+                try:
+                    ts = int(jp.stem)
+                except ValueError:
+                    continue
+                timestamps.append(ts)
+                kept_jsons.append(jp)
+
+            ego_id: int | None = None
+            try:
+                ego_id = self.carid_lookup.get_ego_id(scene_id)
+            except FileNotFoundError:
+                ego_id = None
+
+            self._scenes.append(
+                SceneIndex(
+                    scene_id=scene_id,
+                    root=scene_dir,
+                    label_jsons=kept_jsons,
+                    timestamps_ms=timestamps,
+                    ego_id=ego_id,
+                )
+            )
+            self._scene_fixtures[scene_id] = {}
+
+        self._index_built = True
+
+    def _resolve_idx(self, idx: int) -> tuple[SceneIndex, int, str]:
+        """Map a flat ``idx`` to ``(scene, ts_index, camera_id)``.
+
+        Layout: outer loop over scenes, then over timestamps, inner loop
+        over the configured cameras.
+        """
+        if idx < 0:
+            idx += len(self)
+        n_cams = len(self.cameras)
+        running = 0
+        for scene in self._scenes:
+            n_ts = len(scene)
+            block = n_ts * n_cams
+            if idx < running + block:
+                local = idx - running
+                ts_i = local // n_cams
+                cam_i = local % n_cams
+                return scene, ts_i, self.cameras[cam_i]
+            running += block
+        raise IndexError(idx)
+
+    @property
+    def scenes(self) -> list[SceneIndex]:
+        """Lazily-built list of indexed scenes."""
+        if not self._index_built:
+            self._build_index()
+        return self._scenes
 
     # ------------------------------------------------------------------ #
     # BaseDataset interface
     # ------------------------------------------------------------------ #
     def __len__(self) -> int:
         if not self._index_built:
-            return 0
+            self._build_index()
         n_ts = sum(len(s) for s in self._scenes)
         return n_ts * len(self.cameras)
 
     def get_frame(self, idx: int) -> Frame:
-        raise NotImplementedError("Stage 3: frame I/O")
+        """Load one frame ``(scene, timestamp, camera)``.
+
+        Reads the annotation JSON, the corresponding pinhole image, and
+        the merged LiDAR PCD; returns a populated :class:`Frame`. The
+        first time a scene is touched we also scan its annotations for
+        static fixtures (Bollards / Crash_bucket / Cone) and cache them
+        in :attr:`scene_fixtures`.
+        """
+        if not self._index_built:
+            self._build_index()
+        scene, ts_i, cam_id = self._resolve_idx(idx)
+        ts_ms = scene.timestamps_ms[ts_i]
+        json_path = scene.label_jsons[ts_i]
+
+        # Lazy static-fixture scan for the scene
+        if scene.scene_id not in self._scene_fixtures or not self._scene_fixtures[
+            scene.scene_id
+        ]:
+            self._scan_scene_fixtures(scene)
+
+        # Load image
+        img_path = self.pinhole_image_path(scene.root, cam_id, ts_ms)
+        try:
+            import cv2  # type: ignore[import-not-found]
+        except ImportError as exc:  # pragma: no cover
+            raise RuntimeError(
+                "OpenCV (cv2) is required for image I/O; install with "
+                "`pip install opencv-python` or `opencv-python-headless`"
+            ) from exc
+        bgr = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
+        if bgr is None:
+            raise FileNotFoundError(f"could not read image: {img_path}")
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+        # Load LiDAR
+        from lidar_anchored_depth.data.pcd_io import read_pcd_xyz
+
+        pcd_path = self.merged_pcd_path(scene.root, ts_ms)
+        if not pcd_path.is_file():
+            pcd_path = self.merged_pcd_path(
+                scene.root, ts_ms, prefer_aligned=False
+            )
+        lidar_world = read_pcd_xyz(pcd_path)
+
+        # Read annotation
+        entry = self._read_annotation_entry(json_path)
+        dynamic_objects: list[DynamicObject] = []
+        for raw_obj in entry.get("object", []):
+            obj, is_static = self._parse_object(raw_obj, scene.scene_id)
+            if is_static:
+                continue  # absorbed into scene_fixtures
+            if not self._filter_dynamic(obj):
+                continue
+            dynamic_objects.append(obj)
+
+        # Calibration for this camera
+        cam_calib = self.calibration.cameras[cam_id]
+
+        return Frame(
+            frame_id=f"{scene.scene_id}/{ts_ms}/cam{cam_id}",
+            image=rgb,
+            K=cam_calib.K,
+            T_wc=cam_calib.T_wc,
+            lidar_world=lidar_world,
+            dynamic_objects=dynamic_objects,
+            image_ts_ms=ts_ms,
+            lidar_ts_ms=ts_ms,
+            meta={
+                "scene_id": scene.scene_id,
+                "cam_id": cam_id,
+                "is_fisheye": cam_calib.is_fisheye,
+                "image_size_hw": cam_calib.image_size_hw,
+                "distortion": cam_calib.dist,
+                "ego_id": scene.ego_id,
+                "image_path": str(img_path),
+                "pcd_path": str(pcd_path),
+                "json_path": str(json_path),
+            },
+        )
+
+    def _scan_scene_fixtures(self, scene: SceneIndex) -> None:
+        """Populate ``scene_fixtures[scene_id]`` by scanning every JSON.
+
+        Static fixtures are recorded at their first sighting (lowest
+        timestamp). Subsequent occurrences with the same instance id are
+        ignored — they're assumed identical (rig is fixed across the 89
+        sessions).
+        """
+        bucket = self._scene_fixtures.setdefault(scene.scene_id, {})
+        for json_path in scene.label_jsons:
+            entry = self._read_annotation_entry(json_path)
+            for raw_obj in entry.get("object", []):
+                obj, is_static = self._parse_object(raw_obj, scene.scene_id)
+                if not is_static:
+                    continue
+                key = int(obj.id)
+                if key in bucket:
+                    continue
+                bucket[key] = StaticFixture(
+                    scene_id=scene.scene_id,
+                    instance_id=key,
+                    label=obj.label,
+                    obj=obj,
+                )
 
     def __iter__(self) -> Iterator[Frame]:
         for i in range(len(self)):

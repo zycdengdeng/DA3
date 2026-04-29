@@ -144,9 +144,17 @@ def test_index_not_built_returns_zero_length():
     assert len(loader) == 0
 
 
-def test_get_frame_not_implemented_at_stage12():
-    loader = RoadsideV2XLoader(data_root="/tmp")
-    with pytest.raises(NotImplementedError):
+def test_get_frame_with_missing_data_root_raises(tmp_path):
+    loader = RoadsideV2XLoader(data_root=str(tmp_path / "nope"))
+    with pytest.raises(FileNotFoundError):
+        loader.get_frame(0)
+
+
+def test_get_frame_with_empty_data_root_index_is_empty(tmp_path):
+    """A valid but empty data root yields an empty index, not a crash."""
+    loader = RoadsideV2XLoader(data_root=str(tmp_path))
+    assert len(loader) == 0
+    with pytest.raises(IndexError):
         loader.get_frame(0)
 
 
