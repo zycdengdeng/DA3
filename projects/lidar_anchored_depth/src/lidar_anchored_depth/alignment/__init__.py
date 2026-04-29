@@ -23,6 +23,7 @@ from lidar_anchored_depth.alignment.bbox_anchor import (
     BboxMatch,
     aa_had,
     match_bboxes_to_masks,
+    points_in_oriented_bbox,
 )
 from lidar_anchored_depth.alignment.global_scale import (
     AffineFit,
@@ -109,4 +110,5 @@ __all__ = [
     "BboxMatch",
     "aa_had",
     "match_bboxes_to_masks",
+    "points_in_oriented_bbox",
 ]

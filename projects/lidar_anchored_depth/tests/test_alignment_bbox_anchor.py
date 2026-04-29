@@ -8,6 +8,7 @@ import pytest
 from lidar_anchored_depth.alignment.bbox_anchor import (
     aa_had,
     match_bboxes_to_masks,
+    points_in_oriented_bbox,
 )
 from lidar_anchored_depth.data.base import DynamicObject
 
@@ -125,6 +126,73 @@ def test_aa_had_recovers_known_affine(synthetic_camera, synthetic_object):
     b_rec = result.anchors[0].b
     assert a_rec == pytest.approx(a_true, rel=0.05)
     assert b_rec == pytest.approx(b_true, abs=0.1)
+
+
+def test_points_in_oriented_bbox_axis_aligned():
+    """Yaw=0 bbox at origin: simple axis-aligned containment check."""
+    obj = DynamicObject(
+        id=1, label="Car",
+        xyz=np.array([0.0, 0.0, 0.0]),
+        lwh=np.array([4.0, 2.0, 1.5]),
+        yaw=0.0,
+    )
+    pts = np.array(
+        [
+            [0.0, 0.0, 0.0],     # centre
+            [1.9, 0.9, 0.7],     # just inside
+            [2.1, 0.0, 0.0],     # just outside on X
+            [0.0, 1.1, 0.0],     # just outside on Y
+            [0.0, 0.0, 0.8],     # just outside on Z
+        ],
+        dtype=np.float64,
+    )
+    inside = points_in_oriented_bbox(pts, obj)
+    assert inside.tolist() == [True, True, False, False, False]
+
+
+def test_points_in_oriented_bbox_yaw_90_degrees():
+    """Yaw=90° rotates the bbox; what was on X is now on Y."""
+    obj = DynamicObject(
+        id=1, label="Car",
+        xyz=np.array([0.0, 0.0, 0.0]),
+        lwh=np.array([4.0, 2.0, 1.5]),
+        yaw=np.pi / 2,
+    )
+    pts = np.array(
+        [
+            [0.0, 1.9, 0.0],    # in bbox-local +X (length axis), inside
+            [0.0, 2.1, 0.0],    # outside the rotated length axis
+            [0.9, 0.0, 0.0],    # in bbox-local +Y (width axis), inside
+            [1.1, 0.0, 0.0],    # outside the rotated width axis
+        ],
+        dtype=np.float64,
+    )
+    inside = points_in_oriented_bbox(pts, obj)
+    assert inside.tolist() == [True, False, True, False]
+
+
+def test_points_in_oriented_bbox_expand():
+    """Expand parameter loosens the half-extent."""
+    obj = DynamicObject(
+        id=1, label="Car",
+        xyz=np.array([0.0, 0.0, 0.0]),
+        lwh=np.array([4.0, 2.0, 1.5]),
+        yaw=0.0,
+    )
+    pts = np.array([[2.05, 0.0, 0.0]], dtype=np.float64)
+    assert points_in_oriented_bbox(pts, obj).tolist() == [False]
+    assert points_in_oriented_bbox(pts, obj, expand=0.1).tolist() == [True]
+
+
+def test_points_in_oriented_bbox_empty():
+    obj = DynamicObject(
+        id=1, label="Car",
+        xyz=np.array([0.0, 0.0, 0.0]),
+        lwh=np.array([4.0, 2.0, 1.5]),
+        yaw=0.0,
+    )
+    out = points_in_oriented_bbox(np.zeros((0, 3)), obj)
+    assert out.shape == (0,)
 
 
 def test_aa_had_no_match_no_solve(synthetic_camera, synthetic_object):

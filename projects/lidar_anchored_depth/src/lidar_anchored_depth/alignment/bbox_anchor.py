@@ -32,6 +32,49 @@ from lidar_anchored_depth.alignment.projection import (
     project_3d_bbox,
 )
 from lidar_anchored_depth.data.base import DynamicObject
+from lidar_anchored_depth.data.calibration import euler_zyx_to_R
+
+
+# --------------------------------------------------------------------- #
+# Oriented-bbox membership
+# --------------------------------------------------------------------- #
+def points_in_oriented_bbox(
+    points_world: np.ndarray,
+    obj: DynamicObject,
+    *,
+    expand: float = 0.0,
+) -> np.ndarray:
+    """Return a bool mask over ``points_world`` for "inside the 3D bbox".
+
+    The bbox is defined by ``obj.xyz`` (centre), ``obj.lwh`` (length /
+    width / height along the bbox-local X / Y / Z), and the ZYX Euler
+    triple ``(roll, pitch, yaw)``. Membership is tested by transforming
+    each point into the bbox-local frame and checking each axis against
+    ``[-half_extent - expand, half_extent + expand]``.
+
+    Parameters
+    ----------
+    points_world : (N, 3) array, world frame, meters.
+    obj : :class:`DynamicObject` providing the oriented bbox.
+    expand : extra slack added to every half-extent (meters); useful for
+        capturing LiDAR returns slightly outside the bbox surface (e.g.
+        annotation noise, beam divergence). Default 0.
+
+    Returns
+    -------
+    inside : (N,) bool array.
+    """
+    if points_world.size == 0:
+        return np.zeros(0, dtype=bool)
+    R = euler_zyx_to_R(obj.roll, obj.pitch, obj.yaw)
+    centered = np.asarray(points_world, dtype=np.float64) - obj.xyz
+    local = centered @ R  # equivalent to (R.T @ centered.T).T
+    half = obj.lwh / 2.0 + expand
+    return (
+        (np.abs(local[:, 0]) <= half[0])
+        & (np.abs(local[:, 1]) <= half[1])
+        & (np.abs(local[:, 2]) <= half[2])
+    )
 
 
 # --------------------------------------------------------------------- #
