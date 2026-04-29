@@ -90,8 +90,67 @@ def test_missing_xyz_fields_raises(tmp_path):
         _read_pcd_ascii(p)
 
 
-def test_binary_pcd_without_open3d_raises_clearly(tmp_path):
+def test_binary_pcd_uncompressed_xyz_f32(tmp_path):
+    """Native parser handles DATA binary (uncompressed, FIELDS x y z F4)."""
+    xyz = np.array(
+        [[1.5, -2.5, 3.5], [-10.0, 20.0, -1.5], [0.0, 0.0, 0.0]],
+        dtype=np.float32,
+    )
+    header = textwrap.dedent(
+        f"""\
+        VERSION 0.7
+        FIELDS x y z
+        SIZE 4 4 4
+        TYPE F F F
+        COUNT 1 1 1
+        WIDTH {len(xyz)}
+        HEIGHT 1
+        VIEWPOINT 0 0 0 1 0 0 0
+        POINTS {len(xyz)}
+        DATA binary
+        """
+    ).encode("ascii")
+    body = xyz.tobytes()
     p = tmp_path / "bin.pcd"
+    p.write_bytes(header + body)
+    out = _read_pcd_ascii(p)
+    np.testing.assert_allclose(out, xyz, atol=1e-6)
+
+
+def test_binary_pcd_with_extra_intensity_field(tmp_path):
+    """Native parser strips intensity (just keeps x/y/z)."""
+    n = 4
+    xyz = np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9], [-1, -2, -3]],
+                   dtype=np.float32)
+    intensity = np.array([100, 200, 50, 25], dtype=np.float32)
+    header = textwrap.dedent(
+        f"""\
+        VERSION 0.7
+        FIELDS x y z intensity
+        SIZE 4 4 4 4
+        TYPE F F F F
+        COUNT 1 1 1 1
+        WIDTH {n}
+        HEIGHT 1
+        VIEWPOINT 0 0 0 1 0 0 0
+        POINTS {n}
+        DATA binary
+        """
+    ).encode("ascii")
+    # Interleave xyz + intensity per-point
+    body = b"".join(
+        np.array([xyz[i, 0], xyz[i, 1], xyz[i, 2], intensity[i]],
+                 dtype=np.float32).tobytes()
+        for i in range(n)
+    )
+    p = tmp_path / "bin.pcd"
+    p.write_bytes(header + body)
+    out = _read_pcd_ascii(p)
+    np.testing.assert_allclose(out, xyz, atol=1e-6)
+
+
+def test_binary_compressed_raises_clearly(tmp_path):
+    p = tmp_path / "bcmp.pcd"
     p.write_text(
         textwrap.dedent(
             """\
@@ -104,11 +163,11 @@ def test_binary_pcd_without_open3d_raises_clearly(tmp_path):
             HEIGHT 1
             VIEWPOINT 0 0 0 1 0 0 0
             POINTS 1
-            DATA binary
+            DATA binary_compressed
             """
         )
     )
-    with pytest.raises(RuntimeError, match="install open3d"):
+    with pytest.raises(RuntimeError, match="binary_compressed"):
         _read_pcd_ascii(p)
 
 
