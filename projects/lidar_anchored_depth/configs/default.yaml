@@ -1,0 +1,20 @@
+# Default Hydra config. Compose data / model / method / experiment via
+# `+data=<name>` etc. on the CLI.
+
+defaults:
+  - data: car_road
+  - model: da3_giant
+  - method: had_full
+  - _self_
+
+seed: 0
+output_dir: runs/${now:%Y-%m-%d_%H-%M-%S}_${method.name}
+
+# Inference / evaluation behaviour
+device: cuda
+half_precision: false
+batch_size: 1
+
+logging:
+  level: INFO
+  use_loguru: true

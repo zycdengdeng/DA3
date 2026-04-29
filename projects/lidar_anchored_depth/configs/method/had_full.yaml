@@ -1,0 +1,24 @@
+# M3: HAD + ground-plane + adaptive fusion.
+name: had_full
+
+instance:
+  enabled: true
+  height_percentile_lo: 5.0
+  height_percentile_hi: 95.0
+  min_lidar_per_instance: 5
+  fallback_when_insufficient: ground_lift
+
+ground:
+  enabled: true
+  ransac_threshold_m: 0.20
+  ransac_iterations: 2000
+  refine_with_inliers: true
+
+fusion:
+  mode: adaptive   # one of: instance_only, ground_only, adaptive
+  seam_blur_px: 5
+
+sam:
+  enabled: true
+  model: vit_h
+  points_per_side: 32

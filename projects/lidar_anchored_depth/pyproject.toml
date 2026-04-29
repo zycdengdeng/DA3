@@ -1,0 +1,75 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lidar-anchored-depth"
+version = "0.0.1"
+description = "Height-Anchored Depth for foundation depth models in roadside V2X"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "LAD-DA3 contributors" }]
+keywords = [
+    "depth-estimation",
+    "lidar",
+    "foundation-models",
+    "v2x",
+    "roadside-perception",
+]
+
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.11",
+    "opencv-python>=4.8",
+    "Pillow>=10.0",
+    "torch>=2.1",
+    "hydra-core>=1.3",
+    "omegaconf>=2.3",
+    "loguru>=0.7",
+    "tqdm>=4.66",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+sam = ["segment-anything>=1.0"]
+viz = ["matplotlib>=3.7", "open3d>=0.17"]
+dev = [
+    "pytest>=7.4",
+    "pytest-cov>=4.1",
+    "ruff>=0.4",
+    "mypy>=1.8",
+    "black>=24.0",
+]
+
+[project.scripts]
+lad-infer = "lidar_anchored_depth.cli.infer:main"
+lad-evaluate = "lidar_anchored_depth.cli.evaluate:main"
+lad-ablate = "lidar_anchored_depth.cli.ablate:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+lidar_anchored_depth = ["py.typed"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+extend-exclude = ["notebooks"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = false
+ignore_missing_imports = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+filterwarnings = ["ignore::DeprecationWarning"]

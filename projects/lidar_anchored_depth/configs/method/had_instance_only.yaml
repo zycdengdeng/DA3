@@ -1,0 +1,19 @@
+# M1: HAD on instances only, no ground branch, raw DA3 elsewhere.
+name: had_instance_only
+
+instance:
+  enabled: true
+  height_percentile_lo: 5.0
+  height_percentile_hi: 95.0
+  min_lidar_per_instance: 5
+
+ground:
+  enabled: false
+
+fusion:
+  mode: instance_only
+
+sam:
+  enabled: true
+  model: vit_h
+  points_per_side: 32

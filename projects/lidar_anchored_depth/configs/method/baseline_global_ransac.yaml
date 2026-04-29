@@ -1,0 +1,16 @@
+# B3: global RANSAC scale on (d_pred, z_lidar) pairs.
+name: baseline_global_ransac
+
+instance:
+  enabled: false
+
+ground:
+  enabled: false
+
+global_align:
+  mode: ransac_scale
+  ransac_threshold_rel: 0.10
+  ransac_iterations: 1000
+
+sam:
+  enabled: false

@@ -1,0 +1,3 @@
+_target_: lidar_anchored_depth.pipeline.da3_wrapper.DA3DepthModel
+checkpoint: DA3NESTED-GIANT-LARGE-1.1
+output: relative_depth  # or 'metric_depth'

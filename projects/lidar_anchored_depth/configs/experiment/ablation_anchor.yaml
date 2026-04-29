@@ -1,0 +1,13 @@
+# @package _global_
+# Ablation A: anchor primitive — height (HAD) vs depth (region-z-affine)
+# on identical SAM masks and LiDAR returns. The crucial scientific
+# comparison.
+
+defaults:
+  - override /data: car_road
+  - _self_
+
+experiment_name: ablation_anchor
+methods_to_run:
+  - had_instance_only
+  - baseline_region_zaffine

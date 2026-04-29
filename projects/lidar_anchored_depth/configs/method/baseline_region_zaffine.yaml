@@ -1,0 +1,19 @@
+# B4: per-mask affine on (d_pred, z_lidar). Direct prior-art comparator
+# to HAD: same SAM masks, same LiDAR, but anchor on z (not Z).
+name: baseline_region_zaffine
+
+instance:
+  enabled: false
+
+ground:
+  enabled: false
+
+region_align:
+  mode: per_region_affine
+  min_lidar_per_region: 5
+  use_ransac: true
+
+sam:
+  enabled: true
+  model: vit_h
+  points_per_side: 32

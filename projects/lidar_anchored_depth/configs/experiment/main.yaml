@@ -1,0 +1,11 @@
+# @package _global_
+# Top-level experiment: run all baselines + ours on the test split,
+# emit Table 1 numbers and qualitative figures.
+
+defaults:
+  - override /data: car_road
+  - override /method: had_full
+  - _self_
+
+experiment_name: main_results
+tag: ${method.name}

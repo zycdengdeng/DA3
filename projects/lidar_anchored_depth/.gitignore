@@ -1,0 +1,22 @@
+# project-local artefacts
+runs/
+paper_artefacts/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+__pycache__/
+*.pyc
+*.pyo
+
+# notebooks: keep .ipynb but ignore checkpoints
+.ipynb_checkpoints/
+
+# data — never commit raw datasets (top-level only; src/.../data/ is the loader package)
+/data/
+/datasets/
+*.bin
+*.pcd
+*.las

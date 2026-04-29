@@ -1,0 +1,31 @@
+cff-version: 1.2.0
+title: "LAD-DA3: LiDAR-Anchored Depth for foundation depth models"
+message: "If you use this work, please cite as below."
+type: software
+version: 0.0.1
+date-released: 2026-04-29
+license: Apache-2.0
+authors:
+  - family-names: TBD
+    given-names: TBD
+abstract: >-
+  We propose Height-Anchored Depth (HAD), a test-time procedure that
+  recovers metric depth from foundation depth models in roadside / V2X
+  scenes by anchoring on world-frame object heights extracted from sparse
+  LiDAR returns inside instance segmentation masks, instead of the
+  conventional camera-axis-depth anchors. HAD yields a closed-form
+  per-instance affine fit and outperforms global / region z-anchor
+  baselines especially in the long-range regime.
+keywords:
+  - depth-estimation
+  - foundation-models
+  - lidar
+  - v2x
+  - roadside-perception
+preferred-citation:
+  type: article
+  title: "Placeholder — to be replaced upon submission"
+  authors:
+    - family-names: TBD
+      given-names: TBD
+  year: 2026

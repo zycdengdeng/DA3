@@ -1,0 +1,5 @@
+# Car-Road TianJin dataset adapter (ported from prior branch).
+_target_: lidar_anchored_depth.data.car_road.CarRoadLoader
+root: /mnt/car_road_data_TianJin
+split: test
+camera_type: fisheye  # or 'pinhole'

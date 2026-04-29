@@ -1,0 +1,6 @@
+# Schema-only adapter for arbitrary roadside data. Set `root` to your data
+# directory once it exists; the loader follows the convention in
+# docs/data.md §1 (one Frame per scene/timestamp).
+_target_: lidar_anchored_depth.data.generic.GenericRoadside
+root: ???
+manifest: ???  # path to a JSON/CSV listing per-frame paths and calib refs
