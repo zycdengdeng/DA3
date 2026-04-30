@@ -55,11 +55,16 @@ from lidar_anchored_depth.data import (
     PINHOLE_CAMERA_IDS,
     RoadsideV2XLoader,
 )
+from lidar_anchored_depth.pipeline.region_static_calib import (
+    GridStaticCalib,
+    fit_grid_static_calib,
+)
 from lidar_anchored_depth.reconstruction import (
     depth_to_world_points,
     voxel_downsample,
     write_ply_xyz,
 )
+from lidar_anchored_depth.segmentation.sam_io import load_sam_dynamic_mask
 
 
 def _resolve_scene_id(loader: RoadsideV2XLoader, scene_arg: str) -> str:
@@ -87,28 +92,7 @@ def _filter_finite_in_image(uv, z, hw):
     return uv[inside], z[inside], uv_int[inside, 0], uv_int[inside, 1]
 
 
-def _load_sam_dynamic_mask(
-    sam_dir: Path | None,
-    scene_id: str, ts_ms: int, cam_id: str,
-    image_hw: tuple[int, int],
-) -> np.ndarray:
-    """Build a (H, W) bool mask = union of every per-bbox SAM mask in
-    the corresponding _sam.npz. ``True`` = dynamic-object pixel."""
-    H, W = image_hw
-    out = np.zeros((H, W), dtype=bool)
-    if sam_dir is None:
-        return out
-    p = sam_dir / f"{scene_id}_ts{ts_ms}_cam{cam_id}_sam.npz"
-    if not p.is_file():
-        return out
-    data = np.load(p, allow_pickle=True)
-    masks = data["masks"]
-    if masks.shape[0] == 0:
-        return out
-    return np.any(masks, axis=0)
-
-
-def _calibrate_static_per_camera(
+def _collect_static_pairs_per_camera(
     loader: RoadsideV2XLoader,
     scene_id: str,
     cam_id: str,
@@ -116,14 +100,18 @@ def _calibrate_static_per_camera(
     sam_dir: Path | None,
     *,
     z_min: float, z_max: float,
-) -> dict | None:
-    """Run B3-RANSAC on (d̃, z_lidar) pairs from this camera's STATIC
-    LiDAR returns, joint over every timestamp. Returns ``None`` if
-    fewer than ~100 valid pairs exist."""
+    sam_dilate_px: int = 0,
+    require_v2x_frames: bool = True,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, tuple[int, int] | None, dict]:
+    """Walk every timestamp for one camera and return the static-LiDAR
+    pairs ``(d_tilde, z_cam, uv)`` plus the image dims and counters.
+    Used by both the single-(a, b) and grid calibration paths."""
     scene = next(s for s in loader.scenes if s.scene_id == scene_id)
 
     d_all: list[np.ndarray] = []
     z_all: list[np.ndarray] = []
+    uv_all: list[np.ndarray] = []
+    image_hw: tuple[int, int] | None = None
     n_static_total = 0
     n_dynamic_total = 0
     for ts_ms in scene.timestamps_ms:
@@ -140,6 +128,14 @@ def _calibrate_static_per_camera(
         frame = loader.get_frame(idx)
         H, W = frame.image.shape[:2]
         if d_image.shape != (H, W):
+            continue
+        image_hw = (H, W)
+
+        # Skip interpolated frames that have no V2X annotations: SAM
+        # didn't run for them, so the dynamic-mask subtraction is a
+        # no-op and any moving object visible in the image leaks into
+        # the static branch / calibration.
+        if require_v2x_frames and not (frame.dynamic_objects or []):
             continue
 
         # Build "static LiDAR" = LiDAR \ ⋃ V2X bbox interiors.
@@ -164,8 +160,9 @@ def _calibrate_static_per_camera(
         # ALSO drop pixels covered by the dynamic SAM mask (so we don't
         # accidentally calibrate against pixels that belong to a moving
         # object even if the LiDAR point itself is "static").
-        dyn_mask = _load_sam_dynamic_mask(
-            sam_dir, scene_id, ts_ms, cam_id, (H, W)
+        dyn_mask = load_sam_dynamic_mask(
+            sam_dir, scene_id, ts_ms, cam_id, (H, W),
+            dilate_px=sam_dilate_px,
         )
         keep = ~dyn_mask[v, u]
         u = u[keep]
@@ -183,11 +180,46 @@ def _calibrate_static_per_camera(
             continue
         d_all.append(d_at[valid])
         z_all.append(z_cam[valid].astype(np.float64))
+        uv_keep = np.stack([u[valid].astype(np.float64),
+                            v[valid].astype(np.float64)], axis=1)
+        uv_all.append(uv_keep)
 
     if not d_all:
-        return None
+        return (
+            np.zeros(0), np.zeros(0), np.zeros((0, 2)), image_hw,
+            {"n_static_lidar_total": int(n_static_total),
+             "n_dynamic_lidar_total": int(n_dynamic_total)},
+        )
     d_full = np.concatenate(d_all)
     z_full = np.concatenate(z_all)
+    uv_full = np.concatenate(uv_all)
+    counters = {
+        "n_static_lidar_total": int(n_static_total),
+        "n_dynamic_lidar_total": int(n_dynamic_total),
+    }
+    return d_full, z_full, uv_full, image_hw, counters
+
+
+def _calibrate_static_per_camera(
+    loader: RoadsideV2XLoader,
+    scene_id: str,
+    cam_id: str,
+    d_paths_index: dict,
+    sam_dir: Path | None,
+    *,
+    z_min: float, z_max: float,
+    sam_dilate_px: int = 0,
+    require_v2x_frames: bool = True,
+) -> dict | None:
+    """Run B3-RANSAC on (d̃, z_lidar) pairs from this camera's STATIC
+    LiDAR returns, joint over every timestamp. Returns ``None`` if
+    fewer than ~100 valid pairs exist."""
+    d_full, z_full, _uv, _hw, counters = _collect_static_pairs_per_camera(
+        loader, scene_id, cam_id, d_paths_index, sam_dir,
+        z_min=z_min, z_max=z_max,
+        sam_dilate_px=sam_dilate_px,
+        require_v2x_frames=require_v2x_frames,
+    )
     if d_full.size < 100:
         return None
     fit = b3_ransac_affine(
@@ -198,9 +230,42 @@ def _calibrate_static_per_camera(
         "a": float(fit.a), "b": float(fit.b),
         "rmse_inliers_m": float(fit.residual_rmse),
         "n_pairs": int(d_full.size),
-        "n_static_lidar_total": int(n_static_total),
-        "n_dynamic_lidar_total": int(n_dynamic_total),
+        "n_static_lidar_total": int(counters["n_static_lidar_total"]),
+        "n_dynamic_lidar_total": int(counters["n_dynamic_lidar_total"]),
     }
+
+
+def _calibrate_grid_per_camera(
+    loader: RoadsideV2XLoader,
+    scene_id: str,
+    cam_id: str,
+    d_paths_index: dict,
+    sam_dir: Path | None,
+    *,
+    z_min: float, z_max: float,
+    sam_dilate_px: int,
+    require_v2x_frames: bool,
+    n_rows: int,
+    n_cols: int,
+    min_lidar_per_cell: int,
+) -> tuple[GridStaticCalib | None, dict]:
+    d_full, z_full, uv_full, image_hw, counters = (
+        _collect_static_pairs_per_camera(
+            loader, scene_id, cam_id, d_paths_index, sam_dir,
+            z_min=z_min, z_max=z_max,
+            sam_dilate_px=sam_dilate_px,
+            require_v2x_frames=require_v2x_frames,
+        )
+    )
+    if d_full.size < 100 or image_hw is None:
+        return None, counters
+    calib = fit_grid_static_calib(
+        d_full, z_full, uv_full, image_hw,
+        n_rows=n_rows, n_cols=n_cols,
+        min_lidar_per_cell=min_lidar_per_cell,
+    )
+    counters["n_pairs"] = int(d_full.size)
+    return calib, counters
 
 
 def _unproject_static_branch(
@@ -214,6 +279,9 @@ def _unproject_static_branch(
     pixel_stride: int,
     z_min: float, z_max: float,
     sigma_predictor=None,
+    sam_dilate_px: int = 0,
+    require_v2x_frames: bool = True,
+    grid_calib: GridStaticCalib | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
     """Apply (a, b) to every (camera, ts) frame; unproject the STATIC
     portion (image \\ dynamic SAM mask) to world.
@@ -239,10 +307,18 @@ def _unproject_static_branch(
         H, W = frame.image.shape[:2]
         if d_image.shape != (H, W):
             continue
+        if require_v2x_frames and not (frame.dynamic_objects or []):
+            continue
 
-        z_cam = (a * d_image + b).astype(np.float32)
+        if grid_calib is not None:
+            z_cam = grid_calib.apply(d_image).astype(np.float32)
+        else:
+            z_cam = (a * d_image + b).astype(np.float32)
         # Static mask = whole image \ dynamic SAM mask, with stride decimation
-        dyn = _load_sam_dynamic_mask(sam_dir, scene_id, ts_ms, cam_id, (H, W))
+        dyn = load_sam_dynamic_mask(
+            sam_dir, scene_id, ts_ms, cam_id, (H, W),
+            dilate_px=sam_dilate_px,
+        )
         static_mask = ~dyn
         if pixel_stride > 1:
             stride_mask = np.zeros((H, W), dtype=bool)
@@ -269,8 +345,18 @@ def _unproject_static_branch(
             rows, cols = np.where(valid)
             uv = np.stack([cols.astype(np.float64), rows.astype(np.float64)], axis=1)
             d_at = d_image[rows, cols].astype(np.float64)
+            # When a grid calib is in use, the sigma head sees the
+            # camera-mean (a, b) as its 8th feature (the head was
+            # trained on a single per-camera scalar). The z_pred
+            # feature it computes will diverge slightly from the
+            # grid-applied z_cam used for unprojection. Re-train the
+            # head with grid-aware features for tighter calibration.
+            sa, sb = a, b
+            if grid_calib is not None and grid_calib.fallback() is not None:
+                sa = float(grid_calib.fallback().a)
+                sb = float(grid_calib.fallback().b)
             sigma = sigma_predictor.predict_for_pixels(
-                uv, d_at, frame.K, a=a, b=b, image_hw=(H, W),
+                uv, d_at, frame.K, a=sa, b=sb, image_hw=(H, W),
             )
             sig_all.append(sigma)
 
@@ -342,6 +428,49 @@ def main() -> int:
         help="V2X annotation filter (default 0 → permissive)",
     )
     parser.add_argument(
+        "--sam-dilate-px", type=int, default=0,
+        help="dilate the union of dynamic SAM masks by this many pixels "
+        "before subtracting it from the static branch. DA3's depth "
+        "predictions tend to bleed past the SAM mask edge by 3-10 px "
+        "(soft transition vs SAM's hard cut), so a small dilation "
+        "(e.g. 5-10) catches the residual ghost halo. Default 0.",
+    )
+    parser.add_argument(
+        "--require-v2x-frames", action="store_true", default=True,
+        help="skip frames that have no V2X bbox annotations (i.e. "
+        "interpolated frames between V2X timestamps). Those frames "
+        "have no SAM masks generated, so any moving object visible in "
+        "them leaks into the static branch as a 'ghost'. Default ON.",
+    )
+    parser.add_argument(
+        "--no-require-v2x-frames", action="store_false",
+        dest="require_v2x_frames",
+    )
+    parser.add_argument(
+        "--hybrid-include-dynamic-lidar", action="store_true", default=False,
+        help="include the dynamic-LiDAR cloud (LiDAR points inside V2X "
+        "bboxes) in <scene>_hybrid.ply. Default OFF — accumulating "
+        "every dynamic point across the whole session smears each "
+        "vehicle into a long trail and dominates the figure. The "
+        "<scene>_lidar_dynamic.ply file is still written separately.",
+    )
+    parser.add_argument(
+        "--region-grid", nargs=2, type=int, default=[0, 0],
+        metavar=("ROWS", "COLS"),
+        help="if set to ROWS COLS > 0, replace the single per-camera "
+        "(a, b) with a per-image-cell affine fit. Each cell runs B3-"
+        "RANSAC on the static-LiDAR pairs that project into it; cells "
+        "with too few pairs fall back to the global per-camera (a, b). "
+        "Recommended: '6 8' (6 rows × 8 cols) for 1080p frames. "
+        "Default '0 0' = disabled.",
+    )
+    parser.add_argument(
+        "--region-min-lidar-per-cell", type=int, default=30,
+        help="minimum static-LiDAR samples a grid cell needs to fit "
+        "its own (a, b); cells below this threshold fall back to the "
+        "global fit (default 30).",
+    )
+    parser.add_argument(
         "--sigma-checkpoint", default=None,
         help="optional .pt produced by scripts/train_sigma_head.py. "
         "If given, the static AA-HAD branch is fused across cameras "
@@ -396,6 +525,8 @@ def main() -> int:
         info = _calibrate_static_per_camera(
             loader, scene_id, cam_id, d_paths_index, sam_dir,
             z_min=args.z_min, z_max=args.z_max,
+            sam_dilate_px=args.sam_dilate_px,
+            require_v2x_frames=args.require_v2x_frames,
         )
         if info is None:
             print(f"  cam{cam_id}: too few static LiDAR pairs, skipping")
@@ -411,6 +542,40 @@ def main() -> int:
 
     calib_json = out_dir / f"{scene_id}_static_calib.json"
     calib_json.write_text(json.dumps(cam_calib, indent=2))
+
+    # Optional: per-image-cell calibration on top of the per-camera
+    # baseline. Fixes the near-camera curvature that a single (a, b)
+    # cannot express.
+    n_rows, n_cols = args.region_grid
+    grid_calib_by_cam: dict[str, GridStaticCalib] = {}
+    if n_rows > 0 and n_cols > 0:
+        print()
+        print(f"[1b/3] grid calibration  rows={n_rows}  cols={n_cols}")
+        gfmt = "  cam{:<3}  cells solved/total = {:>3}/{:>3}  fallback rmse={:>5.2f}m"
+        grid_serial: dict[str, dict] = {}
+        for cam_id in cam_calib.keys():
+            calib, _ = _calibrate_grid_per_camera(
+                loader, scene_id, cam_id, d_paths_index, sam_dir,
+                z_min=args.z_min, z_max=args.z_max,
+                sam_dilate_px=args.sam_dilate_px,
+                require_v2x_frames=args.require_v2x_frames,
+                n_rows=n_rows, n_cols=n_cols,
+                min_lidar_per_cell=args.region_min_lidar_per_cell,
+            )
+            if calib is None:
+                print(f"  cam{cam_id}: grid calib failed, falling back to scalar (a, b)")
+                continue
+            grid_calib_by_cam[cam_id] = calib
+            grid_serial[cam_id] = calib.to_serialisable()
+            fallback_rmse = (
+                calib.fallback().residual_rmse if calib.fallback() is not None else float("nan")
+            )
+            print(gfmt.format(
+                cam_id, calib.n_cells_solved, calib.n_cells_total, fallback_rmse,
+            ))
+        if grid_serial:
+            grid_json = out_dir / f"{scene_id}_static_calib_grid.json"
+            grid_json.write_text(json.dumps(grid_serial, indent=2))
 
     # ---- 2. Per-camera unproject + accumulate static AA-HAD -----------
     sigma_predictor = None
@@ -434,6 +599,9 @@ def main() -> int:
             pixel_stride=args.aahad_pixel_stride,
             z_min=args.z_min, z_max=args.z_max,
             sigma_predictor=sigma_predictor,
+            sam_dilate_px=args.sam_dilate_px,
+            require_v2x_frames=args.require_v2x_frames,
+            grid_calib=grid_calib_by_cam.get(cam_id),
         )
         elapsed = time.time() - t0
         if sig is not None and sig.size > 0:
@@ -550,7 +718,7 @@ def main() -> int:
         # average toward grey).
         hybrid_pts.append(static_lv)
         hybrid_rgb.append(np.full((static_lv.shape[0], 3), 180, dtype=np.uint8))
-    if dynamic_lv.shape[0] > 0:
+    if dynamic_lv.shape[0] > 0 and args.hybrid_include_dynamic_lidar:
         hybrid_pts.append(dynamic_lv)
         hybrid_rgb.append(np.full((dynamic_lv.shape[0], 3), 220, dtype=np.uint8))
     if hybrid_pts:

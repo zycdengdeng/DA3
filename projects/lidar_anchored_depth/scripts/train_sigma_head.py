@@ -57,6 +57,7 @@ from lidar_anchored_depth.models import (
     features_for_pixels,
     gaussian_nll_loss,
 )
+from lidar_anchored_depth.segmentation.sam_io import load_sam_dynamic_mask
 
 
 def _filter_finite_in_image(uv, z, hw):
@@ -72,21 +73,6 @@ def _filter_finite_in_image(uv, z, hw):
         & (uv_int[:, 1] >= 0) & (uv_int[:, 1] < H)
     )
     return uv[inside], z[inside], uv_int[inside, 0], uv_int[inside, 1]
-
-
-def _load_sam_dynamic_mask(sam_dir, scene_id, ts_ms, cam_id, image_hw):
-    H, W = image_hw
-    out = np.zeros((H, W), dtype=bool)
-    if sam_dir is None:
-        return out
-    p = sam_dir / f"{scene_id}_ts{ts_ms}_cam{cam_id}_sam.npz"
-    if not p.is_file():
-        return out
-    data = np.load(p, allow_pickle=True)
-    masks = data["masks"]
-    if masks.shape[0] == 0:
-        return out
-    return np.any(masks, axis=0)
 
 
 def _resolve_scene_id(loader: RoadsideV2XLoader, scene_arg: str) -> str:
@@ -112,6 +98,7 @@ def _collect_training_pairs(
     z_max: float,
     max_per_frame: int,
     rng: np.random.Generator,
+    sam_dilate_px: int = 0,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return per-pixel ``X`` (N, 8) and residual ``y`` (N,)."""
     scene = next(s for s in loader.scenes if s.scene_id == scene_id)
@@ -148,7 +135,10 @@ def _collect_training_pairs(
         if u.size < 50:
             continue
 
-        dyn_mask = _load_sam_dynamic_mask(sam_dir, scene_id, ts_ms, cam_id, (H, W))
+        dyn_mask = load_sam_dynamic_mask(
+            sam_dir, scene_id, ts_ms, cam_id, (H, W),
+            dilate_px=sam_dilate_px,
+        )
         keep = ~dyn_mask[v, u]
         u = u[keep]
         v = v[keep]
@@ -298,6 +288,12 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--loader-min-points", type=int, default=0)
+    parser.add_argument(
+        "--sam-dilate-px", type=int, default=0,
+        help="match the dilation used at recon time (so the head sees "
+        "training pixels with the same static/dynamic split it will "
+        "see at inference). Default 0.",
+    )
     args = parser.parse_args()
 
     import torch  # imported here so the script fails fast if torch is missing
@@ -354,6 +350,7 @@ def main() -> int:
             loader, scene_id, cam_id, a, b, d_paths_index, sam_dir,
             z_min=args.z_min, z_max=args.z_max,
             max_per_frame=args.max_per_frame, rng=rng,
+            sam_dilate_px=args.sam_dilate_px,
         )
         if Xc.shape[0] == 0:
             print(f"  cam{cam_id}: no pairs collected")
