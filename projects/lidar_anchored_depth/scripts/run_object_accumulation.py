@@ -43,8 +43,8 @@ import argparse
 import glob
 import json
 import sys
-import time
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
@@ -496,6 +496,122 @@ def accumulate_one_object(
 
 
 # --------------------------------------------------------------------- #
+# Per-bbox driver (used by both serial and worker-pool paths)
+# --------------------------------------------------------------------- #
+_WORKER_STATE: dict = {}
+
+
+def _init_worker(
+    data_root: str,
+    scene_arg: str,
+    loader_min_points: int,
+) -> None:
+    """ProcessPoolExecutor initialiser — build one loader per worker
+    process and cache it in module globals. Each worker re-scans V2X
+    JSONs once at startup; subsequent ``get_frame`` calls hit the
+    OS page cache for the underlying images / LiDAR PCDs.
+    """
+    loader = RoadsideV2XLoader(
+        data_root=data_root,
+        scenes=[scene_arg] if "_" in scene_arg else None,
+        min_num_points=loader_min_points,
+    )
+    if "_" not in scene_arg:
+        loader.scene_filter = [scene_arg]
+    scene_id = _resolve_scene_id(loader, scene_arg)
+    _WORKER_STATE["loader"] = loader
+    _WORKER_STATE["scene_id"] = scene_id
+
+
+def _run_one_bbox(
+    bbox_id: int,
+    *,
+    out_dir: str,
+    cams: list[str],
+    d_paths_index: dict,
+    sam_dir: str | None,
+    bbox_expand: float,
+    bbox_clip_expand: float,
+    ground_cut_m: float,
+    voxel_size: float,
+    z_min: float,
+    z_max: float,
+    dense_min_pixels: int,
+    solver_mode: str,
+    z_target: str,
+    lidar_weight: float,
+    icp_per_camera: bool,
+    icp_max_iterations: int,
+    icp_trim_percentile: float,
+    lidar_color: str,
+    ply_binary: bool,
+    loader: "RoadsideV2XLoader | None" = None,
+    scene_id: str | None = None,
+) -> dict | None:
+    """Accumulate one bbox + write its two PLYs.
+
+    Returns the JSON-friendly summary (with the numpy-array fields
+    stripped). When called from a worker process, ``loader`` and
+    ``scene_id`` are taken from ``_WORKER_STATE``.
+    """
+    if loader is None:
+        loader = _WORKER_STATE["loader"]
+    if scene_id is None:
+        scene_id = _WORKER_STATE["scene_id"]
+    sam_dir_path = Path(sam_dir) if sam_dir else None
+    d_paths_index_paths = {
+        k: Path(v) if not isinstance(v, Path) else v
+        for k, v in d_paths_index.items()
+    }
+
+    summary = accumulate_one_object(
+        loader=loader, scene_id=scene_id, bbox_id=bbox_id,
+        cams=cams,
+        d_paths_index=d_paths_index_paths, sam_dir=sam_dir_path,
+        bbox_expand=bbox_expand,
+        bbox_clip_expand=bbox_clip_expand,
+        ground_cut_m=ground_cut_m,
+        voxel_size=voxel_size,
+        z_min=z_min, z_max=z_max,
+        dense_min_pixels=dense_min_pixels,
+        solver_mode=solver_mode,
+        z_target=z_target,
+        lidar_weight=lidar_weight,
+        icp_per_camera=icp_per_camera,
+        icp_max_iterations=icp_max_iterations,
+        icp_trim_percentile=icp_trim_percentile,
+    )
+    if summary is None:
+        return None
+
+    L_pts = summary.pop("lidar_local_points")
+    A_pts = summary.pop("aa_had_local_points")
+    A_col = summary.pop("aa_had_local_colors")
+    out_dir_p = Path(out_dir)
+    if L_pts.shape[0] > 0:
+        if lidar_color == "none":
+            lidar_colors = None
+        elif lidar_color == "height":
+            lidar_colors = _colorize_by_z(L_pts)
+        elif lidar_color == "red":
+            lidar_colors = _colorize_by_z(L_pts, base_color=(220, 30, 30))
+        elif lidar_color == "white":
+            lidar_colors = _colorize_by_z(L_pts, base_color=(240, 240, 240))
+        else:
+            lidar_colors = None
+        write_ply_xyz(
+            out_dir_p / f"{scene_id}_obj{bbox_id}_lidar.ply",
+            L_pts, lidar_colors, binary=ply_binary,
+        )
+    if A_pts.shape[0] > 0:
+        write_ply_xyz(
+            out_dir_p / f"{scene_id}_obj{bbox_id}_aa_had.ply",
+            A_pts, A_col, binary=ply_binary,
+        )
+    return summary
+
+
+# --------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------- #
 def main() -> int:
@@ -625,6 +741,14 @@ def main() -> int:
         "Default 'row-linear'; pair with --solver-mode per-camera and "
         "--z-target ray-obb for the headline reconstruction.",
     )
+    parser.add_argument(
+        "--workers", type=int, default=0,
+        help="number of worker processes for the per-bbox loop. 0 = "
+        "serial (default; deterministic print order, easier to debug). "
+        "N > 0 spawns a ProcessPoolExecutor; each worker re-scans V2X "
+        "once at startup. Per-bbox work is independent (no shared RNG, "
+        "no ordering requirement) so results are bit-exact.",
+    )
     args = parser.parse_args()
 
     out_dir = Path(args.output)
@@ -666,60 +790,16 @@ def main() -> int:
             raise SystemExit("specify --bbox-id N or --all-bboxes")
         target_ids = [args.bbox_id]
 
-    print(f"[run] cams={args.cams}  voxel={args.voxel_size}m")
+    print(f"[run] cams={args.cams}  voxel={args.voxel_size}m  workers={args.workers}")
     print()
 
     fmt = "  bbox {:>4}  {:<22} N_frames(L,A)=({:>3},{:>3})  N_pts(L,A)=({:>6},{:>6})  chamfer={:>8}"
     aggregated: list[dict] = []
-    for bbox_id in target_ids:
-        t0 = time.time()
-        summary = accumulate_one_object(
-            loader=loader, scene_id=scene_id, bbox_id=bbox_id,
-            cams=args.cams,
-            d_paths_index=d_paths_index, sam_dir=sam_dir,
-            bbox_expand=args.bbox_expand,
-            bbox_clip_expand=args.bbox_clip_expand,
-            ground_cut_m=args.ground_cut_m,
-            voxel_size=args.voxel_size,
-            z_min=args.z_min, z_max=args.z_max,
-            dense_min_pixels=args.dense_min_pixels,
-            solver_mode=args.solver_mode,
-            z_target=args.z_target,
-            lidar_weight=args.lidar_weight,
-            icp_per_camera=args.icp_per_camera,
-            icp_max_iterations=args.icp_max_iterations,
-            icp_trim_percentile=args.icp_trim_percentile,
-        )
+
+    def _print_summary(bbox_id: int, summary: dict | None) -> None:
         if summary is None:
             print(f"  bbox {bbox_id:>4}  no usable frames")
-            continue
-
-        # Write PLYs
-        L_pts = summary.pop("lidar_local_points")
-        A_pts = summary.pop("aa_had_local_points")
-        A_col = summary.pop("aa_had_local_colors")
-        if L_pts.shape[0] > 0:
-            lidar_colors: np.ndarray | None
-            if args.lidar_color == "none":
-                lidar_colors = None
-            elif args.lidar_color == "height":
-                lidar_colors = _colorize_by_z(L_pts)
-            elif args.lidar_color == "red":
-                lidar_colors = _colorize_by_z(L_pts, base_color=(220, 30, 30))
-            elif args.lidar_color == "white":
-                lidar_colors = _colorize_by_z(L_pts, base_color=(240, 240, 240))
-            else:
-                lidar_colors = None
-            write_ply_xyz(
-                out_dir / f"{scene_id}_obj{bbox_id}_lidar.ply",
-                L_pts, lidar_colors, binary=args.ply_binary,
-            )
-        if A_pts.shape[0] > 0:
-            write_ply_xyz(
-                out_dir / f"{scene_id}_obj{bbox_id}_aa_had.ply",
-                A_pts, A_col, binary=args.ply_binary,
-            )
-
+            return
         chamfer_str = (
             f"{summary['chamfer_m']:.3f} m"
             if summary["chamfer_m"] is not None
@@ -732,11 +812,59 @@ def main() -> int:
             chamfer_str,
         ))
 
-        # JSON-friendly summary (drop the numpy arrays)
-        aggregated.append({
-            k: v for k, v in summary.items() if k != "lidar_local_points"
-            and k != "aa_had_local_points" and k != "aa_had_local_colors"
-        })
+    common_kwargs = dict(
+        out_dir=str(out_dir),
+        cams=args.cams,
+        d_paths_index={k: str(v) for k, v in d_paths_index.items()},
+        sam_dir=str(sam_dir) if sam_dir else None,
+        bbox_expand=args.bbox_expand,
+        bbox_clip_expand=args.bbox_clip_expand,
+        ground_cut_m=args.ground_cut_m,
+        voxel_size=args.voxel_size,
+        z_min=args.z_min, z_max=args.z_max,
+        dense_min_pixels=args.dense_min_pixels,
+        solver_mode=args.solver_mode,
+        z_target=args.z_target,
+        lidar_weight=args.lidar_weight,
+        icp_per_camera=args.icp_per_camera,
+        icp_max_iterations=args.icp_max_iterations,
+        icp_trim_percentile=args.icp_trim_percentile,
+        lidar_color=args.lidar_color,
+        ply_binary=args.ply_binary,
+    )
+
+    if args.workers <= 0:
+        for bbox_id in target_ids:
+            summary = _run_one_bbox(
+                bbox_id, loader=loader, scene_id=scene_id, **common_kwargs,
+            )
+            _print_summary(bbox_id, summary)
+            if summary is not None:
+                aggregated.append(summary)
+    else:
+        n_workers = min(args.workers, len(target_ids))
+        print(f"[parallel] spawning {n_workers} workers for {len(target_ids)} objects")
+        with ProcessPoolExecutor(
+            max_workers=n_workers,
+            initializer=_init_worker,
+            initargs=(args.data_root, args.scene, args.loader_min_points),
+        ) as ex:
+            futures = {
+                ex.submit(_run_one_bbox, bbox_id, **common_kwargs): bbox_id
+                for bbox_id in target_ids
+            }
+            for fut in as_completed(futures):
+                bbox_id = futures[fut]
+                try:
+                    summary = fut.result()
+                except Exception as e:
+                    print(f"  bbox {bbox_id:>4}  worker failed: {e}")
+                    continue
+                _print_summary(bbox_id, summary)
+                if summary is not None:
+                    aggregated.append(summary)
+        # Restore deterministic ordering for the JSON / aggregate report.
+        aggregated.sort(key=lambda s: s.get("bbox_id", 0))
 
     # Aggregate report
     chamfers = [
