@@ -54,6 +54,7 @@ from lidar_anchored_depth.alignment.bbox_anchor import (
 )
 from lidar_anchored_depth.alignment.height_anchor import (
     solve_affine_dense_lsq,
+    solve_affine_dense_lsq_multi,
 )
 from lidar_anchored_depth.data import RoadsideV2XLoader
 from lidar_anchored_depth.reconstruction import (
@@ -192,6 +193,8 @@ def accumulate_one_object(
     z_min: float,
     z_max: float,
     dense_min_pixels: int,
+    solver_mode: str = "per-camera",  # 'per-frame' | 'per-camera'
+    z_target: str = "row-linear",      # 'row-linear' | 'ray-obb'
 ) -> dict | None:
     """Accumulate LiDAR + AA-HAD points for one bbox.id across all frames it appears in.
 
@@ -210,13 +213,20 @@ def accumulate_one_object(
     n_frames_lidar = 0
     n_frames_aa_had = 0
 
+    # ---------------- pass 1: collect per-(cam, ts) frame data ----------
+    # For solver_mode='per-camera' we need every (mask, d̃, K, T_wc, obj)
+    # for one camera before we can solve a single (a, b). Even for
+    # solver_mode='per-frame' the structure is uniform, so we use the
+    # same collection pass for both modes.
+    by_cam: dict[str, list[dict]] = {}
+    lidar_data: list[tuple[np.ndarray, "DynamicObject"]] = []  # (P_world, obj)
+
     for ts_ms, cam_id in candidates:
         try:
             idx = loader.find_frame_idx(scene_id, ts_ms, cam_id)
         except ValueError:
             continue
         frame = loader.get_frame(idx)
-        # Find this bbox in the per-frame dynamic_objects
         obj = next(
             (o for o in (frame.dynamic_objects or []) if int(o.id) == bbox_id),
             None,
@@ -225,9 +235,7 @@ def accumulate_one_object(
             continue
         label = obj.label
 
-        # --- 1. LiDAR points inside oriented bbox → object-local frame.
-        #     Drop the bottom ``ground_cut_m`` band (V2X bboxes typically
-        #     wrap a thin road-surface layer beneath the vehicle).
+        # LiDAR side accumulates immediately (no solver involved).
         in_bbox = points_in_oriented_bbox(
             frame.lidar_world, obj,
             expand=bbox_expand,
@@ -235,11 +243,10 @@ def accumulate_one_object(
         )
         if int(in_bbox.sum()) > 0:
             P_world = frame.lidar_world[in_bbox]
-            P_local = world_to_object_local(P_world, obj)
-            lidar_local.append(P_local)
+            lidar_local.append(world_to_object_local(P_world, obj))
             n_frames_lidar += 1
 
-        # --- 2. AA-HAD per-pixel unproject → object-local frame (needs SAM)
+        # AA-HAD side: stash for solver pass 2.
         sam_masks = _load_sam_masks(sam_dir, scene_id, ts_ms, cam_id)
         mask = sam_masks.get(bbox_id)
         if mask is None or not mask.any():
@@ -252,58 +259,97 @@ def accumulate_one_object(
         if d_image.shape != frame.image.shape[:2]:
             continue
 
-        sol = solve_affine_dense_lsq(
-            K=frame.K, T_wc=frame.T_wc, mask=mask, d_pred_image=d_image,
-            Z_max=obj.Z_max, Z_min=obj.Z_min,
-            min_pixels=dense_min_pixels,
-        )
-        if sol is None:
-            continue
-        a_i, b_i = sol
+        by_cam.setdefault(cam_id, []).append({
+            "ts_ms": ts_ms,
+            "K": frame.K, "T_wc": frame.T_wc,
+            "mask": mask, "d_pred_image": d_image,
+            "Z_max": obj.Z_max, "Z_min": obj.Z_min,
+            "obj": obj,
+            "image_rgb": frame.image,
+            "bbox_expand": bbox_expand,
+        })
 
-        # Build a per-pixel metric depth on the mask
-        z_cam = (a_i * d_image + b_i).astype(np.float32)
-        # Unproject mask pixels
-        P_world_pred, colors = depth_to_world_points(
-            depth=z_cam, image_rgb=frame.image,
-            K=frame.K, T_wc=frame.T_wc,
-            mask=mask, z_min=z_min, z_max=z_max,
-        )
-        if P_world_pred.shape[0] == 0:
-            continue
+    # ---------------- pass 2: solve (a, b) per cam or per frame ---------
+    # In per-camera mode we get ONE (a_c, b_c) per camera by stacking all
+    # of that camera's frames into one LSQ. In per-frame mode we keep
+    # solving per frame (the original Stage 3C behavior, kept for
+    # ablation). The dict ``ab_by_frame[(cam, ts)] = (a, b)`` is the
+    # cached result either way.
+    ab_by_frame: dict[tuple[str, int], tuple[float, float]] = {}
+    ab_by_cam: dict[str, tuple[float, float]] = {}
 
-        # Clip AA-HAD predicted points to lie inside the V2X 3D bbox
-        # (with the same expand we use for LiDAR). This fixes two
-        # structural issues at once:
-        #  (1) SAM mask leakage into background (sky / trees / road) →
-        #      those pixels' z = a·d̃ + b lands far outside the bbox
-        #      and gets clipped here.
-        #  (2) Dense-LSQ "elongation" along the camera ray for non-wall
-        #      objects (buses / trucks viewed at an angle): the LSQ
-        #      solver's "Z varies only with image row" assumption fails
-        #      for 3D objects, producing predicted points that drift
-        #      outside the bbox volume along the camera ray. Clipping
-        #      forces the prediction back to the actual object volume.
-        keep_in_bbox = points_in_oriented_bbox(
-            P_world_pred, obj, expand=bbox_clip_expand,
-        )
-        if not keep_in_bbox.any():
-            continue
-        P_world_pred = P_world_pred[keep_in_bbox]
-        colors = colors[keep_in_bbox]
-
-        P_local_pred = world_to_object_local(P_world_pred, obj)
-        # Same ground cut as the LiDAR side: drop predicted points
-        # whose object-local Z falls in the bottom ground band.
-        if ground_cut_m > 0.0:
-            keep = P_local_pred[:, 2] >= -obj.lwh[2] / 2.0 + ground_cut_m
-            if not keep.any():
+    if solver_mode == "per-camera":
+        for cam_id, entries in by_cam.items():
+            sol = solve_affine_dense_lsq_multi(
+                entries,
+                z_target=z_target,
+                min_pixels_per_frame=dense_min_pixels,
+            )
+            if sol is None:
                 continue
-            P_local_pred = P_local_pred[keep]
-            colors = colors[keep]
-        aa_had_local.append(P_local_pred)
-        aa_had_colors.append(colors)
-        n_frames_aa_had += 1
+            ab_by_cam[cam_id] = sol
+            for e in entries:
+                ab_by_frame[(cam_id, e["ts_ms"])] = sol
+    elif solver_mode == "per-frame":
+        for cam_id, entries in by_cam.items():
+            for e in entries:
+                if z_target == "ray-obb":
+                    sol = solve_affine_dense_lsq_multi(
+                        [e], z_target="ray-obb",
+                        min_pixels_per_frame=dense_min_pixels,
+                    )
+                else:
+                    sol = solve_affine_dense_lsq(
+                        K=e["K"], T_wc=e["T_wc"],
+                        mask=e["mask"], d_pred_image=e["d_pred_image"],
+                        Z_max=e["Z_max"], Z_min=e["Z_min"],
+                        min_pixels=dense_min_pixels,
+                    )
+                if sol is None:
+                    continue
+                ab_by_frame[(cam_id, e["ts_ms"])] = sol
+    else:
+        raise ValueError(f"unknown solver_mode={solver_mode!r}")
+
+    # ---------------- pass 3: apply (a, b) to each frame's mask ---------
+    for cam_id, entries in by_cam.items():
+        for e in entries:
+            ab = ab_by_frame.get((cam_id, e["ts_ms"]))
+            if ab is None:
+                continue
+            a_i, b_i = ab
+            obj = e["obj"]
+            mask = e["mask"]
+            d_image = e["d_pred_image"]
+
+            z_cam = (a_i * d_image + b_i).astype(np.float32)
+            P_world_pred, colors = depth_to_world_points(
+                depth=z_cam, image_rgb=e["image_rgb"],
+                K=e["K"], T_wc=e["T_wc"],
+                mask=mask, z_min=z_min, z_max=z_max,
+            )
+            if P_world_pred.shape[0] == 0:
+                continue
+
+            # Bbox volume clip (catches SAM-leak + LSQ elongation outliers).
+            keep_in_bbox = points_in_oriented_bbox(
+                P_world_pred, obj, expand=bbox_clip_expand,
+            )
+            if not keep_in_bbox.any():
+                continue
+            P_world_pred = P_world_pred[keep_in_bbox]
+            colors = colors[keep_in_bbox]
+
+            P_local_pred = world_to_object_local(P_world_pred, obj)
+            if ground_cut_m > 0.0:
+                keep = P_local_pred[:, 2] >= -obj.lwh[2] / 2.0 + ground_cut_m
+                if not keep.any():
+                    continue
+                P_local_pred = P_local_pred[keep]
+                colors = colors[keep]
+            aa_had_local.append(P_local_pred)
+            aa_had_colors.append(colors)
+            n_frames_aa_had += 1
 
     if not lidar_local and not aa_had_local:
         return None
@@ -431,6 +477,27 @@ def main() -> int:
         "--ply-binary", action="store_true",
         help="write PLY in binary (faster + smaller for large clouds)",
     )
+    parser.add_argument(
+        "--solver-mode", default="per-camera",
+        choices=["per-frame", "per-camera"],
+        help="how to solve (a, b). 'per-frame' = one fit per (cam, ts) "
+        "(Stage 3C, sensitive to per-frame DA3 / SAM noise). "
+        "'per-camera' = stack all of one camera's frames into one LSQ "
+        "→ one (a, b) per camera per object (Stage 3D-A; eliminates "
+        "frame-jitter shells). Default 'per-camera'.",
+    )
+    parser.add_argument(
+        "--z-target", default="row-linear",
+        choices=["row-linear", "ray-obb"],
+        help="how to assign per-pixel target depth in the LSQ. "
+        "'row-linear' = linear interp from Z_max at mask top row to "
+        "Z_min at mask bottom row (Stage 3C; biased for non-frontal "
+        "cameras). 'ray-obb' = exact camera-axis depth from "
+        "ray ↔ V2X 3D bbox surface intersection (Stage 3D-B; "
+        "geometrically correct for any view direction). "
+        "Default 'row-linear'; pair with --solver-mode per-camera and "
+        "--z-target ray-obb for the headline reconstruction.",
+    )
     args = parser.parse_args()
 
     out_dir = Path(args.output)
@@ -489,6 +556,8 @@ def main() -> int:
             voxel_size=args.voxel_size,
             z_min=args.z_min, z_max=args.z_max,
             dense_min_pixels=args.dense_min_pixels,
+            solver_mode=args.solver_mode,
+            z_target=args.z_target,
         )
         if summary is None:
             print(f"  bbox {bbox_id:>4}  no usable frames")

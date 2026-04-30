@@ -202,6 +202,187 @@ def solve_affine_dense_lsq(
 
 
 # --------------------------------------------------------------------- #
+# Joint LSQ across many (mask, image) pairs of the same camera
+# --------------------------------------------------------------------- #
+def _build_lsq_rows_for_one_frame(
+    K: np.ndarray,
+    T_wc: np.ndarray,
+    mask: np.ndarray,
+    d_pred_image: np.ndarray,
+    Z_max: float,
+    Z_min: float,
+    *,
+    obj=None,  # DynamicObject for ray-OBB; None → row-linear z_target
+    bbox_expand: float = 0.0,
+    robust_lo_pct: float = 0.0,
+    robust_hi_pct: float = 100.0,
+    min_pixels: int = 50,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Build the LSQ rows ``A_rows · [a; b] = rhs_rows`` for one frame.
+
+    Returns ``(A_rows, rhs_rows)`` or ``None`` when the frame yields too
+    few usable pixels. Internal helper for the per-camera joint solver.
+
+    When ``obj`` is provided, ``z_target`` per pixel comes from
+    :func:`alignment.ray_obb.ray_obb_z_target` (Path B — geometrically
+    exact). Otherwise the row-linear interpolation is used (current
+    Path A baseline).
+    """
+    if mask.dtype != bool:
+        mask = mask.astype(bool)
+    H, W = mask.shape
+    if d_pred_image.shape != (H, W):
+        return None
+    if not mask.any():
+        return None
+
+    rows, cols = np.where(mask)
+    if rows.size < min_pixels:
+        return None
+
+    if robust_lo_pct > 0.0 or robust_hi_pct < 100.0:
+        v_lo = float(np.percentile(rows, robust_lo_pct))
+        v_hi = float(np.percentile(rows, robust_hi_pct))
+        in_band = (rows >= v_lo) & (rows <= v_hi)
+        rows = rows[in_band]
+        cols = cols[in_band]
+        if rows.size < min_pixels:
+            return None
+
+    d_vals = d_pred_image[rows, cols].astype(np.float64)
+    finite = np.isfinite(d_vals) & (d_vals > 0)
+    if int(finite.sum()) < min_pixels:
+        return None
+    rows_f = rows[finite].astype(np.float64)
+    cols_f = cols[finite].astype(np.float64)
+    d_vals = d_vals[finite]
+
+    uv = np.stack([cols_f, rows_f], axis=1)
+    alphas, beta = world_z_at_pixel_unit_depth(uv, K, T_wc)
+    safe = np.abs(alphas) > 1e-9
+    if int(safe.sum()) < min_pixels:
+        return None
+    rows_f = rows_f[safe]
+    cols_f = cols_f[safe]
+    alphas = alphas[safe]
+    d_vals = d_vals[safe]
+    uv = np.stack([cols_f, rows_f], axis=1)
+
+    # ---- z_target: row-linear (default) or ray-OBB (Path B) ----
+    if obj is None:
+        # Row-linear interpolation using the TRUE mask extent
+        v_top_extent = float(rows.min())
+        v_bot_extent = float(rows.max())
+        span = v_bot_extent - v_top_extent
+        if span < 2.0:
+            return None
+        frac = (rows_f - v_top_extent) / span
+        z_target_world = Z_max + frac * (Z_min - Z_max)  # this is a world-Z target
+        # Convert to "z_cam target" via Z_world = α · z_cam + β
+        # We want the LSQ to produce a, b such that α · (a · d̃ + b) + β ≈ z_target_world
+        # ⇒ rows: α · d̃ · a + α · b = z_target_world - β
+        rhs_rows = z_target_world - beta
+    else:
+        from lidar_anchored_depth.alignment.ray_obb import ray_obb_z_target
+        z_cam_target = ray_obb_z_target(uv, K, T_wc, obj, expand=bbox_expand)
+        ok = np.isfinite(z_cam_target)
+        if int(ok.sum()) < min_pixels:
+            return None
+        d_vals = d_vals[ok]
+        z_cam_target = z_cam_target[ok]
+        # Path B: z_cam_target is in CAMERA-axis space directly (it's the
+        # ray's t to the bbox-near hit, with rays_cam[2] == 1 → t == z_cam).
+        # HAD model: z_cam = a · d̃ + b. So each pixel adds:
+        #     d̃ · a + 1 · b = z_cam_target
+        A_rows = np.stack([d_vals, np.ones_like(d_vals)], axis=1)
+        rhs_rows = z_cam_target
+        return A_rows, rhs_rows
+
+    A_rows = np.stack([alphas * d_vals, alphas], axis=1)
+    return A_rows, rhs_rows
+
+
+def solve_affine_dense_lsq_multi(
+    inputs: list[dict],
+    *,
+    z_target: str = "row-linear",
+    robust_lo_pct: float = 0.0,
+    robust_hi_pct: float = 100.0,
+    min_pixels_per_frame: int = 50,
+    min_total_pixels: int = 200,
+) -> tuple[float, float] | None:
+    """Joint dense-LSQ across multiple frames sharing the same camera.
+
+    Solves a *single* ``(a, b)`` from the stacked LSQ rows of every
+    input frame. The intended use is "one (a, b) per (camera, object)"
+    where many frames of the same object as seen by the same camera
+    pool their pixel constraints — averages out per-frame DA3 noise +
+    per-frame SAM mask jitter.
+
+    Parameters
+    ----------
+    inputs : list of dicts. Each dict has::
+        {
+          'K': (3, 3),
+          'T_wc': (4, 4),
+          'mask': (H, W) bool,
+          'd_pred_image': (H, W) float,
+          'Z_max': float, 'Z_min': float,   # only used when z_target='row-linear'
+          'obj': DynamicObject,             # only used when z_target='ray-obb'
+        }
+    z_target : 'row-linear' (Path A only) or 'ray-obb' (Path A+B).
+    robust_lo_pct, robust_hi_pct : per-frame row percentile band filter.
+    min_pixels_per_frame : drop frames with fewer usable pixels than this.
+    min_total_pixels : refuse to solve if the stack has fewer rows total.
+
+    Returns
+    -------
+    (a, b) on success, else ``None``.
+    """
+    if z_target not in ("row-linear", "ray-obb"):
+        raise ValueError(f"z_target must be 'row-linear' or 'ray-obb'; got {z_target!r}")
+
+    A_blocks: list[np.ndarray] = []
+    rhs_blocks: list[np.ndarray] = []
+    for entry in inputs:
+        if z_target == "row-linear":
+            built = _build_lsq_rows_for_one_frame(
+                K=entry["K"], T_wc=entry["T_wc"],
+                mask=entry["mask"], d_pred_image=entry["d_pred_image"],
+                Z_max=entry["Z_max"], Z_min=entry["Z_min"],
+                obj=None,
+                robust_lo_pct=robust_lo_pct, robust_hi_pct=robust_hi_pct,
+                min_pixels=min_pixels_per_frame,
+            )
+        else:  # 'ray-obb'
+            built = _build_lsq_rows_for_one_frame(
+                K=entry["K"], T_wc=entry["T_wc"],
+                mask=entry["mask"], d_pred_image=entry["d_pred_image"],
+                Z_max=entry.get("Z_max", 0.0), Z_min=entry.get("Z_min", 0.0),
+                obj=entry["obj"],
+                bbox_expand=entry.get("bbox_expand", 0.0),
+                robust_lo_pct=robust_lo_pct, robust_hi_pct=robust_hi_pct,
+                min_pixels=min_pixels_per_frame,
+            )
+        if built is None:
+            continue
+        A_rows, rhs_rows = built
+        A_blocks.append(A_rows)
+        rhs_blocks.append(rhs_rows)
+
+    if not A_blocks:
+        return None
+    A = np.vstack(A_blocks)
+    rhs = np.concatenate(rhs_blocks)
+    if A.shape[0] < min_total_pixels:
+        return None
+    sol, *_ = np.linalg.lstsq(A, rhs, rcond=None)
+    if sol.shape[0] != 2:
+        return None
+    return float(sol[0]), float(sol[1])
+
+
+# --------------------------------------------------------------------- #
 # Mask geometry helpers
 # --------------------------------------------------------------------- #
 def mask_top_bottom_pixels(

@@ -46,8 +46,10 @@ from lidar_anchored_depth.alignment.height_anchor import (
     height_interval_from_lidar_in_mask,
     mask_top_bottom_pixels,
     solve_affine_dense_lsq,
+    solve_affine_dense_lsq_multi,
     solve_affine_from_height_anchors,
 )
+from lidar_anchored_depth.alignment.ray_obb import ray_obb_z_target
 from lidar_anchored_depth.alignment.projection import (
     BBOX_EDGES,
     bbox_3d_corners,
@@ -106,7 +108,9 @@ __all__ = [
     "had_mask",
     "height_interval_from_lidar_in_mask",
     "mask_top_bottom_pixels",
+    "ray_obb_z_target",
     "solve_affine_dense_lsq",
+    "solve_affine_dense_lsq_multi",
     "solve_affine_from_height_anchors",
     # bbox anchor (M2/M3 AA-HAD)
     "BboxMatch",
