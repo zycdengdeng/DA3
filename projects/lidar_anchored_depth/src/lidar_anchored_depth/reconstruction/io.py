@@ -91,6 +91,21 @@ def read_ply_xyz(path: str | Path) -> np.ndarray:
     Returns ``(N, 3) float32``. Color channels are skipped. Designed for
     PLYs written by :func:`write_ply_xyz` plus other simple variants.
     """
+    pts, _ = _read_ply(path, want_rgb=False)
+    return pts
+
+
+def read_ply_xyz_rgb(path: str | Path) -> tuple[np.ndarray, np.ndarray | None]:
+    """Read XYZ + (optional) RGB from a PLY.
+
+    Returns ``(points (N, 3) float32, colors (N, 3) uint8 | None)``.
+    Colors is ``None`` if the file has no ``red``/``green``/``blue``
+    properties.
+    """
+    return _read_ply(path, want_rgb=True)
+
+
+def _read_ply(path: str | Path, *, want_rgb: bool) -> tuple[np.ndarray, np.ndarray | None]:
     p = Path(path)
     with p.open("rb") as f:
         header_bytes = b""
@@ -117,6 +132,16 @@ def read_ply_xyz(path: str | Path) -> np.ndarray:
         ix = prop_names.index("x")
         iy = prop_names.index("y")
         iz = prop_names.index("z")
+        has_rgb = (
+            want_rgb
+            and "red" in prop_names
+            and "green" in prop_names
+            and "blue" in prop_names
+        )
+        if has_rgb:
+            ir = prop_names.index("red")
+            ig = prop_names.index("green")
+            ib = prop_names.index("blue")
 
         if "binary_little_endian" in fmt_line:
             type_to_struct = {
@@ -134,19 +159,31 @@ def read_ply_xyz(path: str | Path) -> np.ndarray:
             rec_size = struct.calcsize("<" + chars)
             assert rec_size == sizes
             data = f.read(n * rec_size)
-            unpacked = struct.iter_unpack("<" + chars, data)
+            unpacked = list(struct.iter_unpack("<" + chars, data))
             out = np.empty((n, 3), dtype=np.float32)
             for k, vals in enumerate(unpacked):
                 out[k, 0] = vals[ix]
                 out[k, 1] = vals[iy]
                 out[k, 2] = vals[iz]
-            return out
+            colors = None
+            if has_rgb:
+                colors = np.empty((n, 3), dtype=np.uint8)
+                for k, vals in enumerate(unpacked):
+                    colors[k, 0] = int(vals[ir])
+                    colors[k, 1] = int(vals[ig])
+                    colors[k, 2] = int(vals[ib])
+            return out, colors
         else:  # ASCII
             body = f.read().decode("ascii", errors="replace")
             out = np.empty((n, 3), dtype=np.float32)
+            colors = np.empty((n, 3), dtype=np.uint8) if has_rgb else None
             for k, line in enumerate(body.splitlines()[:n]):
                 toks = line.split()
                 out[k, 0] = float(toks[ix])
                 out[k, 1] = float(toks[iy])
                 out[k, 2] = float(toks[iz])
-            return out
+                if colors is not None:
+                    colors[k, 0] = int(toks[ir])
+                    colors[k, 1] = int(toks[ig])
+                    colors[k, 2] = int(toks[ib])
+            return out, colors

@@ -238,3 +238,140 @@ def test_depth_to_world_points_shape_mismatch(synthetic_camera):
     image = np.zeros((20, 20, 3), dtype=np.uint8)
     with pytest.raises(ValueError, match="match"):
         depth_to_world_points(depth, image, K, T_wc)
+
+
+# --------------------------------------------------------------------- #
+# ICP
+# --------------------------------------------------------------------- #
+from lidar_anchored_depth.reconstruction.icp import (  # noqa: E402
+    apply_transform,
+    icp_point_to_point,
+)
+
+
+def test_icp_identity_when_source_equals_target():
+    rng = np.random.default_rng(0)
+    pts = rng.uniform(-10, 10, size=(200, 3))
+    T, info = icp_point_to_point(pts, pts, max_iterations=10)
+    np.testing.assert_allclose(T, np.eye(4), atol=1e-9)
+    assert info["final_residual"] < 1e-9
+
+
+def test_icp_recovers_translation():
+    rng = np.random.default_rng(0)
+    pts = rng.uniform(-5, 5, size=(500, 3))
+    t_true = np.array([1.5, -2.3, 0.7])
+    target = pts + t_true
+    # trim_percentile=100 disables outlier rejection; the source is
+    # cleanly translated so every correspondence should converge.
+    T, info = icp_point_to_point(
+        pts, target, max_iterations=50, trim_percentile=100.0,
+    )
+    np.testing.assert_allclose(T[:3, 3], t_true, atol=1e-2)
+    np.testing.assert_allclose(T[:3, :3], np.eye(3), atol=1e-2)
+
+
+def test_icp_recovers_rotation():
+    rng = np.random.default_rng(0)
+    pts = rng.uniform(-5, 5, size=(500, 3))
+    # 30° rotation about Z
+    theta = np.deg2rad(30.0)
+    R_true = np.array([
+        [np.cos(theta), -np.sin(theta), 0],
+        [np.sin(theta),  np.cos(theta), 0],
+        [0, 0, 1],
+    ])
+    target = (R_true @ pts.T).T
+    # ICP needs a decent init for rotations; use identity (works because
+    # the cloud is well-spread in 3D and 30° is recoverable).
+    T, info = icp_point_to_point(pts, target, max_iterations=50, trim_percentile=100.0)
+    # Compare the rotation extracted from T to R_true
+    np.testing.assert_allclose(T[:3, :3], R_true, atol=1e-2)
+    assert info["final_residual"] < 0.5
+
+
+def test_icp_recovers_full_se3():
+    rng = np.random.default_rng(0)
+    pts = rng.uniform(-5, 5, size=(500, 3))
+    theta = np.deg2rad(15.0)
+    R_true = np.array([
+        [np.cos(theta), 0, np.sin(theta)],
+        [0, 1, 0],
+        [-np.sin(theta), 0, np.cos(theta)],
+    ])
+    t_true = np.array([0.5, -1.2, 2.0])
+    target = (R_true @ pts.T).T + t_true
+    T, info = icp_point_to_point(pts, target, max_iterations=50, trim_percentile=100.0)
+    # Apply T to source, check it matches target
+    src_aligned = apply_transform(pts, T)
+    err = np.linalg.norm(src_aligned - target, axis=1).mean()
+    assert err < 0.05
+
+
+def test_icp_robust_to_outliers():
+    """20% of source points are far from the target → ICP should still
+    align the inliers (trim_percentile=80 drops the worst 20%)."""
+    rng = np.random.default_rng(0)
+    pts = rng.uniform(-5, 5, size=(500, 3))
+    t_true = np.array([1.0, 2.0, 0.5])
+    target = pts + t_true
+    # Inject 100 outliers
+    pts_outlier = np.concatenate([pts, rng.uniform(-50, 50, size=(100, 3))])
+    T, info = icp_point_to_point(
+        pts_outlier, target, max_iterations=30, trim_percentile=80.0,
+    )
+    # Translation should still recover
+    np.testing.assert_allclose(T[:3, 3], t_true, atol=0.1)
+
+
+def test_icp_too_few_points_raises():
+    with pytest.raises(ValueError, match="need >="):
+        icp_point_to_point(np.zeros((2, 3)), np.zeros((10, 3)))
+
+
+def test_apply_transform_round_trip():
+    pts = np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+    T = np.eye(4)
+    T[:3, 3] = [10, 20, 30]
+    out = apply_transform(pts, T)
+    np.testing.assert_allclose(out, pts + [10, 20, 30])
+
+
+def test_apply_transform_empty():
+    out = apply_transform(np.zeros((0, 3)), np.eye(4))
+    assert out.shape == (0, 3)
+
+
+# --------------------------------------------------------------------- #
+# RGB-aware PLY round-trip
+# --------------------------------------------------------------------- #
+from lidar_anchored_depth.reconstruction.io import read_ply_xyz_rgb  # noqa: E402
+
+
+def test_ply_xyz_rgb_round_trip_ascii(tmp_path):
+    pts = np.array([[1, 2, 3], [4, 5, 6]], dtype=np.float32)
+    rgb = np.array([[255, 128, 0], [10, 20, 30]], dtype=np.uint8)
+    p = tmp_path / "x.ply"
+    write_ply_xyz(p, pts, rgb)
+    pts_back, rgb_back = read_ply_xyz_rgb(p)
+    np.testing.assert_allclose(pts_back, pts, atol=1e-5)
+    np.testing.assert_array_equal(rgb_back, rgb)
+
+
+def test_ply_xyz_rgb_returns_none_when_no_rgb(tmp_path):
+    pts = np.array([[1, 2, 3]], dtype=np.float32)
+    p = tmp_path / "x.ply"
+    write_ply_xyz(p, pts)
+    pts_back, rgb_back = read_ply_xyz_rgb(p)
+    assert rgb_back is None
+
+
+def test_ply_xyz_rgb_round_trip_binary(tmp_path):
+    rng = np.random.default_rng(0)
+    pts = rng.uniform(-5, 5, size=(50, 3)).astype(np.float32)
+    rgb = rng.integers(0, 256, size=(50, 3), dtype=np.uint8)
+    p = tmp_path / "x.ply"
+    write_ply_xyz(p, pts, rgb, binary=True)
+    pts_back, rgb_back = read_ply_xyz_rgb(p)
+    np.testing.assert_allclose(pts_back, pts, atol=1e-5)
+    np.testing.assert_array_equal(rgb_back, rgb)

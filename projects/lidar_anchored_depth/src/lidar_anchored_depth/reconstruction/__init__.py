@@ -21,8 +21,13 @@ from lidar_anchored_depth.reconstruction.chamfer import (
     chamfer_distance,
     chamfer_l2,
 )
+from lidar_anchored_depth.reconstruction.icp import (
+    apply_transform,
+    icp_point_to_point,
+)
 from lidar_anchored_depth.reconstruction.io import (
     read_ply_xyz,
+    read_ply_xyz_rgb,
     write_ply_xyz,
 )
 from lidar_anchored_depth.reconstruction.object_local import (
@@ -35,11 +40,14 @@ from lidar_anchored_depth.reconstruction.unproject import (
 )
 
 __all__ = [
+    "apply_transform",
     "chamfer_distance",
     "chamfer_l2",
     "depth_to_world_points",
+    "icp_point_to_point",
     "object_local_to_world",
     "read_ply_xyz",
+    "read_ply_xyz_rgb",
     "voxel_downsample",
     "world_to_object_local",
     "write_ply_xyz",
