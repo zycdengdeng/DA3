@@ -195,9 +195,12 @@ def accumulate_one_object(
     z_min: float,
     z_max: float,
     dense_min_pixels: int,
-    solver_mode: str = "per-camera",  # 'per-frame' | 'per-camera' | 'per-camera-lidar'
+    solver_mode: str = "per-camera",  # 'per-frame' | 'per-camera' | 'per-camera-lidar' | 'per-camera-lidar-offset'
     z_target: str = "row-linear",      # 'row-linear' | 'ray-obb'
     lidar_weight: float = 100.0,
+    icp_per_camera: bool = False,
+    icp_max_iterations: int = 30,
+    icp_trim_percentile: float = 80.0,
 ) -> dict | None:
     """Accumulate LiDAR + AA-HAD points for one bbox.id across all frames it appears in.
 
@@ -211,8 +214,7 @@ def accumulate_one_object(
 
     label = "Unknown"
     lidar_local: list[np.ndarray] = []
-    aa_had_local: list[np.ndarray] = []
-    aa_had_colors: list[np.ndarray] = []
+    aa_had_by_cam: dict[str, dict[str, list[np.ndarray]]] = {}
     n_frames_lidar = 0
     n_frames_aa_had = 0
 
@@ -396,11 +398,13 @@ def accumulate_one_object(
                     continue
                 P_local_pred = P_local_pred[keep]
                 colors = colors[keep]
-            aa_had_local.append(P_local_pred)
-            aa_had_colors.append(colors)
+            aa_had_by_cam.setdefault(cam_id, {"pts": [], "colors": []})
+            aa_had_by_cam[cam_id]["pts"].append(P_local_pred)
+            aa_had_by_cam[cam_id]["colors"].append(colors)
             n_frames_aa_had += 1
 
-    if not lidar_local and not aa_had_local:
+    has_aahad = any(d["pts"] for d in aa_had_by_cam.values())
+    if not lidar_local and not has_aahad:
         return None
 
     summary: dict = {
@@ -412,7 +416,6 @@ def accumulate_one_object(
         "voxel_size_m": voxel_size,
     }
 
-    # Aggregate + voxel-downsample
     if lidar_local:
         L = np.concatenate(lidar_local, axis=0)
         L_v, _ = voxel_downsample(L, voxel_size)
@@ -420,10 +423,49 @@ def accumulate_one_object(
         summary["n_lidar_voxel"] = int(L_v.shape[0])
         summary["lidar_local_points"] = L_v
     else:
-        L_v = np.zeros((0, 3), dtype=np.float64)
+        L = np.zeros((0, 3), dtype=np.float64)
+        L_v = L
         summary["n_lidar_raw"] = 0
         summary["n_lidar_voxel"] = 0
         summary["lidar_local_points"] = L_v
+
+    # Per-camera ICP (optional): align each camera's contribution to
+    # LiDAR independently. Fixes the "4 ghost shells" issue that a
+    # global rigid ICP cannot — each camera's slope and offset error is
+    # absorbed into its own SE(3) transform.
+    icp_log: list[dict] = []
+    if icp_per_camera and L.shape[0] >= 50:
+        L_for_icp = L.astype(np.float64)
+        for cam_id, data in aa_had_by_cam.items():
+            if not data["pts"]:
+                continue
+            P_cam = np.concatenate(data["pts"], axis=0).astype(np.float64)
+            if P_cam.shape[0] < 50:
+                continue
+            from lidar_anchored_depth.reconstruction.icp import (
+                apply_transform, icp_point_to_point,
+            )
+            T, info = icp_point_to_point(
+                P_cam, L_for_icp,
+                max_iterations=icp_max_iterations,
+                trim_percentile=icp_trim_percentile,
+            )
+            P_cam_aligned = apply_transform(P_cam, T)
+            data["pts"] = [P_cam_aligned.astype(np.float32)]  # replace
+            icp_log.append({
+                "cam_id": cam_id,
+                "n_iter": int(info["n_iterations"]),
+                "init_residual_m": info.get("initial_residual"),
+                "final_residual_m": info.get("final_residual"),
+                "T_translation_m": list(T[:3, 3]),
+            })
+    summary["icp_per_camera"] = icp_log
+
+    aa_had_local: list[np.ndarray] = []
+    aa_had_colors: list[np.ndarray] = []
+    for data in aa_had_by_cam.values():
+        aa_had_local.extend(data["pts"])
+        aa_had_colors.extend(data["colors"])
 
     if aa_had_local:
         A = np.concatenate(aa_had_local, axis=0)
@@ -548,6 +590,23 @@ def main() -> int:
         "Default 'per-camera'.",
     )
     parser.add_argument(
+        "--icp-per-camera", action="store_true",
+        help="after solving (a, b), independently ICP-align EACH "
+        "camera's accumulated point cloud onto the LiDAR cloud (rigid "
+        "SE(3) per camera). Fixes the 4 ghost shells / inter-camera "
+        "disagreement that a single global ICP cannot. Recommended "
+        "for the headline reconstruction. Default off.",
+    )
+    parser.add_argument(
+        "--icp-max-iterations", type=int, default=30,
+        help="ICP iteration cap per camera (default 30)",
+    )
+    parser.add_argument(
+        "--icp-trim-percentile", type=float, default=80.0,
+        help="ICP correspondence trimming (default 80; closest 80%% of "
+        "matches kept each iteration; set to 100 for no trimming)",
+    )
+    parser.add_argument(
         "--lidar-weight", type=float, default=100.0,
         help="when --solver-mode=per-camera-lidar: how many mask pixels "
         "one LiDAR row counts as in the LSQ. 100 means a single LiDAR "
@@ -627,6 +686,9 @@ def main() -> int:
             solver_mode=args.solver_mode,
             z_target=args.z_target,
             lidar_weight=args.lidar_weight,
+            icp_per_camera=args.icp_per_camera,
+            icp_max_iterations=args.icp_max_iterations,
+            icp_trim_percentile=args.icp_trim_percentile,
         )
         if summary is None:
             print(f"  bbox {bbox_id:>4}  no usable frames")
