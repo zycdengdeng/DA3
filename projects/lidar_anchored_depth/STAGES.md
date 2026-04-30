@@ -48,6 +48,40 @@ Stage 1.2 ships only public APIs and dataclasses — actual file I/O
 (PCD reading, image decoding, full scene indexing) waits for Stage 3
 once the data is mounted on the build host.
 
+## Stage 3C — Per-object temporal accumulation (this commit)
+
+The per-frame headline (Stage 3A/B) gave us a per-object RMSE number.
+Stage 3C complements that with a **multi-frame, multi-camera per-object
+reconstruction**: we accumulate every LiDAR return that landed inside
+one V2X bbox across every frame the object appears in (object-local
+frame), do the same for AA-HAD's per-pixel unprojection through SAM
+masks, voxel-downsample, and report the symmetric Chamfer distance
+between the two clouds. This is the project's headline qualitative
+**and** quantitative figure: a dense per-object reconstruction with a
+single number that says "metric depth error vs LiDAR ground truth".
+
+Modules added under `src/lidar_anchored_depth/reconstruction/`:
+- `io` — tiny in-house PLY writer / reader (XYZ + optional RGB),
+  ASCII or binary little-endian. No open3d.
+- `chamfer` — symmetric Chamfer distance via `scipy.spatial.cKDTree`,
+  returns scalar + per-direction stats (mean / median / p95).
+- `object_local` — `world_to_object_local` / `object_local_to_world`
+  using the V2X bbox pose, plus `voxel_downsample` (centroid + colors).
+- `unproject` — `depth_to_world_points`: backproject a (H, W) metric
+  depth + RGB image through the camera ray to a colored world cloud,
+  optionally restricted by a SAM mask.
+
+Scripts:
+- `scripts/run_object_accumulation.py` — main Stage 3C entry point.
+  `--bbox-id N` for one object or `--all-bboxes` for a sweep. Writes
+  `<scene>_obj<id>_lidar.ply` (GT) and `<scene>_obj<id>_aa_had.ply`
+  (predicted, with RGB) plus a JSON summary with per-object Chamfer.
+- `scripts/aggregate_object_chamfer.py` — population-level summary
+  across many JSONs (median chamfer, per-class breakdown, chamfer vs
+  number of frames).
+
+22 new tests in `tests/test_reconstruction.py`. 146 total tests pass.
+
 ## Stage 2 — Core algorithms
 
 - `alignment.projection` — port from prior `utils/lidar_alignment.py`

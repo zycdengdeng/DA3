@@ -1,0 +1,477 @@
+"""Per-object temporal accumulation — Stage 3C headline experiment.
+
+For one tracked V2X object (identified by ``--bbox-id``) across many
+frames + cameras we build **two** dense object-local point clouds:
+
+  1. ``<obj>_lidar.ply`` : the LiDAR ground truth — every LiDAR return
+     that fell inside the object's 3D bbox at each frame, transformed
+     into the object's local frame.
+  2. ``<obj>_aa_had.ply``: the AA-HAD prediction — for every (camera,
+     frame) where SAM has a mask of this object, solve the per-instance
+     ``(a_i, b_i)``, unproject every mask pixel via the camera ray, and
+     transform into the object's local frame.
+
+Then compute the symmetric Chamfer distance between the two clouds. This
+is the central per-object validation metric for the project: if our
+metric depth is right, the AA-HAD cloud should hug the LiDAR cloud at
+the centimeter scale.
+
+Usage
+-----
+    PYTHONPATH=src python scripts/run_object_accumulation.py \\
+        --data-root /mnt/car_road_data_TianJin \\
+        --scene 008 \\
+        --bbox-id 1 \\
+        --d-paths-glob 'preview/da3/008_*_d.npz' \\
+        --sam-mask-dir preview/sam/ \\
+        --output preview/recon/
+
+    # Full sweep across all bbox ids in the scene:
+    PYTHONPATH=src python scripts/run_object_accumulation.py ... --all-bboxes
+
+The script prints one summary line per object:
+
+    bbox  1  Bus     N_frames=8   N_lidar=15234  N_aa_had=78912  chamfer=0.42 m
+
+and writes ``recon/<scene>_obj<id>_<lidar|aa_had>.ply`` plus a JSON
+summary ``recon/<scene>_obj<id>_recon.json``.
+"""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import sys
+import time
+from collections import defaultdict
+from pathlib import Path
+
+import numpy as np
+
+from lidar_anchored_depth.alignment.bbox_anchor import (
+    points_in_oriented_bbox,
+)
+from lidar_anchored_depth.alignment.height_anchor import (
+    solve_affine_dense_lsq,
+)
+from lidar_anchored_depth.data import RoadsideV2XLoader
+from lidar_anchored_depth.reconstruction import (
+    chamfer_distance,
+    depth_to_world_points,
+    voxel_downsample,
+    world_to_object_local,
+    write_ply_xyz,
+)
+
+
+# --------------------------------------------------------------------- #
+# Helpers
+# --------------------------------------------------------------------- #
+def _load_sam_masks(
+    sam_dir: Path | None,
+    scene_id: str, ts_ms: int, cam_id: str,
+) -> dict[int, np.ndarray]:
+    if sam_dir is None:
+        return {}
+    p = sam_dir / f"{scene_id}_ts{ts_ms}_cam{cam_id}_sam.npz"
+    if not p.is_file():
+        return {}
+    data = np.load(p, allow_pickle=True)
+    ids = list(data["mask_ids"])
+    masks = data["masks"]
+    return {int(i): masks[k].astype(bool) for k, i in enumerate(ids)}
+
+
+def _frames_with_bbox(
+    loader: RoadsideV2XLoader,
+    scene_id: str,
+    cams: list[str],
+    bbox_id: int,
+) -> list[tuple[int, str]]:
+    """Find every (ts_ms, cam_id) where this V2X bbox.id is annotated.
+
+    The cam_id loop is purely for accumulation breadth; the V2X bbox
+    annotation is camera-independent (world-frame), but each camera's
+    frame independently provides image / SAM mask.
+    """
+    out: list[tuple[int, str]] = []
+    scene = next(s for s in loader.scenes if s.scene_id == scene_id)
+    for ts in scene.timestamps_ms:
+        # Use cam0 as the "discovery" camera since the dynamic_objects
+        # list is shared across cameras for the same timestamp.
+        try:
+            idx = loader.find_frame_idx(scene_id, ts, cams[0])
+        except ValueError:
+            continue
+        frame = loader.get_frame(idx)
+        ids_here = {int(o.id) for o in frame.dynamic_objects or []}
+        if bbox_id not in ids_here:
+            continue
+        for c in cams:
+            out.append((ts, c))
+    return out
+
+
+def _all_bbox_ids_in_scene(
+    loader: RoadsideV2XLoader,
+    scene_id: str,
+    cam_for_discovery: str,
+) -> dict[int, str]:
+    """Return ``{bbox_id: label}`` for every dynamic object ever seen
+    in the scene from ``cam_for_discovery``."""
+    out: dict[int, str] = {}
+    scene = next(s for s in loader.scenes if s.scene_id == scene_id)
+    for ts in scene.timestamps_ms:
+        try:
+            idx = loader.find_frame_idx(scene_id, ts, cam_for_discovery)
+        except ValueError:
+            continue
+        frame = loader.get_frame(idx)
+        for obj in frame.dynamic_objects or []:
+            out.setdefault(int(obj.id), obj.label)
+    return out
+
+
+def _resolve_scene_id(loader: RoadsideV2XLoader, scene_arg: str) -> str:
+    cands = [s for s in loader.scenes if s.scene_id == scene_arg]
+    if cands:
+        return cands[0].scene_id
+    cands = [s for s in loader.scenes if s.scene_id.startswith(scene_arg + "_")]
+    if not cands:
+        raise SystemExit(f"no scene matched {scene_arg!r}")
+    return cands[0].scene_id
+
+
+# --------------------------------------------------------------------- #
+# Main per-object work
+# --------------------------------------------------------------------- #
+def accumulate_one_object(
+    loader: RoadsideV2XLoader,
+    scene_id: str,
+    bbox_id: int,
+    *,
+    cams: list[str],
+    d_paths_index: dict[tuple[str, int, str], Path],
+    sam_dir: Path | None,
+    bbox_expand: float,
+    voxel_size: float,
+    z_min: float,
+    z_max: float,
+    dense_min_pixels: int,
+) -> dict | None:
+    """Accumulate LiDAR + AA-HAD points for one bbox.id across all frames it appears in.
+
+    Returns a dict with the per-object summary, or ``None`` if no frame
+    yielded usable points.
+    """
+    # Walk every (ts, cam) where this bbox.id is annotated.
+    candidates = _frames_with_bbox(loader, scene_id, cams, bbox_id)
+    if not candidates:
+        return None
+
+    label = "Unknown"
+    lidar_local: list[np.ndarray] = []
+    aa_had_local: list[np.ndarray] = []
+    aa_had_colors: list[np.ndarray] = []
+    n_frames_lidar = 0
+    n_frames_aa_had = 0
+
+    for ts_ms, cam_id in candidates:
+        try:
+            idx = loader.find_frame_idx(scene_id, ts_ms, cam_id)
+        except ValueError:
+            continue
+        frame = loader.get_frame(idx)
+        # Find this bbox in the per-frame dynamic_objects
+        obj = next(
+            (o for o in (frame.dynamic_objects or []) if int(o.id) == bbox_id),
+            None,
+        )
+        if obj is None:
+            continue
+        label = obj.label
+
+        # --- 1. LiDAR points inside oriented bbox → object-local frame
+        in_bbox = points_in_oriented_bbox(
+            frame.lidar_world, obj, expand=bbox_expand
+        )
+        if int(in_bbox.sum()) > 0:
+            P_world = frame.lidar_world[in_bbox]
+            P_local = world_to_object_local(P_world, obj)
+            lidar_local.append(P_local)
+            n_frames_lidar += 1
+
+        # --- 2. AA-HAD per-pixel unproject → object-local frame (needs SAM)
+        sam_masks = _load_sam_masks(sam_dir, scene_id, ts_ms, cam_id)
+        mask = sam_masks.get(bbox_id)
+        if mask is None or not mask.any():
+            continue
+        d_path = d_paths_index.get((scene_id, ts_ms, cam_id))
+        if d_path is None or not d_path.is_file():
+            continue
+        d_data = np.load(d_path, allow_pickle=True)
+        d_image = d_data["depth"]
+        if d_image.shape != frame.image.shape[:2]:
+            continue
+
+        sol = solve_affine_dense_lsq(
+            K=frame.K, T_wc=frame.T_wc, mask=mask, d_pred_image=d_image,
+            Z_max=obj.Z_max, Z_min=obj.Z_min,
+            min_pixels=dense_min_pixels,
+        )
+        if sol is None:
+            continue
+        a_i, b_i = sol
+
+        # Build a per-pixel metric depth on the mask
+        z_cam = (a_i * d_image + b_i).astype(np.float32)
+        # Unproject mask pixels
+        P_world_pred, colors = depth_to_world_points(
+            depth=z_cam, image_rgb=frame.image,
+            K=frame.K, T_wc=frame.T_wc,
+            mask=mask, z_min=z_min, z_max=z_max,
+        )
+        if P_world_pred.shape[0] == 0:
+            continue
+        P_local_pred = world_to_object_local(P_world_pred, obj)
+        aa_had_local.append(P_local_pred)
+        aa_had_colors.append(colors)
+        n_frames_aa_had += 1
+
+    if not lidar_local and not aa_had_local:
+        return None
+
+    summary: dict = {
+        "scene_id": scene_id,
+        "bbox_id": bbox_id,
+        "label": label,
+        "n_frames_lidar": n_frames_lidar,
+        "n_frames_aa_had": n_frames_aa_had,
+        "voxel_size_m": voxel_size,
+    }
+
+    # Aggregate + voxel-downsample
+    if lidar_local:
+        L = np.concatenate(lidar_local, axis=0)
+        L_v, _ = voxel_downsample(L, voxel_size)
+        summary["n_lidar_raw"] = int(L.shape[0])
+        summary["n_lidar_voxel"] = int(L_v.shape[0])
+        summary["lidar_local_points"] = L_v
+    else:
+        L_v = np.zeros((0, 3), dtype=np.float64)
+        summary["n_lidar_raw"] = 0
+        summary["n_lidar_voxel"] = 0
+        summary["lidar_local_points"] = L_v
+
+    if aa_had_local:
+        A = np.concatenate(aa_had_local, axis=0)
+        C = np.concatenate(aa_had_colors, axis=0)
+        A_v, C_v = voxel_downsample(A, voxel_size, colors=C)
+        summary["n_aa_had_raw"] = int(A.shape[0])
+        summary["n_aa_had_voxel"] = int(A_v.shape[0])
+        summary["aa_had_local_points"] = A_v
+        summary["aa_had_local_colors"] = C_v
+    else:
+        A_v = np.zeros((0, 3), dtype=np.float64)
+        C_v = np.zeros((0, 3), dtype=np.uint8)
+        summary["n_aa_had_raw"] = 0
+        summary["n_aa_had_voxel"] = 0
+        summary["aa_had_local_points"] = A_v
+        summary["aa_had_local_colors"] = C_v
+
+    # Chamfer (only if both clouds non-empty)
+    if L_v.shape[0] > 0 and A_v.shape[0] > 0:
+        cd, stats = chamfer_distance(A_v, L_v)
+        summary["chamfer_m"] = float(cd)
+        summary["chamfer_stats"] = stats
+    else:
+        summary["chamfer_m"] = None
+        summary["chamfer_stats"] = None
+
+    return summary
+
+
+# --------------------------------------------------------------------- #
+# Main
+# --------------------------------------------------------------------- #
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    parser.add_argument("--data-root", required=True)
+    parser.add_argument("--scene", required=True)
+    parser.add_argument("--output", required=True)
+    parser.add_argument(
+        "--bbox-id", type=int, default=None,
+        help="V2X bbox.id to accumulate. Use --all-bboxes for a sweep.",
+    )
+    parser.add_argument(
+        "--all-bboxes", action="store_true",
+        help="run on every dynamic-object id seen in the scene",
+    )
+    parser.add_argument(
+        "--cams", nargs="+", default=["0", "3", "6", "9"],
+        help="pinhole cam ids to accumulate over",
+    )
+    parser.add_argument(
+        "--d-paths-glob", required=True,
+        help="single-quoted glob for the .npz files written by "
+        "run_da3_inference.py, e.g. 'preview/da3/008_*_d.npz'",
+    )
+    parser.add_argument(
+        "--sam-mask-dir", default=None,
+        help="directory with SAM .npz files (if absent, only the LiDAR "
+        "side is accumulated; no AA-HAD prediction)",
+    )
+    parser.add_argument(
+        "--voxel-size", type=float, default=0.05,
+        help="voxel size (m) for downsampling. Default 5 cm.",
+    )
+    parser.add_argument(
+        "--bbox-expand", type=float, default=0.10,
+        help="expand bbox half-extents by this many meters when picking "
+        "LiDAR points inside the bbox",
+    )
+    parser.add_argument("--z-min", type=float, default=0.5)
+    parser.add_argument("--z-max", type=float, default=250.0)
+    parser.add_argument("--dense-min-pixels", type=int, default=50)
+    parser.add_argument(
+        "--loader-min-points", type=int, default=0,
+        help="V2X annotation filter: drop bboxes with num_points below "
+        "this. Default 0 to be permissive on interpolated frames.",
+    )
+    parser.add_argument(
+        "--ply-binary", action="store_true",
+        help="write PLY in binary (faster + smaller for large clouds)",
+    )
+    args = parser.parse_args()
+
+    out_dir = Path(args.output)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Build d_path index keyed by (scene_id, ts_ms, cam_id)
+    d_paths_index: dict[tuple[str, int, str], Path] = {}
+    for p in sorted(glob.glob(args.d_paths_glob)):
+        try:
+            data = np.load(p, allow_pickle=True)
+        except Exception:
+            continue
+        try:
+            key = (str(data["scene_id"]), int(data["ts_ms"]), str(data["cam_id"]))
+        except KeyError:
+            continue
+        d_paths_index[key] = Path(p)
+    print(f"[load] {len(d_paths_index)} d̃ frames indexed")
+
+    sam_dir = Path(args.sam_mask_dir) if args.sam_mask_dir else None
+    if sam_dir is not None and not sam_dir.is_dir():
+        raise SystemExit(f"--sam-mask-dir {sam_dir} not a directory")
+
+    loader = RoadsideV2XLoader(
+        data_root=args.data_root,
+        scenes=[args.scene] if "_" in args.scene else None,
+        min_num_points=args.loader_min_points,
+    )
+    if "_" not in args.scene:
+        loader.scene_filter = [args.scene]
+    scene_id = _resolve_scene_id(loader, args.scene)
+
+    if args.all_bboxes:
+        ids_labels = _all_bbox_ids_in_scene(loader, scene_id, args.cams[0])
+        target_ids = sorted(ids_labels.keys())
+        print(f"[scene] {scene_id}  found {len(target_ids)} dynamic bbox ids")
+    else:
+        if args.bbox_id is None:
+            raise SystemExit("specify --bbox-id N or --all-bboxes")
+        target_ids = [args.bbox_id]
+
+    print(f"[run] cams={args.cams}  voxel={args.voxel_size}m")
+    print()
+
+    fmt = "  bbox {:>4}  {:<22} N_frames(L,A)=({:>3},{:>3})  N_pts(L,A)=({:>6},{:>6})  chamfer={:>8}"
+    aggregated: list[dict] = []
+    for bbox_id in target_ids:
+        t0 = time.time()
+        summary = accumulate_one_object(
+            loader=loader, scene_id=scene_id, bbox_id=bbox_id,
+            cams=args.cams,
+            d_paths_index=d_paths_index, sam_dir=sam_dir,
+            bbox_expand=args.bbox_expand,
+            voxel_size=args.voxel_size,
+            z_min=args.z_min, z_max=args.z_max,
+            dense_min_pixels=args.dense_min_pixels,
+        )
+        if summary is None:
+            print(f"  bbox {bbox_id:>4}  no usable frames")
+            continue
+
+        # Write PLYs
+        L_pts = summary.pop("lidar_local_points")
+        A_pts = summary.pop("aa_had_local_points")
+        A_col = summary.pop("aa_had_local_colors")
+        if L_pts.shape[0] > 0:
+            write_ply_xyz(
+                out_dir / f"{scene_id}_obj{bbox_id}_lidar.ply",
+                L_pts, binary=args.ply_binary,
+            )
+        if A_pts.shape[0] > 0:
+            write_ply_xyz(
+                out_dir / f"{scene_id}_obj{bbox_id}_aa_had.ply",
+                A_pts, A_col, binary=args.ply_binary,
+            )
+
+        chamfer_str = (
+            f"{summary['chamfer_m']:.3f} m"
+            if summary["chamfer_m"] is not None
+            else "—"
+        )
+        print(fmt.format(
+            bbox_id, summary["label"][:22],
+            summary["n_frames_lidar"], summary["n_frames_aa_had"],
+            summary["n_lidar_voxel"], summary["n_aa_had_voxel"],
+            chamfer_str,
+        ))
+
+        # JSON-friendly summary (drop the numpy arrays)
+        aggregated.append({
+            k: v for k, v in summary.items() if k != "lidar_local_points"
+            and k != "aa_had_local_points" and k != "aa_had_local_colors"
+        })
+
+    # Aggregate report
+    chamfers = [
+        s["chamfer_m"] for s in aggregated
+        if s.get("chamfer_m") is not None and np.isfinite(s["chamfer_m"])
+    ]
+    print()
+    print("=" * 64)
+    print(f"AGGREGATE over {len(aggregated)} objects "
+          f"({len(chamfers)} with valid chamfer)")
+    print("=" * 64)
+    if chamfers:
+        c = np.array(chamfers)
+        print(f"  median chamfer: {float(np.median(c)):.3f} m")
+        print(f"  p25 / p75      : {float(np.percentile(c, 25)):.3f} / "
+              f"{float(np.percentile(c, 75)):.3f} m")
+        print(f"  min  / max     : {float(c.min()):.3f} / {float(c.max()):.3f} m")
+
+        # Per-class breakdown
+        by_lab: dict[str, list[float]] = defaultdict(list)
+        for s in aggregated:
+            if s.get("chamfer_m") is not None:
+                by_lab[s["label"]].append(s["chamfer_m"])
+        print()
+        print("Per-class median chamfer:")
+        for lab in sorted(by_lab, key=lambda k: -len(by_lab[k])):
+            vs = by_lab[lab]
+            print(f"  {lab:<22} N={len(vs):>3}  median {np.median(vs):.3f} m")
+
+    json_path = out_dir / f"{scene_id}_recon_summary.json"
+    json_path.write_text(json.dumps(aggregated, indent=2, default=str))
+    print()
+    print(f"  ↳ json : {json_path}")
+    print(f"  ↳ ply  : {out_dir}/{scene_id}_obj*_*.ply")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
