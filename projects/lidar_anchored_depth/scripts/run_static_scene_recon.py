@@ -213,12 +213,17 @@ def _unproject_static_branch(
     *,
     pixel_stride: int,
     z_min: float, z_max: float,
-) -> tuple[np.ndarray, np.ndarray]:
+    sigma_predictor=None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
     """Apply (a, b) to every (camera, ts) frame; unproject the STATIC
-    portion (image \\ dynamic SAM mask) to world. Returns (P_world, RGB).
+    portion (image \\ dynamic SAM mask) to world.
+
+    Returns ``(P_world, RGB, sigma_per_point)``; ``sigma_per_point`` is
+    ``None`` when ``sigma_predictor`` is not provided.
     """
     pts_all: list[np.ndarray] = []
     rgb_all: list[np.ndarray] = []
+    sig_all: list[np.ndarray] = []
     scene = next(s for s in loader.scenes if s.scene_id == scene_id)
     for ts_ms in scene.timestamps_ms:
         try:
@@ -257,9 +262,29 @@ def _unproject_static_branch(
         pts_all.append(P_world)
         rgb_all.append(colors)
 
+        if sigma_predictor is not None:
+            # Reproduce the same kept-pixel set the unprojector used so
+            # rows align 1:1 with P_world.
+            valid = (z_cam >= z_min) & (z_cam <= z_max) & np.isfinite(z_cam) & static_mask
+            rows, cols = np.where(valid)
+            uv = np.stack([cols.astype(np.float64), rows.astype(np.float64)], axis=1)
+            d_at = d_image[rows, cols].astype(np.float64)
+            sigma = sigma_predictor.predict_for_pixels(
+                uv, d_at, frame.K, a=a, b=b, image_hw=(H, W),
+            )
+            sig_all.append(sigma)
+
     if not pts_all:
-        return np.zeros((0, 3), dtype=np.float64), np.zeros((0, 3), dtype=np.uint8)
-    return np.concatenate(pts_all), np.concatenate(rgb_all)
+        empty_sig = np.zeros(0, dtype=np.float32) if sigma_predictor is not None else None
+        return (
+            np.zeros((0, 3), dtype=np.float64),
+            np.zeros((0, 3), dtype=np.uint8),
+            empty_sig,
+        )
+    pts = np.concatenate(pts_all)
+    rgb = np.concatenate(rgb_all)
+    sig = np.concatenate(sig_all) if sigma_predictor is not None else None
+    return pts, rgb, sig
 
 
 def main() -> int:
@@ -315,6 +340,18 @@ def main() -> int:
     parser.add_argument(
         "--loader-min-points", type=int, default=0,
         help="V2X annotation filter (default 0 → permissive)",
+    )
+    parser.add_argument(
+        "--sigma-checkpoint", default=None,
+        help="optional .pt produced by scripts/train_sigma_head.py. "
+        "If given, the static AA-HAD branch is fused across cameras "
+        "with inverse-variance weights (w = 1/sigma^2) instead of the "
+        "default unweighted voxel mean. Requires torch.",
+    )
+    parser.add_argument(
+        "--sigma-device", default="cpu",
+        help="device for the sigma predictor (default cpu; recon is "
+        "I/O-bound so cuda is rarely worth the transfer cost)",
     )
     args = parser.parse_args()
 
@@ -376,26 +413,46 @@ def main() -> int:
     calib_json.write_text(json.dumps(cam_calib, indent=2))
 
     # ---- 2. Per-camera unproject + accumulate static AA-HAD -----------
+    sigma_predictor = None
+    if args.sigma_checkpoint:
+        from lidar_anchored_depth.models import SigmaPredictor
+
+        sigma_predictor = SigmaPredictor(args.sigma_checkpoint, device=args.sigma_device)
+        print()
+        print(f"[sigma] loaded {args.sigma_checkpoint} on {args.sigma_device}")
+
     print()
     print(f"[2/3] static-AA-HAD unprojection (stride={args.aahad_pixel_stride})")
     aahad_pts_all: list[np.ndarray] = []
     aahad_rgb_all: list[np.ndarray] = []
+    aahad_sig_all: list[np.ndarray] = []
     for cam_id, info in cam_calib.items():
         t0 = time.time()
-        pts, rgb = _unproject_static_branch(
+        pts, rgb, sig = _unproject_static_branch(
             loader, scene_id, cam_id, info["a"], info["b"],
             d_paths_index, sam_dir,
             pixel_stride=args.aahad_pixel_stride,
             z_min=args.z_min, z_max=args.z_max,
+            sigma_predictor=sigma_predictor,
         )
         elapsed = time.time() - t0
-        print(f"  cam{cam_id}  N_aahad_static={pts.shape[0]:>7}  ({elapsed:.1f}s)")
+        if sig is not None and sig.size > 0:
+            print(
+                f"  cam{cam_id}  N_aahad_static={pts.shape[0]:>7}  "
+                f"sigma p50={float(np.median(sig)):.2f}m  "
+                f"p90={float(np.quantile(sig, 0.9)):.2f}m  ({elapsed:.1f}s)"
+            )
+        else:
+            print(f"  cam{cam_id}  N_aahad_static={pts.shape[0]:>7}  ({elapsed:.1f}s)")
         if pts.shape[0] > 0:
             aahad_pts_all.append(pts)
             aahad_rgb_all.append(rgb)
+            if sig is not None:
+                aahad_sig_all.append(sig)
 
     aahad_pts = np.concatenate(aahad_pts_all) if aahad_pts_all else np.zeros((0, 3))
     aahad_rgb = np.concatenate(aahad_rgb_all) if aahad_rgb_all else np.zeros((0, 3), dtype=np.uint8)
+    aahad_sig = np.concatenate(aahad_sig_all) if aahad_sig_all else None
 
     # ---- 3. LiDAR static + LiDAR dynamic accumulate -------------------
     print()
@@ -425,10 +482,23 @@ def main() -> int:
     # ---- Merge + voxel downsample, write PLYs --------------------------
     print()
     print(f"[merge] voxel size = {args.voxel_size} m")
+    aahad_voxel_sig = None
     if aahad_pts.shape[0] > 0:
-        aahad_v, aahad_c = voxel_downsample(
-            aahad_pts, args.voxel_size, colors=aahad_rgb,
-        )
+        if aahad_sig is not None:
+            from lidar_anchored_depth.models import sigma_weighted_voxel
+
+            aahad_v, aahad_c, aahad_voxel_sig = sigma_weighted_voxel(
+                aahad_pts, aahad_sig, args.voxel_size, colors=aahad_rgb,
+            )
+            print(
+                f"  ↳ sigma-weighted fusion: "
+                f"voxel sigma p50={float(np.median(aahad_voxel_sig)):.3f}m  "
+                f"p90={float(np.quantile(aahad_voxel_sig, 0.9)):.3f}m"
+            )
+        else:
+            aahad_v, aahad_c = voxel_downsample(
+                aahad_pts, args.voxel_size, colors=aahad_rgb,
+            )
     else:
         aahad_v = aahad_pts
         aahad_c = aahad_rgb
