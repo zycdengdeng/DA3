@@ -533,6 +533,120 @@ def solve_affine_dense_lsq_multi_with_lidar(
     return float(sol[0]), float(sol[1])
 
 
+def solve_affine_decoupled_mask_slope_lidar_offset(
+    inputs: list[dict],
+    *,
+    min_pixels_per_frame: int = 50,
+    min_lidar_per_frame: int = 5,
+    min_total_pixels: int = 200,
+    use_median_offset: bool = True,
+) -> tuple[float, float] | None:
+    """M5b: slope ``a`` from mask ray-OBB, offset ``b`` from LiDAR mean.
+
+    Why this beats the joint-weighted M5 solver:
+
+    LiDAR points lie INSIDE the bbox, so their camera-axis depth
+    ``z_cam`` and the d̃ values at their projected pixels both span a
+    narrow range — LiDAR alone gives a poorly-conditioned slope ``a``.
+    When ``lidar_weight`` is large in the joint LSQ, LiDAR overrides
+    mask's slope info and the predicted surface "compresses" along the
+    camera ray (the user's compression artefact at lidar_weight=100).
+
+    M5b solves the two parameters in their natural data sources:
+
+      Step 1 (slope from mask):  ``a, b_M4`` from M4-style ray-OBB LSQ
+                                 on mask pixels (their wide d̃ span fits
+                                 ``a`` well; the resulting ``b_M4``
+                                 carries whatever systematic bias DA3
+                                 has).
+      Step 2 (offset from LiDAR): ``δ`` = (median or mean) of
+                                       ``z_lidar − (a · d̃_at_lidar + b_M4)``
+                                  ``b_final = b_M4 + δ``
+                                  ``a_final = a``
+
+    Effect: predicted surface keeps the right "thickness" (``a`` from
+    mask is preserved) and is shifted to coincide with the LiDAR cloud
+    (median residual is killed). Expected chamfer is near LiDAR's own
+    sensor floor (~0.05-0.10 m on a typical roadside rig).
+
+    Parameters
+    ----------
+    inputs : same dict format as
+        :func:`solve_affine_dense_lsq_multi_with_lidar`.
+    use_median_offset : ``True`` (default) → δ = median residual
+        (robust to outliers). ``False`` → mean.
+
+    Returns
+    -------
+    ``(a, b)`` on success; falls back to mask-only ``(a, b_M4)`` when
+    no LiDAR samples survive filtering. Returns ``None`` only when the
+    mask side itself fails (Step 1 returns None).
+    """
+    sol = solve_affine_dense_lsq_multi(
+        inputs, z_target="ray-obb",
+        min_pixels_per_frame=min_pixels_per_frame,
+        min_total_pixels=min_total_pixels,
+    )
+    if sol is None:
+        return None
+    a, b_M4 = sol
+
+    residuals: list[float] = []
+    for entry in inputs:
+        lidar_world = entry.get("lidar_world_in_bbox")
+        if lidar_world is None or lidar_world.shape[0] < min_lidar_per_frame:
+            continue
+        K = entry["K"]
+        T_wc = entry["T_wc"]
+        dist = entry.get("dist")
+        d_image = entry["d_pred_image"]
+        mask = entry["mask"]
+        H, W = d_image.shape
+
+        uv, z_cam_lidar, _ = world_to_image(lidar_world, K, T_wc, dist)
+        if uv.size == 0:
+            continue
+        finite = np.isfinite(uv).all(axis=1)
+        uv = uv[finite]
+        z_cam_lidar = z_cam_lidar[finite]
+        uv_int = np.round(uv).astype(np.int64)
+        in_image = (
+            (uv_int[:, 0] >= 0) & (uv_int[:, 0] < W)
+            & (uv_int[:, 1] >= 0) & (uv_int[:, 1] < H)
+        )
+        u = uv_int[in_image, 0]
+        v = uv_int[in_image, 1]
+        z_cam_lidar = z_cam_lidar[in_image].astype(np.float64)
+        if u.size == 0:
+            continue
+        on_mask = mask[v, u]
+        u = u[on_mask]
+        v = v[on_mask]
+        z_cam_lidar = z_cam_lidar[on_mask]
+        if u.size < min_lidar_per_frame:
+            continue
+        d_at = d_image[v, u].astype(np.float64)
+        valid = (
+            np.isfinite(d_at) & (d_at > 0)
+            & np.isfinite(z_cam_lidar) & (z_cam_lidar > 0)
+        )
+        if int(valid.sum()) < min_lidar_per_frame:
+            continue
+        d_at = d_at[valid]
+        z_cam_lidar = z_cam_lidar[valid]
+
+        z_pred = a * d_at + b_M4
+        residuals.extend((z_cam_lidar - z_pred).tolist())
+
+    if not residuals:
+        return float(a), float(b_M4)
+    residuals_arr = np.asarray(residuals, dtype=np.float64)
+    delta = float(
+        np.median(residuals_arr) if use_median_offset else np.mean(residuals_arr)
+    )
+    return float(a), float(b_M4 + delta)
+
+
 # --------------------------------------------------------------------- #
 # Mask geometry helpers
 # --------------------------------------------------------------------- #

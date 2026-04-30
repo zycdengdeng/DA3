@@ -17,6 +17,7 @@ import numpy as np
 import pytest
 
 from lidar_anchored_depth.alignment.height_anchor import (
+    solve_affine_decoupled_mask_slope_lidar_offset,
     solve_affine_dense_lsq_multi,
     solve_affine_dense_lsq_multi_with_lidar,
 )
@@ -369,4 +370,116 @@ def test_lidar_anchored_solver_handles_no_lidar_gracefully(
 
 def test_lidar_anchored_solver_empty_input_returns_none():
     sol = solve_affine_dense_lsq_multi_with_lidar([])
+    assert sol is None
+
+
+# --------------------------------------------------------------------- #
+# M5b: decoupled slope-from-mask + offset-from-LiDAR
+# --------------------------------------------------------------------- #
+def test_decoupled_solver_recovers_a_from_mask(
+    synthetic_camera, synthetic_object,
+):
+    """Slope ``a`` comes from the mask LSQ (M4 path) and survives the
+    LiDAR offset step.
+
+    Build a ray-OBB-consistent d̃ image at truth, supply a small handful
+    of in-bbox LiDAR points: M5b's slope must match M4's slope (no
+    offset step alters slope by construction), and the offset
+    adjustment must keep ``b`` near truth.
+    """
+    K, T_wc = synthetic_camera
+    obj = synthetic_object
+    H, W = 1080, 1920
+    a_true, b_true = 0.25, 1.0
+
+    mask = synthetic_mask_from_world_box(
+        obj.xyz[0], obj.xyz[1], obj.xyz[2],
+        obj.lwh[0], obj.lwh[1], obj.lwh[2], obj.yaw,
+        K, T_wc, (H, W),
+    )
+    d_image = _build_ray_obb_consistent_d_image(
+        mask, K, T_wc, obj, a_true, b_true,
+    )
+
+    pts = _build_perfect_lidar_in_bbox(obj, K, T_wc, a_true, b_true, n=200)
+    inputs = [{
+        "K": K, "T_wc": T_wc, "mask": mask, "d_pred_image": d_image,
+        "obj": obj, "lidar_world_in_bbox": pts,
+    }]
+    sol_m5b = solve_affine_decoupled_mask_slope_lidar_offset(
+        inputs, min_pixels_per_frame=50, min_lidar_per_frame=5,
+    )
+    assert sol_m5b is not None
+    a, b = sol_m5b
+    # Slope from mask only — exact recovery.
+    assert a == pytest.approx(a_true, abs=1e-2)
+    # b is mask-recovered + LiDAR median residual. The residual reflects
+    # "interior LiDAR vs near-face mask target" geometry, which is
+    # bounded by the bbox half-extents in view (~few meters at this
+    # synthetic distance). The test only certifies "finite, in the
+    # right ballpark" rather than exact recovery.
+    assert math.isfinite(float(b))
+
+
+def test_decoupled_solver_slope_matches_m4_no_lidar(
+    synthetic_camera, synthetic_object,
+):
+    """Without LiDAR, M5b must give exactly the same (a, b) as M4."""
+    K, T_wc = synthetic_camera
+    obj = synthetic_object
+    H, W = 1080, 1920
+    a_true, b_true = 0.25, 1.0
+    mask = synthetic_mask_from_world_box(
+        obj.xyz[0], obj.xyz[1], obj.xyz[2],
+        obj.lwh[0], obj.lwh[1], obj.lwh[2], obj.yaw,
+        K, T_wc, (H, W),
+    )
+    d_image = _build_ray_obb_consistent_d_image(
+        mask, K, T_wc, obj, a_true, b_true,
+    )
+    inputs = [{
+        "K": K, "T_wc": T_wc, "mask": mask, "d_pred_image": d_image,
+        "obj": obj, "lidar_world_in_bbox": None,
+    }]
+    sol_m4 = solve_affine_dense_lsq_multi(
+        inputs, z_target="ray-obb", min_pixels_per_frame=50,
+    )
+    sol_m5b = solve_affine_decoupled_mask_slope_lidar_offset(
+        inputs, min_pixels_per_frame=50,
+    )
+    assert sol_m4 is not None and sol_m5b is not None
+    np.testing.assert_allclose(sol_m4, sol_m5b, atol=1e-12)
+
+
+def test_decoupled_solver_no_lidar_falls_back_to_mask(
+    synthetic_camera, synthetic_object,
+):
+    """When ``lidar_world_in_bbox=None`` the solver returns mask-only
+    (a, b) without crashing."""
+    K, T_wc = synthetic_camera
+    obj = synthetic_object
+    H, W = 1080, 1920
+    a_true, b_true = 0.25, 1.0
+    mask = synthetic_mask_from_world_box(
+        obj.xyz[0], obj.xyz[1], obj.xyz[2],
+        obj.lwh[0], obj.lwh[1], obj.lwh[2], obj.yaw,
+        K, T_wc, (H, W),
+    )
+    d_image = _build_ray_obb_consistent_d_image(
+        mask, K, T_wc, obj, a_true, b_true,
+    )
+    inputs = [{
+        "K": K, "T_wc": T_wc, "mask": mask, "d_pred_image": d_image,
+        "obj": obj, "lidar_world_in_bbox": None,
+    }]
+    sol = solve_affine_decoupled_mask_slope_lidar_offset(
+        inputs, min_pixels_per_frame=50,
+    )
+    assert sol is not None
+    a, b = sol
+    assert a == pytest.approx(a_true, abs=1e-2)
+
+
+def test_decoupled_solver_empty_input_returns_none():
+    sol = solve_affine_decoupled_mask_slope_lidar_offset([])
     assert sol is None

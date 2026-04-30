@@ -53,6 +53,7 @@ from lidar_anchored_depth.alignment.bbox_anchor import (
     points_in_oriented_bbox,
 )
 from lidar_anchored_depth.alignment.height_anchor import (
+    solve_affine_decoupled_mask_slope_lidar_offset,
     solve_affine_dense_lsq,
     solve_affine_dense_lsq_multi,
     solve_affine_dense_lsq_multi_with_lidar,
@@ -324,6 +325,20 @@ def accumulate_one_object(
             ab_by_cam[cam_id] = sol
             for e in entries:
                 ab_by_frame[(cam_id, e["ts_ms"])] = sol
+    elif solver_mode == "per-camera-lidar-offset":
+        # M5b — slope from mask (ray-OBB), offset from LiDAR median.
+        # Avoids the depth-compression artefact of joint-weighted M5
+        # that arises when LiDAR's narrow d̃ range pollutes the slope.
+        for cam_id, entries in by_cam.items():
+            sol = solve_affine_decoupled_mask_slope_lidar_offset(
+                entries,
+                min_pixels_per_frame=dense_min_pixels,
+            )
+            if sol is None:
+                continue
+            ab_by_cam[cam_id] = sol
+            for e in entries:
+                ab_by_frame[(cam_id, e["ts_ms"])] = sol
     elif solver_mode == "per-frame":
         for cam_id, entries in by_cam.items():
             for e in entries:
@@ -513,7 +528,10 @@ def main() -> int:
     )
     parser.add_argument(
         "--solver-mode", default="per-camera",
-        choices=["per-frame", "per-camera", "per-camera-lidar"],
+        choices=[
+            "per-frame", "per-camera",
+            "per-camera-lidar", "per-camera-lidar-offset",
+        ],
         help="how to solve (a, b). "
         "'per-frame' = one fit per (cam, ts) (Stage 3C, sensitive to "
         "per-frame DA3 / SAM noise). "
@@ -521,9 +539,13 @@ def main() -> int:
         "→ one (a, b) per camera per object (Stage 3D-A; eliminates "
         "frame-jitter shells). "
         "'per-camera-lidar' = M5 — per-camera joint LSQ + LiDAR points "
-        "as additional anchor rows (forces the solved (a, b) to honor "
-        "actual LiDAR measurements at sample points; expected sub-meter "
-        "chamfer). Implies ray-OBB z_target. Default 'per-camera'.",
+        "as additional anchor rows. Honors LiDAR but tends to compress "
+        "the prediction along the camera ray when --lidar-weight is "
+        "large (LiDAR's narrow d̃ range pollutes slope). "
+        "'per-camera-lidar-offset' = M5b — slope from mask ray-OBB, "
+        "offset from LiDAR median residual. Decoupled, no compression "
+        "artefact. Recommended for the headline reconstruction. "
+        "Default 'per-camera'.",
     )
     parser.add_argument(
         "--lidar-weight", type=float, default=100.0,
