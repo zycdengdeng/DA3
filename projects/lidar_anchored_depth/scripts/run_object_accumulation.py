@@ -55,6 +55,7 @@ from lidar_anchored_depth.alignment.bbox_anchor import (
 from lidar_anchored_depth.alignment.height_anchor import (
     solve_affine_dense_lsq,
     solve_affine_dense_lsq_multi,
+    solve_affine_dense_lsq_multi_with_lidar,
 )
 from lidar_anchored_depth.data import RoadsideV2XLoader
 from lidar_anchored_depth.reconstruction import (
@@ -193,8 +194,9 @@ def accumulate_one_object(
     z_min: float,
     z_max: float,
     dense_min_pixels: int,
-    solver_mode: str = "per-camera",  # 'per-frame' | 'per-camera'
+    solver_mode: str = "per-camera",  # 'per-frame' | 'per-camera' | 'per-camera-lidar'
     z_target: str = "row-linear",      # 'row-linear' | 'ray-obb'
+    lidar_weight: float = 100.0,
 ) -> dict | None:
     """Accumulate LiDAR + AA-HAD points for one bbox.id across all frames it appears in.
 
@@ -236,15 +238,31 @@ def accumulate_one_object(
         label = obj.label
 
         # LiDAR side accumulates immediately (no solver involved).
-        in_bbox = points_in_oriented_bbox(
+        # Two independent slices of the LiDAR cloud:
+        #   in_bbox_for_gt : ground-cut applied — used for the LiDAR
+        #                    PLY and chamfer GT.
+        #   in_bbox_for_solve : NO ground cut — used as anchor rows in
+        #                       the per-camera-lidar solver. We want
+        #                       every measurement we can get for the
+        #                       solver, including wheel-contact returns.
+        in_bbox_for_gt = points_in_oriented_bbox(
             frame.lidar_world, obj,
             expand=bbox_expand,
             z_local_min_offset=ground_cut_m,
         )
-        if int(in_bbox.sum()) > 0:
-            P_world = frame.lidar_world[in_bbox]
+        if int(in_bbox_for_gt.sum()) > 0:
+            P_world = frame.lidar_world[in_bbox_for_gt]
             lidar_local.append(world_to_object_local(P_world, obj))
             n_frames_lidar += 1
+
+        in_bbox_for_solve = points_in_oriented_bbox(
+            frame.lidar_world, obj, expand=bbox_expand,
+        )
+        lidar_world_in_bbox = (
+            frame.lidar_world[in_bbox_for_solve]
+            if int(in_bbox_for_solve.sum()) > 0
+            else None
+        )
 
         # AA-HAD side: stash for solver pass 2.
         sam_masks = _load_sam_masks(sam_dir, scene_id, ts_ms, cam_id)
@@ -267,6 +285,8 @@ def accumulate_one_object(
             "obj": obj,
             "image_rgb": frame.image,
             "bbox_expand": bbox_expand,
+            "lidar_world_in_bbox": lidar_world_in_bbox,
+            "dist": frame.meta.get("distortion"),
         })
 
     # ---------------- pass 2: solve (a, b) per cam or per frame ---------
@@ -283,6 +303,20 @@ def accumulate_one_object(
             sol = solve_affine_dense_lsq_multi(
                 entries,
                 z_target=z_target,
+                min_pixels_per_frame=dense_min_pixels,
+            )
+            if sol is None:
+                continue
+            ab_by_cam[cam_id] = sol
+            for e in entries:
+                ab_by_frame[(cam_id, e["ts_ms"])] = sol
+    elif solver_mode == "per-camera-lidar":
+        # M5 — per-camera joint LSQ that anchors (a, b) to the actual
+        # in-bbox LiDAR points. Implies ray-OBB z_target on the mask side.
+        for cam_id, entries in by_cam.items():
+            sol = solve_affine_dense_lsq_multi_with_lidar(
+                entries,
+                lidar_weight=lidar_weight,
                 min_pixels_per_frame=dense_min_pixels,
             )
             if sol is None:
@@ -479,12 +513,24 @@ def main() -> int:
     )
     parser.add_argument(
         "--solver-mode", default="per-camera",
-        choices=["per-frame", "per-camera"],
-        help="how to solve (a, b). 'per-frame' = one fit per (cam, ts) "
-        "(Stage 3C, sensitive to per-frame DA3 / SAM noise). "
+        choices=["per-frame", "per-camera", "per-camera-lidar"],
+        help="how to solve (a, b). "
+        "'per-frame' = one fit per (cam, ts) (Stage 3C, sensitive to "
+        "per-frame DA3 / SAM noise). "
         "'per-camera' = stack all of one camera's frames into one LSQ "
         "→ one (a, b) per camera per object (Stage 3D-A; eliminates "
-        "frame-jitter shells). Default 'per-camera'.",
+        "frame-jitter shells). "
+        "'per-camera-lidar' = M5 — per-camera joint LSQ + LiDAR points "
+        "as additional anchor rows (forces the solved (a, b) to honor "
+        "actual LiDAR measurements at sample points; expected sub-meter "
+        "chamfer). Implies ray-OBB z_target. Default 'per-camera'.",
+    )
+    parser.add_argument(
+        "--lidar-weight", type=float, default=100.0,
+        help="when --solver-mode=per-camera-lidar: how many mask pixels "
+        "one LiDAR row counts as in the LSQ. 100 means a single LiDAR "
+        "anchor pulls (a, b) as hard as 100 mask pixels (LiDAR is "
+        "centimeter-precise; mask pixels carry ~1%% d̃ noise). Default 100.",
     )
     parser.add_argument(
         "--z-target", default="row-linear",
@@ -558,6 +604,7 @@ def main() -> int:
             dense_min_pixels=args.dense_min_pixels,
             solver_mode=args.solver_mode,
             z_target=args.z_target,
+            lidar_weight=args.lidar_weight,
         )
         if summary is None:
             print(f"  bbox {bbox_id:>4}  no usable frames")

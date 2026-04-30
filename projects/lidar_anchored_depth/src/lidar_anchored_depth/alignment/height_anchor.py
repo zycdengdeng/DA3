@@ -382,6 +382,157 @@ def solve_affine_dense_lsq_multi(
     return float(sol[0]), float(sol[1])
 
 
+def solve_affine_dense_lsq_multi_with_lidar(
+    inputs: list[dict],
+    *,
+    lidar_weight: float = 100.0,
+    min_pixels_per_frame: int = 50,
+    min_lidar_per_frame: int = 5,
+    min_total_pixels: int = 200,
+) -> tuple[float, float] | None:
+    """Joint per-camera LSQ that combines mask pixels with LiDAR anchors.
+
+    M5: stacks two row types into one big LSQ system, both expressed in
+    camera-axis depth space (so they're dimensionally compatible):
+
+      Mask row     (Path A+B):  d̃_mask · a + b = z_cam_target_OBB
+      LiDAR row    (Path C):    d̃_lidar · a + b = z_cam_lidar  (× sqrt(w))
+
+    The mask side uses the geometrically-exact ``ray_obb_z_target``
+    (Path B) to define the per-pixel target depth. The LiDAR side
+    contributes the actually-measured camera depth at the projection of
+    each in-bbox LiDAR point. Each LiDAR row is scaled by
+    ``sqrt(lidar_weight)`` so that a single LiDAR sample counts as
+    ``lidar_weight`` mask pixels in the LSQ residual sum (default 100).
+
+    Why this is better than mask-only or LiDAR-only:
+      - Mask-only (Path A+B): bbox surface is GEOMETRIC prior; per-pixel
+        d̃ noise propagates → ~0.4 m chamfer at 30-100 m range.
+      - LiDAR-only (B4 baseline): centimeter-precise but sparse — a few
+        dozen LiDAR points per object can't constrain (a, b) with
+        sub-meter precision under d̃ noise.
+      - Combined: mask provides density, LiDAR provides absolute scale.
+        Expected chamfer 0.15-0.20 m on real data.
+
+    Parameters
+    ----------
+    inputs : list of dicts. Each dict has::
+        {
+          'K': (3, 3),
+          'T_wc': (4, 4),
+          'mask': (H, W) bool,
+          'd_pred_image': (H, W) float,
+          'obj': DynamicObject,                     # for ray-OBB
+          'lidar_world_in_bbox': (M, 3) or None,    # LiDAR points already
+              # filtered to lie inside this object's 3D bbox; if None,
+              # this frame contributes only mask rows.
+          'dist': optional distortion vector,
+          'bbox_expand': optional float for ray-OBB expand,
+        }
+    lidar_weight : per-LiDAR-row weight in the LSQ residual (default 100).
+        Roughly: how many mask pixels does one LiDAR point count as.
+    min_pixels_per_frame : drop frames whose mask side yields fewer
+        usable pixels than this.
+    min_lidar_per_frame : drop frames whose LiDAR side yields fewer
+        in-mask LiDAR projections than this.
+    min_total_pixels : require this many total LSQ rows to attempt.
+
+    Returns
+    -------
+    (a, b) on success, else ``None``.
+    """
+    A_blocks: list[np.ndarray] = []
+    rhs_blocks: list[np.ndarray] = []
+    n_lidar_used = 0
+    n_mask_used = 0
+
+    weight_sqrt = float(np.sqrt(max(lidar_weight, 0.0)))
+
+    for entry in inputs:
+        # ---- Mask side: ray-OBB z_target (Path B) -----------------
+        built = _build_lsq_rows_for_one_frame(
+            K=entry["K"], T_wc=entry["T_wc"],
+            mask=entry["mask"], d_pred_image=entry["d_pred_image"],
+            Z_max=entry.get("Z_max", 0.0), Z_min=entry.get("Z_min", 0.0),
+            obj=entry["obj"],
+            bbox_expand=entry.get("bbox_expand", 0.0),
+            min_pixels=min_pixels_per_frame,
+        )
+        if built is not None:
+            A_mask, rhs_mask = built
+            A_blocks.append(A_mask)
+            rhs_blocks.append(rhs_mask)
+            n_mask_used += A_mask.shape[0]
+
+        # ---- LiDAR side: actually-measured z_cam at projected LiDAR -
+        lidar_world = entry.get("lidar_world_in_bbox")
+        if lidar_world is None or lidar_world.shape[0] < min_lidar_per_frame:
+            continue
+        if weight_sqrt <= 0.0:
+            continue
+
+        K = entry["K"]
+        T_wc = entry["T_wc"]
+        dist = entry.get("dist")
+        d_image = entry["d_pred_image"]
+        mask = entry["mask"]
+        H, W = d_image.shape
+
+        uv, z_cam_lidar, _ = world_to_image(lidar_world, K, T_wc, dist)
+        if uv.size == 0:
+            continue
+        finite = np.isfinite(uv).all(axis=1)
+        uv = uv[finite]
+        z_cam_lidar = z_cam_lidar[finite]
+        if uv.size == 0:
+            continue
+        uv_int = np.round(uv).astype(np.int64)
+        in_image = (
+            (uv_int[:, 0] >= 0) & (uv_int[:, 0] < W)
+            & (uv_int[:, 1] >= 0) & (uv_int[:, 1] < H)
+        )
+        u = uv_int[in_image, 0]
+        v = uv_int[in_image, 1]
+        z_cam_lidar = z_cam_lidar[in_image].astype(np.float64)
+        if u.size < min_lidar_per_frame:
+            continue
+        # Restrict to LiDAR points that project ONTO the SAM mask of
+        # this object, so we read d̃ at the right surface (not the
+        # background behind it).
+        on_mask = mask[v, u]
+        u = u[on_mask]
+        v = v[on_mask]
+        z_cam_lidar = z_cam_lidar[on_mask]
+        if u.size < min_lidar_per_frame:
+            continue
+        d_at = d_image[v, u].astype(np.float64)
+        valid = np.isfinite(d_at) & (d_at > 0) & np.isfinite(z_cam_lidar) & (z_cam_lidar > 0)
+        if int(valid.sum()) < min_lidar_per_frame:
+            continue
+        d_at = d_at[valid]
+        z_cam_lidar = z_cam_lidar[valid]
+
+        # LSQ rows: d̃ · a + 1 · b = z_cam_lidar, scaled by sqrt(weight).
+        A_lidar = weight_sqrt * np.stack(
+            [d_at, np.ones_like(d_at)], axis=1
+        )
+        rhs_lidar = weight_sqrt * z_cam_lidar
+        A_blocks.append(A_lidar)
+        rhs_blocks.append(rhs_lidar)
+        n_lidar_used += int(valid.sum())
+
+    if not A_blocks:
+        return None
+    A = np.vstack(A_blocks)
+    rhs = np.concatenate(rhs_blocks)
+    if A.shape[0] < min_total_pixels:
+        return None
+    sol, *_ = np.linalg.lstsq(A, rhs, rcond=None)
+    if sol.shape[0] != 2:
+        return None
+    return float(sol[0]), float(sol[1])
+
+
 # --------------------------------------------------------------------- #
 # Mask geometry helpers
 # --------------------------------------------------------------------- #
