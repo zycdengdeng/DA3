@@ -43,6 +43,8 @@ def points_in_oriented_bbox(
     obj: DynamicObject,
     *,
     expand: float = 0.0,
+    expand_xyz: tuple[float, float, float] | None = None,
+    z_local_min_offset: float = 0.0,
 ) -> np.ndarray:
     """Return a bool mask over ``points_world`` for "inside the 3D bbox".
 
@@ -50,15 +52,24 @@ def points_in_oriented_bbox(
     width / height along the bbox-local X / Y / Z), and the ZYX Euler
     triple ``(roll, pitch, yaw)``. Membership is tested by transforming
     each point into the bbox-local frame and checking each axis against
-    ``[-half_extent - expand, half_extent + expand]``.
+    its half-extent (with optional expand / shrink).
 
     Parameters
     ----------
     points_world : (N, 3) array, world frame, meters.
     obj : :class:`DynamicObject` providing the oriented bbox.
-    expand : extra slack added to every half-extent (meters); useful for
-        capturing LiDAR returns slightly outside the bbox surface (e.g.
-        annotation noise, beam divergence). Default 0.
+    expand : isotropic slack added to every half-extent (meters). Useful
+        for capturing surface returns just outside the nominal bbox
+        (annotation noise, beam divergence). Default 0.
+    expand_xyz : ``(ex, ey, ez)`` per-axis slack overriding ``expand``
+        when provided. Negative values **shrink** that axis — handy for
+        cutting away the road-surface band that V2X bbox annotations
+        often capture below a vehicle (set ``ez`` negative).
+    z_local_min_offset : extra positive bias added to the lower-Z bound
+        only. Concretely: keep points with ``z_local >= -h/2 +
+        z_local_min_offset``. ``0.10`` drops everything in the bottom
+        10 cm of the bbox, which on roadside V2X data reliably removes
+        the road-surface returns. Has no effect on the upper bound.
 
     Returns
     -------
@@ -69,12 +80,20 @@ def points_in_oriented_bbox(
     R = euler_zyx_to_R(obj.roll, obj.pitch, obj.yaw)
     centered = np.asarray(points_world, dtype=np.float64) - obj.xyz
     local = centered @ R  # equivalent to (R.T @ centered.T).T
-    half = obj.lwh / 2.0 + expand
-    return (
+
+    if expand_xyz is not None:
+        ex = np.asarray(expand_xyz, dtype=np.float64).reshape(3)
+        half = obj.lwh / 2.0 + ex
+    else:
+        half = obj.lwh / 2.0 + expand
+    inside = (
         (np.abs(local[:, 0]) <= half[0])
         & (np.abs(local[:, 1]) <= half[1])
         & (np.abs(local[:, 2]) <= half[2])
     )
+    if z_local_min_offset > 0.0:
+        inside &= local[:, 2] >= -obj.lwh[2] / 2.0 + z_local_min_offset
+    return inside
 
 
 # --------------------------------------------------------------------- #

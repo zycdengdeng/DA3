@@ -184,6 +184,56 @@ def test_points_in_oriented_bbox_expand():
     assert points_in_oriented_bbox(pts, obj, expand=0.1).tolist() == [True]
 
 
+def test_points_in_oriented_bbox_expand_xyz_per_axis():
+    """expand_xyz overrides isotropic expand; negative ez shrinks Z."""
+    obj = DynamicObject(
+        id=1, label="Car",
+        xyz=np.array([0.0, 0.0, 0.0]),
+        lwh=np.array([4.0, 2.0, 1.5]),
+        yaw=0.0,
+    )
+    # Point just past the +X edge, exactly on +Y edge, just below -Z bottom
+    pts = np.array(
+        [
+            [2.10, 0.0, 0.0],   # past +X by 0.10
+            [0.0, 1.05, 0.0],   # past +Y by 0.05
+            [0.0, 0.0, -0.80],  # past -Z by 0.05 (h/2 = 0.75)
+        ],
+        dtype=np.float64,
+    )
+    # Asymmetric: expand X by 0.15, Y by 0.10, shrink Z by 0.10
+    out = points_in_oriented_bbox(
+        pts, obj, expand_xyz=(0.15, 0.10, -0.10),
+    )
+    assert out.tolist() == [True, True, False]
+
+
+def test_points_in_oriented_bbox_z_local_min_offset_drops_ground():
+    """z_local_min_offset cuts the bottom band of the bbox."""
+    obj = DynamicObject(
+        id=1, label="Car",
+        xyz=np.array([0.0, 0.0, 0.0]),
+        lwh=np.array([4.0, 2.0, 1.5]),  # h/2 = 0.75
+        yaw=0.0,
+    )
+    pts = np.array(
+        [
+            [0.0, 0.0, 0.7],   # near top — kept
+            [0.0, 0.0, -0.5],  # mid — kept
+            [0.0, 0.0, -0.70], # bottom 5cm of bbox — DROPPED with offset 0.10
+            [0.0, 0.0, -0.74], # very bottom — DROPPED
+        ],
+        dtype=np.float64,
+    )
+    # Without offset: all in bbox
+    assert points_in_oriented_bbox(pts, obj).tolist() == [True, True, True, True]
+    # With 0.10m ground cut: cut at z >= -0.75 + 0.10 = -0.65, so only
+    # the two bottom-most points are dropped.
+    assert points_in_oriented_bbox(
+        pts, obj, z_local_min_offset=0.10
+    ).tolist() == [True, True, False, False]
+
+
 def test_points_in_oriented_bbox_empty():
     obj = DynamicObject(
         id=1, label="Car",

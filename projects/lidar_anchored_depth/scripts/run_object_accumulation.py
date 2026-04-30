@@ -65,6 +65,37 @@ from lidar_anchored_depth.reconstruction import (
 )
 
 
+def _colorize_by_z(points: np.ndarray, base_color: tuple[int, int, int] | None = None) -> np.ndarray:
+    """Color a (N, 3) cloud by its Z coordinate (jet-like ramp).
+
+    If ``base_color`` is given, paint uniformly with that color instead.
+    Useful for the LiDAR PLY so it's visually distinguishable from the
+    AA-HAD prediction in viewers that don't differentiate by file.
+    """
+    n = points.shape[0]
+    if n == 0:
+        return np.zeros((0, 3), dtype=np.uint8)
+    if base_color is not None:
+        out = np.empty((n, 3), dtype=np.uint8)
+        out[:] = np.asarray(base_color, dtype=np.uint8).reshape(1, 3)
+        return out
+    z = points[:, 2].astype(np.float64)
+    z_lo, z_hi = float(np.percentile(z, 5)), float(np.percentile(z, 95))
+    if z_hi - z_lo < 1e-6:
+        z_hi = z_lo + 1.0
+    t = np.clip((z - z_lo) / (z_hi - z_lo), 0.0, 1.0)
+    # Jet-like ramp: blue → cyan → green → yellow → red
+    r = np.clip(1.5 - np.abs(4 * t - 3), 0.0, 1.0)
+    g = np.clip(1.5 - np.abs(4 * t - 2), 0.0, 1.0)
+    b = np.clip(1.5 - np.abs(4 * t - 1), 0.0, 1.0)
+    return np.stack(
+        [(r * 255).astype(np.uint8),
+         (g * 255).astype(np.uint8),
+         (b * 255).astype(np.uint8)],
+        axis=1,
+    )
+
+
 # --------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------- #
@@ -155,6 +186,8 @@ def accumulate_one_object(
     d_paths_index: dict[tuple[str, int, str], Path],
     sam_dir: Path | None,
     bbox_expand: float,
+    bbox_clip_expand: float,
+    ground_cut_m: float,
     voxel_size: float,
     z_min: float,
     z_max: float,
@@ -192,9 +225,13 @@ def accumulate_one_object(
             continue
         label = obj.label
 
-        # --- 1. LiDAR points inside oriented bbox → object-local frame
+        # --- 1. LiDAR points inside oriented bbox → object-local frame.
+        #     Drop the bottom ``ground_cut_m`` band (V2X bboxes typically
+        #     wrap a thin road-surface layer beneath the vehicle).
         in_bbox = points_in_oriented_bbox(
-            frame.lidar_world, obj, expand=bbox_expand
+            frame.lidar_world, obj,
+            expand=bbox_expand,
+            z_local_min_offset=ground_cut_m,
         )
         if int(in_bbox.sum()) > 0:
             P_world = frame.lidar_world[in_bbox]
@@ -234,7 +271,36 @@ def accumulate_one_object(
         )
         if P_world_pred.shape[0] == 0:
             continue
+
+        # Clip AA-HAD predicted points to lie inside the V2X 3D bbox
+        # (with the same expand we use for LiDAR). This fixes two
+        # structural issues at once:
+        #  (1) SAM mask leakage into background (sky / trees / road) →
+        #      those pixels' z = a·d̃ + b lands far outside the bbox
+        #      and gets clipped here.
+        #  (2) Dense-LSQ "elongation" along the camera ray for non-wall
+        #      objects (buses / trucks viewed at an angle): the LSQ
+        #      solver's "Z varies only with image row" assumption fails
+        #      for 3D objects, producing predicted points that drift
+        #      outside the bbox volume along the camera ray. Clipping
+        #      forces the prediction back to the actual object volume.
+        keep_in_bbox = points_in_oriented_bbox(
+            P_world_pred, obj, expand=bbox_clip_expand,
+        )
+        if not keep_in_bbox.any():
+            continue
+        P_world_pred = P_world_pred[keep_in_bbox]
+        colors = colors[keep_in_bbox]
+
         P_local_pred = world_to_object_local(P_world_pred, obj)
+        # Same ground cut as the LiDAR side: drop predicted points
+        # whose object-local Z falls in the bottom ground band.
+        if ground_cut_m > 0.0:
+            keep = P_local_pred[:, 2] >= -obj.lwh[2] / 2.0 + ground_cut_m
+            if not keep.any():
+                continue
+            P_local_pred = P_local_pred[keep]
+            colors = colors[keep]
         aa_had_local.append(P_local_pred)
         aa_had_colors.append(colors)
         n_frames_aa_had += 1
@@ -331,6 +397,28 @@ def main() -> int:
         help="expand bbox half-extents by this many meters when picking "
         "LiDAR points inside the bbox",
     )
+    parser.add_argument(
+        "--ground-cut-m", type=float, default=0.10,
+        help="drop the bottom this-many meters of the bbox volume from "
+        "BOTH the LiDAR and AA-HAD clouds. V2X bbox annotations usually "
+        "wrap a thin road-surface band beneath the vehicle; cutting it "
+        "out yields cleaner per-object reconstruction. Default 0.10 m.",
+    )
+    parser.add_argument(
+        "--lidar-color", default="height",
+        choices=["height", "red", "white", "none"],
+        help="how to color the LiDAR PLY (which has no native RGB): "
+        "'height' = jet by Z, 'red' = uniform red, 'white' = uniform "
+        "white, 'none' = XYZ-only (default 'height')",
+    )
+    parser.add_argument(
+        "--bbox-clip-expand", type=float, default=0.30,
+        help="meters of slack when clipping AA-HAD predicted points to "
+        "lie inside the V2X 3D bbox. Removes (a) SAM-mask leakage to "
+        "background and (b) dense-LSQ elongation along the camera ray. "
+        "Default 0.30 m — tighten to 0.10 for cleaner volumes, or set "
+        "to a very large number (e.g. 1000) to effectively disable.",
+    )
     parser.add_argument("--z-min", type=float, default=0.5)
     parser.add_argument("--z-max", type=float, default=250.0)
     parser.add_argument("--dense-min-pixels", type=int, default=50)
@@ -396,6 +484,8 @@ def main() -> int:
             cams=args.cams,
             d_paths_index=d_paths_index, sam_dir=sam_dir,
             bbox_expand=args.bbox_expand,
+            bbox_clip_expand=args.bbox_clip_expand,
+            ground_cut_m=args.ground_cut_m,
             voxel_size=args.voxel_size,
             z_min=args.z_min, z_max=args.z_max,
             dense_min_pixels=args.dense_min_pixels,
@@ -409,9 +499,20 @@ def main() -> int:
         A_pts = summary.pop("aa_had_local_points")
         A_col = summary.pop("aa_had_local_colors")
         if L_pts.shape[0] > 0:
+            lidar_colors: np.ndarray | None
+            if args.lidar_color == "none":
+                lidar_colors = None
+            elif args.lidar_color == "height":
+                lidar_colors = _colorize_by_z(L_pts)
+            elif args.lidar_color == "red":
+                lidar_colors = _colorize_by_z(L_pts, base_color=(220, 30, 30))
+            elif args.lidar_color == "white":
+                lidar_colors = _colorize_by_z(L_pts, base_color=(240, 240, 240))
+            else:
+                lidar_colors = None
             write_ply_xyz(
                 out_dir / f"{scene_id}_obj{bbox_id}_lidar.ply",
-                L_pts, binary=args.ply_binary,
+                L_pts, lidar_colors, binary=args.ply_binary,
             )
         if A_pts.shape[0] > 0:
             write_ply_xyz(
