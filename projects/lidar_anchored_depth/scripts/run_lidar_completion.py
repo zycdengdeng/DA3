@@ -135,6 +135,59 @@ from lidar_anchored_depth.reconstruction import (  # noqa: E402
 )
 
 
+def _dump_anchor_images(
+    loader: RoadsideV2XLoader,
+    scene_id: str,
+    ts_ms: int,
+    cams: list[str],
+    out_dir: Path,
+) -> list[Path]:
+    """Save the camera RGB images at the anchor ts so the user can
+    visually compare the reconstructed PLY against the ground truth.
+
+    Files are written as ``<scene>_anchor_ts<ts>_cam<cam>.jpg``.
+    """
+    try:
+        from PIL import Image
+    except ModuleNotFoundError:
+        print("  [anchor-img] Pillow not installed; skipping image dump")
+        return []
+    saved: list[Path] = []
+    for cam_id in cams:
+        try:
+            idx = loader.find_frame_idx(scene_id, ts_ms, cam_id)
+        except ValueError:
+            print(f"  [anchor-img] cam{cam_id}: no frame at ts={ts_ms}")
+            continue
+        frame = loader.get_frame(idx)
+        img = frame.image
+        if img is None or img.ndim != 3 or img.shape[2] != 3:
+            continue
+        if img.dtype != np.uint8:
+            if img.max() <= 1.0:
+                img = (img * 255).clip(0, 255).astype(np.uint8)
+            else:
+                img = img.clip(0, 255).astype(np.uint8)
+        out_path = out_dir / f"{scene_id}_anchor_ts{ts_ms}_cam{cam_id}.jpg"
+        Image.fromarray(img).save(out_path, quality=92)
+        saved.append(out_path)
+        print(f"  [anchor-img] cam{cam_id} -> {out_path.name}")
+    return saved
+
+
+def _build_source_debug_rgb(
+    n_lidar: int,
+    n_aahad: int,
+) -> np.ndarray:
+    """Build a (N, 3) uint8 RGB array with LiDAR=grey, AA-HAD=red so
+    a debug PLY can show at-a-glance which voxels were filled by DA3
+    rather than LiDAR."""
+    rgb = np.empty((n_lidar + n_aahad, 3), dtype=np.uint8)
+    rgb[:n_lidar] = (180, 180, 180)
+    rgb[n_lidar:] = (255, 50, 50)
+    return rgb
+
+
 def _build_camera_views(
     loader: RoadsideV2XLoader, scene_id: str, cams: list[str],
 ) -> dict[str, CameraView]:
@@ -349,6 +402,27 @@ def main() -> int:
         "ProcessPoolExecutor; each worker re-scans V2X once. Per-"
         "camera work is independent so results are bit-exact.",
     )
+    parser.add_argument(
+        "--dump-anchor-images", action="store_true", default=True,
+        help="when --object-anchor-ts-ms is set, also save the 4 "
+        "camera RGB images at that ts (as JPGs) so the user can "
+        "compare the reconstructed PLY with the actual scene. Default ON.",
+    )
+    parser.add_argument(
+        "--no-dump-anchor-images", action="store_false",
+        dest="dump_anchor_images",
+    )
+    parser.add_argument(
+        "--write-source-debug", action="store_true", default=True,
+        help="write <scene>_completion_source_debug.ply with LiDAR "
+        "coloured grey and AA-HAD fill coloured red, so the user can "
+        "see at-a-glance which regions are LiDAR-derived vs "
+        "DA3-derived. Default ON.",
+    )
+    parser.add_argument(
+        "--no-write-source-debug", action="store_false",
+        dest="write_source_debug",
+    )
     args = parser.parse_args()
 
     out_dir = Path(args.output)
@@ -379,6 +453,16 @@ def main() -> int:
         loader.scene_filter = [args.scene]
     scene_id = _resolve_scene_id(loader, args.scene)
     print(f"[scene] {scene_id}")
+
+    # Dump anchor-ts ground-truth camera images (pre-reconstruction) so
+    # the user can compare the resulting PLY against the actual scene.
+    if args.object_anchor_ts_ms is not None and args.dump_anchor_images:
+        print()
+        print(f"[anchor-img] dumping cam images at ts={args.object_anchor_ts_ms}")
+        _dump_anchor_images(
+            loader, scene_id, int(args.object_anchor_ts_ms),
+            args.cams, out_dir,
+        )
     print()
 
     d_paths_index_str = {k: str(v) for k, v in d_paths_index.items()}
@@ -639,6 +723,25 @@ def main() -> int:
         out_dir / f"{scene_id}_completion.ply",
         fused_v_xyz, fused_v_rgb, binary=args.ply_binary,
     )
+
+    # Source-debug PLY: LiDAR = grey, AA-HAD fill = red. Each voxel's
+    # colour is the mean of its members, so a voxel with both LiDAR
+    # and AA-HAD lands somewhere between (visible as pink). Lets the
+    # user check whether the centre of the intersection is filled by
+    # LiDAR or by DA3.
+    if args.write_source_debug:
+        debug_rgb = _build_source_debug_rgb(n_lidar_fused, n_aahad_fused)
+        debug_v_xyz, debug_v_rgb = voxel_downsample(
+            fused_xyz, args.voxel_size, colors=debug_rgb,
+        )
+        write_ply_xyz(
+            out_dir / f"{scene_id}_completion_source_debug.ply",
+            debug_v_xyz, debug_v_rgb, binary=args.ply_binary,
+        )
+        print(
+            f"  ↳ source-debug PLY written "
+            f"(grey=LiDAR, red=AA-HAD, pink=mixed)"
+        )
 
     # ---- 7. per-object snapshot injection (optional) ------------------
     inj_log: list[dict] = []
