@@ -395,6 +395,22 @@ def main() -> int:
     )
     parser.add_argument("--sigma-device", default="cpu")
     parser.add_argument(
+        "--residual-checkpoint", default=None,
+        help="optional .pt produced by scripts/train_residual_completion.py. "
+        "When set, the AA-HAD initial depth is REFINED by the trained "
+        "rectified-flow residual U-Net before LiDAR-priority fusion. "
+        "Forces serial unproject (the U-Net runs once per (cam, ts) "
+        "and the model + frame state are not picklable).",
+    )
+    parser.add_argument(
+        "--residual-device", default="cuda",
+        help="device for the residual U-Net (default cuda).",
+    )
+    parser.add_argument(
+        "--residual-steps", type=int, default=4,
+        help="Euler steps for rectified-flow residual sampling (default 4).",
+    )
+    parser.add_argument(
         "--workers", type=int, default=0,
         help="number of worker processes for the per-camera "
         "calibration + unproject loops (steps 1, 1b, 2). 0 = serial "
@@ -586,18 +602,56 @@ def main() -> int:
 
         sigma_predictor = SigmaPredictor(args.sigma_checkpoint, device=args.sigma_device)
 
+    residual_refiner = None
+    if args.residual_checkpoint:
+        from lidar_anchored_depth.models import ResidualPredictor
+        from lidar_anchored_depth.models.residual_predictor import (
+            _build_sparse_lidar_map,
+        )
+
+        _residual_pred = ResidualPredictor(
+            args.residual_checkpoint,
+            device=args.residual_device,
+            n_steps=args.residual_steps,
+        )
+        print(
+            f"[residual] loaded {args.residual_checkpoint} on "
+            f"{_residual_pred.device}  steps={_residual_pred.n_steps}"
+        )
+
+        def residual_refiner(frame, d_image, z_aahad):
+            sparse_z, sparse_mask = _build_sparse_lidar_map(
+                frame.lidar_world,
+                frame.dynamic_objects,
+                frame.K, frame.T_wc, frame.meta.get("distortion"),
+                image_hw=frame.image.shape[:2],
+                bbox_expand=args.bbox_expand,
+                z_min=args.z_min, z_max=args.z_max,
+            )
+            return _residual_pred.refine_depth_image(
+                rgb=frame.image,
+                d_image=d_image,
+                z_aahad=z_aahad,
+                sparse_z=sparse_z,
+                sparse_mask=sparse_mask,
+            )
+
     print()
     print(f"[2/6] AA-HAD unproject  stride={args.aahad_pixel_stride}")
     aahad_pts: list[np.ndarray] = []
     aahad_rgb: list[np.ndarray] = []
     aahad_sig: list[np.ndarray] = []
 
-    # Sigma predictor cannot be cleanly pickled across processes (its
-    # torch model carries device + autograd state). When a sigma
-    # checkpoint is provided AND --workers > 0, fall back to serial
+    # Sigma + residual predictors cannot be cleanly pickled across
+    # processes (their torch models carry device + autograd state).
+    # When either is provided AND --workers > 0, fall back to serial
     # for the unproject step. Calibration steps above can still run
-    # parallel because they don't use sigma.
-    can_parallel_unproject = (pool is not None) and (sigma_predictor is None)
+    # parallel because they don't use sigma / residual.
+    can_parallel_unproject = (
+        pool is not None
+        and sigma_predictor is None
+        and residual_refiner is None
+    )
     base_unproject_kwargs = dict(
         pixel_stride=args.aahad_pixel_stride,
         z_min=args.z_min, z_max=args.z_max,
@@ -636,6 +690,7 @@ def main() -> int:
                 d_paths_index, sam_dir,
                 sigma_predictor=sigma_predictor,
                 grid_calib=grid_calib_by_cam.get(cam_id),
+                z_image_refiner=residual_refiner,
                 **base_unproject_kwargs,
             )
             print(f"  cam{cam_id}  N={pts.shape[0]:>7}  ({time.time() - t0:.1f}s)")

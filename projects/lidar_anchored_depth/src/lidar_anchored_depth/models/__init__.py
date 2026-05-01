@@ -7,6 +7,16 @@ pairs from static regions, whose predicted ``sigma`` is then used to
 inverse-variance-weight the per-camera votes that fall in each voxel.
 """
 
+from lidar_anchored_depth.models.flow_matching import (
+    FlowMatchingBatch,
+    RectifiedFlowMatcher,
+    masked_cfm_loss,
+)
+from lidar_anchored_depth.models.residual_predictor import ResidualPredictor
+from lidar_anchored_depth.models.residual_unet import (
+    COND_CHANNELS,
+    ResidualVelocityUNet,
+)
 from lidar_anchored_depth.models.sigma_head import (
     SIGMA_HEAD_FEATURE_DIM,
     SigmaHead,
@@ -17,10 +27,16 @@ from lidar_anchored_depth.models.sigma_head import (
 )
 
 __all__ = [
+    "COND_CHANNELS",
+    "FlowMatchingBatch",
+    "RectifiedFlowMatcher",
+    "ResidualPredictor",
+    "ResidualVelocityUNet",
     "SIGMA_HEAD_FEATURE_DIM",
     "SigmaHead",
     "SigmaPredictor",
     "features_for_pixels",
     "gaussian_nll_loss",
+    "masked_cfm_loss",
     "sigma_weighted_voxel",
 ]

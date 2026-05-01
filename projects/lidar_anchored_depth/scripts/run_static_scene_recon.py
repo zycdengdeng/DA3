@@ -282,6 +282,7 @@ def _unproject_static_branch(
     sam_dilate_px: int = 0,
     require_v2x_frames: bool = True,
     grid_calib: GridStaticCalib | None = None,
+    z_image_refiner=None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
     """Apply (a, b) to every (camera, ts) frame; unproject the STATIC
     portion (image \\ dynamic SAM mask) to world.
@@ -314,6 +315,8 @@ def _unproject_static_branch(
             z_cam = grid_calib.apply(d_image).astype(np.float32)
         else:
             z_cam = (a * d_image + b).astype(np.float32)
+        if z_image_refiner is not None:
+            z_cam = z_image_refiner(frame, d_image, z_cam).astype(np.float32)
         # Static mask = whole image \ dynamic SAM mask, with stride decimation
         dyn = load_sam_dynamic_mask(
             sam_dir, scene_id, ts_ms, cam_id, (H, W),
