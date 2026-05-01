@@ -140,7 +140,24 @@ def test_priority_fill_empty_aahad_returns_lidar_only():
     )
     assert xyz.shape == (2, 3)
     assert (src == 0).all()
-    assert rgb is None
+    # LiDAR is now always coloured (default light grey) even when
+    # aahad_rgb is None — fixes the "yellow LiDAR-only objects" bug.
+    assert rgb is not None
+    assert tuple(rgb[0]) == (180, 180, 180)
+
+
+def test_priority_fill_lidar_grey_when_aahad_has_no_colors():
+    """When AA-HAD points exist but aahad_rgb is None, LiDAR should
+    still be grey (not inherit any fallback)."""
+    lidar = np.array([[0.0, 0.0, 0.0]])
+    aahad = np.array([[5.0, 5.0, 5.0]])
+    xyz, rgb, src = lidar_priority_fill(
+        lidar, aahad, None, voxel_size=0.05,
+    )
+    assert rgb is not None
+    # LiDAR row stays grey 180, AA-HAD row gets fallback 220 220 100
+    assert tuple(rgb[0]) == (180, 180, 180)
+    assert tuple(rgb[1]) == (220, 220, 100)
 
 
 def test_priority_fill_rejects_bad_inputs():
