@@ -5,6 +5,7 @@ from __future__ import annotations
 import numpy as np
 
 from lidar_anchored_depth.pipeline.object_snapshot import (
+    _pick_object_ts,
     discover_object_clouds,
 )
 from lidar_anchored_depth.reconstruction.io import write_ply_xyz

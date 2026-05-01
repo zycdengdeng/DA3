@@ -118,12 +118,14 @@ def _pick_object_ts(
     cam_for_discovery: str,
     *,
     anchor_ts_ms: int | None = None,
+    strict_anchor: bool = False,
 ) -> tuple[int, DynamicObject] | None:
     """Pick a representative timestamp for an object.
 
     Strategy: prefer the user-specified ``anchor_ts_ms`` if the object
-    is annotated there; otherwise pick the median ts over all the
-    ts-instances of that ``obj_id``.
+    is annotated there. If ``strict_anchor`` is ``True`` and the
+    anchor ts is not annotated for this object, return ``None`` (drop
+    the object). Otherwise fall back to the median ts.
     """
     scene = next((s for s in loader.scenes if s.scene_id == scene_id), None)
     if scene is None:
@@ -145,6 +147,8 @@ def _pick_object_ts(
         for t, obj in matches:
             if t == int(anchor_ts_ms):
                 return t, obj
+        if strict_anchor:
+            return None
     matches.sort(key=lambda p: p[0])
     return matches[len(matches) // 2]
 
@@ -156,6 +160,7 @@ def inject_object_snapshots(
     *,
     cam_for_discovery: str = "0",
     anchor_ts_ms: int | None = None,
+    strict_anchor: bool = False,
     use_lidar: bool = False,
     fallback_color: tuple[int, int, int] = (220, 220, 100),
 ) -> tuple[np.ndarray, np.ndarray, list[dict]]:
@@ -168,7 +173,12 @@ def inject_object_snapshots(
         (annotations are camera-independent, so any camera works as
         long as it is sampled).
     anchor_ts_ms : optional global anchor; objects annotated at this
-        ts are placed at that pose, others fall back to their median ts.
+        ts are placed at that pose, others fall back to their median ts
+        (or are dropped if ``strict_anchor=True``).
+    strict_anchor : if ``True`` AND ``anchor_ts_ms`` is set, drop any
+        object that is not annotated at the anchor ts. Yields a
+        single-frame snapshot of the intersection (no temporal smear)
+        at the cost of fewer visible objects.
     use_lidar : if ``True``, also place the per-object LiDAR cloud
         alongside the AA-HAD cloud (in case the per-object LiDAR is
         denser than the static-branch dynamic LiDAR).
@@ -189,10 +199,16 @@ def inject_object_snapshots(
         pick = _pick_object_ts(
             loader, scene_id, obj_id, cam_for_discovery,
             anchor_ts_ms=anchor_ts_ms,
+            strict_anchor=strict_anchor,
         )
         if pick is None:
+            reason = (
+                "not_at_anchor_ts"
+                if strict_anchor and anchor_ts_ms is not None
+                else "no_v2x_match"
+            )
             log.append({"obj_id": obj_id, "ts_ms": None, "n_pts": 0,
-                        "source": "no_v2x_match"})
+                        "source": reason})
             continue
         ts_ms, obj = pick
 

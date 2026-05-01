@@ -101,6 +101,7 @@ def lidar_priority_fill(
     voxel_size: float,
     *,
     max_dist_to_lidar: float | None = None,
+    lidar_color: tuple[int, int, int] = (180, 180, 180),
 ) -> tuple[np.ndarray, np.ndarray | None, np.ndarray]:
     """Build the depth-completion fusion: LiDAR backbone + AA-HAD fill
     in LiDAR-empty voxels.
@@ -121,10 +122,13 @@ def lidar_priority_fill(
     lidar_xyz : (N_l, 3) world XYZ.
     aahad_xyz : (N_a, 3) world XYZ.
     aahad_rgb : optional (N_a, 3) uint8 RGB; LiDAR has no native RGB
-        and is reported with ``(0, 0, 0)`` in the combined RGB array.
+        and is reported with ``lidar_color`` in the combined RGB array.
     voxel_size : metres.
     max_dist_to_lidar : optional metres; if set, drop AA-HAD points
         whose nearest LiDAR neighbour is farther than this.
+    lidar_color : ``(R, G, B)`` uint8 for LiDAR points (default light
+        grey ``(180, 180, 180)``); previously ``(0, 0, 0)`` made the
+        cloud disappear in dark CloudCompare backgrounds.
 
     Returns
     -------
@@ -139,6 +143,8 @@ def lidar_priority_fill(
     if voxel_size <= 0:
         raise ValueError("voxel_size must be positive")
 
+    lidar_color_arr = np.asarray(lidar_color, dtype=np.uint8).reshape(1, 3)
+
     if lidar_xyz.size == 0:
         # Pure AA-HAD fallback.
         kept_xyz = aahad_xyz.astype(np.float32)
@@ -149,7 +155,7 @@ def lidar_priority_fill(
     if aahad_xyz.size == 0:
         kept_xyz = lidar_xyz.astype(np.float32)
         kept_rgb = (
-            np.zeros((lidar_xyz.shape[0], 3), dtype=np.uint8)
+            np.broadcast_to(lidar_color_arr, (lidar_xyz.shape[0], 3)).astype(np.uint8).copy()
             if aahad_rgb is not None else None
         )
         src = np.zeros(kept_xyz.shape[0], dtype=np.uint8)
@@ -182,7 +188,9 @@ def lidar_priority_fill(
 
     xyz = np.concatenate([lidar_xyz, aahad_kept_xyz], axis=0).astype(np.float32)
     if aahad_rgb is not None:
-        lidar_rgb = np.zeros((lidar_xyz.shape[0], 3), dtype=np.uint8)
+        lidar_rgb = np.broadcast_to(
+            lidar_color_arr, (lidar_xyz.shape[0], 3),
+        ).astype(np.uint8).copy()
         rgb = np.concatenate([lidar_rgb, aahad_kept_rgb], axis=0).astype(np.uint8)
     else:
         rgb = None

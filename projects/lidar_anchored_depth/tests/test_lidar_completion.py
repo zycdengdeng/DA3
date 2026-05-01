@@ -87,6 +87,27 @@ def test_priority_fill_keeps_lidar_in_output():
     assert src[10] == 1
 
 
+def test_priority_fill_lidar_color_default_is_light_grey():
+    lidar = np.array([[0.0, 0.0, 0.0]])
+    aahad = np.array([[5.0, 5.0, 5.0]])
+    aahad_rgb = np.array([[10, 20, 30]], dtype=np.uint8)
+    xyz, rgb, src = lidar_priority_fill(lidar, aahad, aahad_rgb, voxel_size=0.05)
+    # First row is LiDAR -> default grey 180
+    assert tuple(rgb[0]) == (180, 180, 180)
+    assert tuple(rgb[1]) == (10, 20, 30)
+
+
+def test_priority_fill_lidar_color_custom():
+    lidar = np.array([[0.0, 0.0, 0.0]])
+    aahad = np.array([[5.0, 5.0, 5.0]])
+    aahad_rgb = np.array([[10, 20, 30]], dtype=np.uint8)
+    xyz, rgb, src = lidar_priority_fill(
+        lidar, aahad, aahad_rgb, voxel_size=0.05,
+        lidar_color=(240, 240, 240),
+    )
+    assert tuple(rgb[0]) == (240, 240, 240)
+
+
 def test_priority_fill_max_dist_filter_drops_far_aahad():
     lidar = np.array([[0.0, 0.0, 0.0]])
     aahad = np.array([

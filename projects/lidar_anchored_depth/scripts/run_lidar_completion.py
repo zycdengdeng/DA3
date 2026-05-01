@@ -191,9 +191,32 @@ def main() -> int:
         "object annotated at that ts (otherwise per-object median ts).",
     )
     parser.add_argument(
+        "--strict-anchor", action="store_true",
+        help="when --object-anchor-ts-ms is set, DROP objects not "
+        "annotated at that ts instead of falling back to their median "
+        "ts. Yields a clean single-frame snapshot of the intersection "
+        "(no temporal smear) at the cost of showing fewer objects.",
+    )
+    parser.add_argument(
         "--include-object-lidar", action="store_true",
         help="also place each per-object LiDAR cloud (in addition to "
         "AA-HAD) at the snapshot pose. Default off.",
+    )
+    parser.add_argument(
+        "--dynamic-voxel-size", type=float, default=0.0,
+        help="if > 0, voxel-merge the per-object snapshot cloud at "
+        "this size BEFORE concatenating it with the static fusion. "
+        "Useful for collapsing the residual per-camera shells inside "
+        "each object (per-object chamfer ~0.27-0.38 m, smaller than "
+        "this voxel hides shells without losing object position). "
+        "Default 0 = no extra merge (use --voxel-size).",
+    )
+    parser.add_argument(
+        "--lidar-color", type=int, nargs=3, default=[180, 180, 180],
+        metavar=("R", "G", "B"),
+        help="RGB used for LiDAR points in the fused PLY (default "
+        "light grey 180 180 180; was previously black which "
+        "disappeared in dark CloudCompare backgrounds).",
     )
 
     parser.add_argument(
@@ -364,6 +387,7 @@ def main() -> int:
         lidar_static, aahad_xyz, aahad_rgb_arr,
         voxel_size=args.voxel_size,
         max_dist_to_lidar=args.max_dist_to_lidar,
+        lidar_color=tuple(args.lidar_color),
     )
     n_lidar_fused = int((source == 0).sum())
     n_aahad_fused = int((source == 1).sum())
@@ -398,10 +422,23 @@ def main() -> int:
             loader, scene_id, clouds,
             cam_for_discovery=args.cams[0],
             anchor_ts_ms=args.object_anchor_ts_ms,
+            strict_anchor=args.strict_anchor,
             use_lidar=args.include_object_lidar,
         )
         n_dyn_total = int(dyn_xyz.shape[0])
-        print(f"  injected {n_dyn_total} dynamic points across {len(inj_log)} objects")
+        n_kept = sum(1 for r in inj_log if r["n_pts"] > 0)
+        print(f"  injected {n_dyn_total} dynamic points across {n_kept}/{len(inj_log)} objects")
+
+        if args.dynamic_voxel_size > 0 and dyn_xyz.shape[0] > 0:
+            dyn_xyz_v, dyn_rgb_v = voxel_downsample(
+                dyn_xyz, args.dynamic_voxel_size, colors=dyn_rgb,
+            )
+            print(
+                f"  dynamic voxel-merge @ {args.dynamic_voxel_size}m: "
+                f"{dyn_xyz.shape[0]} -> {dyn_xyz_v.shape[0]} pts"
+            )
+            dyn_xyz = dyn_xyz_v.astype(np.float32)
+            dyn_rgb = dyn_rgb_v.astype(np.uint8) if dyn_rgb_v is not None else dyn_rgb
 
         full_xyz = np.concatenate([fused_xyz, dyn_xyz], axis=0)
         full_rgb = np.concatenate([fused_rgb, dyn_rgb], axis=0) if fused_rgb is not None else None
