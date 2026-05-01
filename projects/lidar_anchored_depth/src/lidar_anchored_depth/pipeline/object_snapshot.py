@@ -33,8 +33,81 @@ import numpy as np
 
 from lidar_anchored_depth.data.base import DynamicObject
 from lidar_anchored_depth.data.roadside_v2x import RoadsideV2XLoader
+from lidar_anchored_depth.pipeline.lidar_completion import lidar_priority_fill
 from lidar_anchored_depth.reconstruction.io import read_ply_xyz, read_ply_xyz_rgb
 from lidar_anchored_depth.reconstruction.object_local import object_local_to_world
+
+
+# Vehicle classes whose left-right symmetry across the object-local
+# y-axis (= bbox lateral axis) holds well enough that mirroring the
+# observed half across the symmetry plane is a sound geometric prior.
+_DEFAULT_MIRROR_CLASSES = frozenset({"Car", "Suv", "Bus", "Truck"})
+
+
+def _mirror_object_local(points: np.ndarray, axis: str) -> np.ndarray:
+    """Reflect ``points`` across the given axis in object-local frame."""
+    if points.size == 0:
+        return points
+    out = points.copy()
+    idx = {"x": 0, "y": 1, "z": 2}[axis]
+    out[:, idx] *= -1.0
+    return out
+
+
+def fuse_object_clouds(
+    aa_had_local: np.ndarray | None,
+    aa_had_colors: np.ndarray | None,
+    lidar_local: np.ndarray | None,
+    *,
+    voxel_size: float = 0.05,
+    max_dist_to_lidar: float | None = 0.5,
+    mirror_axis: str | None = None,
+    object_lidar_color: tuple[int, int, int] = (160, 160, 160),
+) -> tuple[np.ndarray, np.ndarray | None, np.ndarray]:
+    """Combine per-object LiDAR (primary) and AA-HAD (fill) in
+    object-local frame, with optional left-right symmetry mirror.
+
+    Steps
+    -----
+    1. Optionally mirror both LiDAR and AA-HAD across ``mirror_axis``
+       (concatenated to the originals, doubling coverage on the
+       unobserved side).
+    2. Run :func:`lidar_priority_fill` on the (possibly mirrored)
+       clouds: LiDAR voxels win, AA-HAD only fills empty voxels,
+       AA-HAD points farther than ``max_dist_to_lidar`` from any
+       LiDAR neighbour are dropped (sanity).
+
+    Returns ``(xyz, rgb, source)`` where source ``0`` = LiDAR,
+    ``1`` = AA-HAD, all in object-local frame.
+    """
+    aa_xyz = (
+        aa_had_local.astype(np.float64) if aa_had_local is not None and aa_had_local.size else
+        np.zeros((0, 3), dtype=np.float64)
+    )
+    aa_rgb = (
+        aa_had_colors.astype(np.uint8) if aa_had_colors is not None and aa_had_colors.size else
+        None
+    )
+    lid_xyz = (
+        lidar_local.astype(np.float64) if lidar_local is not None and lidar_local.size else
+        np.zeros((0, 3), dtype=np.float64)
+    )
+
+    if mirror_axis is not None:
+        if aa_xyz.shape[0] > 0:
+            aa_xyz = np.concatenate([aa_xyz, _mirror_object_local(aa_xyz, mirror_axis)], axis=0)
+            if aa_rgb is not None:
+                aa_rgb = np.concatenate([aa_rgb, aa_rgb], axis=0)
+        if lid_xyz.shape[0] > 0:
+            lid_xyz = np.concatenate([lid_xyz, _mirror_object_local(lid_xyz, mirror_axis)], axis=0)
+
+    xyz, rgb, source = lidar_priority_fill(
+        lid_xyz, aa_xyz, aa_rgb,
+        voxel_size=voxel_size,
+        max_dist_to_lidar=max_dist_to_lidar,
+        lidar_color=object_lidar_color,
+    )
+    return xyz, rgb, source
 
 
 _OBJ_PATTERN = re.compile(
@@ -163,6 +236,12 @@ def inject_object_snapshots(
     strict_anchor: bool = False,
     use_lidar: bool = False,
     fallback_color: tuple[int, int, int] = (220, 220, 100),
+    object_fusion: str = "lidar-priority",
+    object_voxel_size: float = 0.05,
+    object_max_dist_to_lidar: float | None = 0.5,
+    mirror_axis: str | None = None,
+    mirror_classes: frozenset[str] | None = None,
+    static_obj_ids: set[int] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, list[dict]]:
     """Place per-object clouds at their representative ts pose.
 
@@ -178,28 +257,48 @@ def inject_object_snapshots(
     strict_anchor : if ``True`` AND ``anchor_ts_ms`` is set, drop any
         object that is not annotated at the anchor ts. Yields a
         single-frame snapshot of the intersection (no temporal smear)
-        at the cost of fewer visible objects.
-    use_lidar : if ``True``, also place the per-object LiDAR cloud
-        alongside the AA-HAD cloud (in case the per-object LiDAR is
-        denser than the static-branch dynamic LiDAR).
+        at the cost of fewer visible objects. Static objects in
+        ``static_obj_ids`` are NEVER dropped (they don't move).
+    use_lidar : (legacy) when ``object_fusion == 'aa-had-only'``, also
+        place the per-object LiDAR cloud alongside the AA-HAD cloud.
+        Ignored for ``lidar-priority`` and ``lidar-only`` modes.
     fallback_color : RGB used when the per-object PLY has no colour
         (e.g., a LiDAR-only object).
-
-    Returns
-    -------
-    points_world : (N, 3) float32
-    colors_rgb : (N, 3) uint8
-    log : list of per-object dicts ``{obj_id, ts_ms, n_pts, source}``
+    object_fusion : one of ``'lidar-priority'`` (default; LiDAR wins
+        per-voxel, AA-HAD fills empty), ``'lidar-only'`` (drop AA-HAD
+        entirely; clean but only the side LiDAR could see),
+        ``'aa-had-only'`` (legacy: only the AA-HAD cloud, with shells).
+    object_voxel_size : voxel size used for the per-object LiDAR-
+        priority fusion in object-local frame (default 5 cm).
+    object_max_dist_to_lidar : drop AA-HAD object-local points whose
+        distance to nearest LiDAR neighbour exceeds this (default
+        0.5 m; tighter than the static-scene 2 m because objects are
+        physically small).
+    mirror_axis : if set (``'x'``, ``'y'``, ``'z'``), mirror the per-
+        object cloud across that axis in object-local frame to fill
+        the unobserved side. Default ``None`` = no mirror.
+    mirror_classes : set of class labels for which mirroring is
+        applied. When ``None`` defaults to the four-wheel vehicle
+        classes (Car, Suv, Bus, Truck). Pedestrians, riders, etc.
+        are NOT mirrored.
+    static_obj_ids : optional set of obj_ids treated as static.
+        Static objects bypass the strict-anchor drop (they appear in
+        the snapshot even if not annotated at the anchor ts).
     """
     pts_chunks: list[np.ndarray] = []
     rgb_chunks: list[np.ndarray] = []
     log: list[dict] = []
 
+    if mirror_classes is None:
+        mirror_classes = _DEFAULT_MIRROR_CLASSES
+    static_set = set(static_obj_ids or [])
+
     for obj_id, clouds in object_clouds.items():
+        is_static = int(obj_id) in static_set
         pick = _pick_object_ts(
             loader, scene_id, obj_id, cam_for_discovery,
             anchor_ts_ms=anchor_ts_ms,
-            strict_anchor=strict_anchor,
+            strict_anchor=strict_anchor and not is_static,
         )
         if pick is None:
             reason = (
@@ -211,14 +310,60 @@ def inject_object_snapshots(
                         "source": reason})
             continue
         ts_ms, obj = pick
+        label = getattr(obj, "label", "Unknown")
+        do_mirror = (mirror_axis is not None) and (label in mirror_classes)
 
+        if object_fusion == "lidar-priority":
+            xyz_local, rgb_local, source = fuse_object_clouds(
+                aa_had_local=clouds.aa_had_local,
+                aa_had_colors=clouds.aa_had_colors,
+                lidar_local=clouds.lidar_local,
+                voxel_size=object_voxel_size,
+                max_dist_to_lidar=object_max_dist_to_lidar,
+                mirror_axis=mirror_axis if do_mirror else None,
+            )
+            sources_used = ["lidar-priority"]
+            if do_mirror:
+                sources_used.append(f"mirror-{mirror_axis}")
+            n_total = int(xyz_local.shape[0])
+            if n_total == 0:
+                log.append({"obj_id": int(obj_id), "ts_ms": int(ts_ms),
+                            "n_pts": 0, "source": "empty",
+                            "label": label, "is_static": is_static})
+                continue
+            P_world = object_local_to_world(xyz_local, obj)
+            pts_chunks.append(P_world.astype(np.float32))
+            if rgb_local is not None:
+                rgb_chunks.append(rgb_local.astype(np.uint8))
+            else:
+                rgb_chunks.append(
+                    np.full((P_world.shape[0], 3), fallback_color, dtype=np.uint8)
+                )
+            log.append({
+                "obj_id": int(obj_id), "ts_ms": int(ts_ms),
+                "n_pts": n_total, "source": "+".join(sources_used),
+                "label": label, "is_static": is_static,
+                "n_lidar": int((source == 0).sum()),
+                "n_aahad_fill": int((source == 1).sum()),
+            })
+            continue
+
+        # Legacy paths (lidar-only / aa-had-only) ----------------------
         sources: list[str] = []
         n_total = 0
-        if clouds.aa_had_local is not None and clouds.aa_had_local.size > 0:
-            P_world = object_local_to_world(clouds.aa_had_local, obj)
+        if object_fusion == "aa-had-only" and clouds.aa_had_local is not None and clouds.aa_had_local.size > 0:
+            aa_local = clouds.aa_had_local
+            aa_col = clouds.aa_had_colors
+            if do_mirror:
+                aa_local = np.concatenate(
+                    [aa_local, _mirror_object_local(aa_local, mirror_axis)], axis=0,
+                )
+                if aa_col is not None:
+                    aa_col = np.concatenate([aa_col, aa_col], axis=0)
+            P_world = object_local_to_world(aa_local, obj)
             pts_chunks.append(P_world.astype(np.float32))
-            if clouds.aa_had_colors is not None:
-                rgb_chunks.append(clouds.aa_had_colors.astype(np.uint8))
+            if aa_col is not None:
+                rgb_chunks.append(aa_col.astype(np.uint8))
             else:
                 rgb_chunks.append(
                     np.full((P_world.shape[0], 3), fallback_color, dtype=np.uint8)
@@ -226,8 +371,16 @@ def inject_object_snapshots(
             sources.append("aa_had")
             n_total += int(P_world.shape[0])
 
-        if use_lidar and clouds.lidar_local is not None and clouds.lidar_local.size > 0:
-            P_world_l = object_local_to_world(clouds.lidar_local, obj)
+        if (
+            (object_fusion == "lidar-only" or (object_fusion == "aa-had-only" and use_lidar))
+            and clouds.lidar_local is not None and clouds.lidar_local.size > 0
+        ):
+            lid_local = clouds.lidar_local
+            if do_mirror:
+                lid_local = np.concatenate(
+                    [lid_local, _mirror_object_local(lid_local, mirror_axis)], axis=0,
+                )
+            P_world_l = object_local_to_world(lid_local, obj)
             pts_chunks.append(P_world_l.astype(np.float32))
             rgb_chunks.append(
                 np.full((P_world_l.shape[0], 3), fallback_color, dtype=np.uint8)
@@ -235,12 +388,15 @@ def inject_object_snapshots(
             sources.append("lidar")
             n_total += int(P_world_l.shape[0])
 
+        if do_mirror and sources:
+            sources.append(f"mirror-{mirror_axis}")
         log.append({
             "obj_id": int(obj_id),
             "ts_ms": int(ts_ms),
             "n_pts": n_total,
             "source": "+".join(sources) if sources else "empty",
-            "label": getattr(obj, "label", "Unknown"),
+            "label": label,
+            "is_static": is_static,
         })
 
     if pts_chunks:
@@ -259,5 +415,6 @@ def inject_object_snapshots(
 __all__ = [
     "ObjectClouds",
     "discover_object_clouds",
+    "fuse_object_clouds",
     "inject_object_snapshots",
 ]
