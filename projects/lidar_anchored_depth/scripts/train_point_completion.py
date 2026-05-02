@@ -235,7 +235,7 @@ def main() -> int:
 
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.num_workers, pin_memory=True, drop_last=True,
+        num_workers=args.num_workers, pin_memory=True, drop_last=False,
     )
     val_loader = (
         DataLoader(
@@ -243,6 +243,16 @@ def main() -> int:
             num_workers=max(1, args.num_workers // 2), pin_memory=True,
         ) if val_ds else None
     )
+
+    n_train_batches = (len(train_ds) + args.batch_size - 1) // args.batch_size
+    print(
+        f"[loader] train batches/epoch = {n_train_batches}  "
+        f"(samples={len(train_ds)}, batch_size={args.batch_size})"
+    )
+    if n_train_batches == 0:
+        raise SystemExit(
+            "train DataLoader has 0 batches; --batch-size > len(dataset)?"
+        )
 
     knn_chunk = None if args.knn_chunk <= 0 else int(args.knn_chunk)
     net = PointCloudVelocityNet(
