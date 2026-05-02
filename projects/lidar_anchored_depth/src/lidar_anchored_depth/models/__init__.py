@@ -13,6 +13,10 @@ from lidar_anchored_depth.models.flow_matching import (
     masked_cfm_loss,
 )
 from lidar_anchored_depth.models.point_cloud_unet import PointCloudVelocityNet
+from lidar_anchored_depth.models.point_residual_predictor import (
+    PointResidualPredictor,
+    build_prior_features,
+)
 from lidar_anchored_depth.models.residual_predictor import ResidualPredictor
 from lidar_anchored_depth.models.residual_unet import (
     COND_CHANNELS,
@@ -31,12 +35,14 @@ __all__ = [
     "COND_CHANNELS",
     "FlowMatchingBatch",
     "PointCloudVelocityNet",
+    "PointResidualPredictor",
     "RectifiedFlowMatcher",
     "ResidualPredictor",
     "ResidualVelocityUNet",
     "SIGMA_HEAD_FEATURE_DIM",
     "SigmaHead",
     "SigmaPredictor",
+    "build_prior_features",
     "features_for_pixels",
     "gaussian_nll_loss",
     "masked_cfm_loss",
