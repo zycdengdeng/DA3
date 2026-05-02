@@ -136,6 +136,7 @@ class PointResidualPredictor:
         prior_rgb: np.ndarray,
         prior_feat: np.ndarray,
         dist_to_lidar: np.ndarray | None = None,
+        segment_id: np.ndarray | None = None,
     ) -> np.ndarray:
         """Predict per-point displacement Δxyz and return the refined
         world-frame cloud ``prior_xyz + Δxyz``.
@@ -172,6 +173,11 @@ class PointResidualPredictor:
         xyz_t = torch.from_numpy(xyz_n).unsqueeze(0).to(self.device)
         rgb_t = torch.from_numpy(rgb_n).unsqueeze(0).to(self.device)
         feat_t = torch.from_numpy(feat_n).unsqueeze(0).to(self.device)
+        seg_t = None
+        if segment_id is not None:
+            seg_t = torch.from_numpy(
+                segment_id.astype(np.int64),
+            ).unsqueeze(0).to(self.device)
 
         with torch.no_grad():
             x_0 = torch.randn(1, N, 3, device=self.device)
@@ -181,7 +187,7 @@ class PointResidualPredictor:
                 t_now = torch.full(
                     (1,), float(k * dt), device=self.device, dtype=x.dtype,
                 )
-                v = self.net(xyz_t, rgb_t, feat_t, x, t_now)
+                v = self.net(xyz_t, rgb_t, feat_t, x, t_now, segment_id=seg_t)
                 x = x + dt * v
         delta_xyz = (x.squeeze(0).cpu().numpy() * DISP_SCALE).astype(np.float32)
 

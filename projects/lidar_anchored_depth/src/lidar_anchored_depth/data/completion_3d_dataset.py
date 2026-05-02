@@ -126,6 +126,13 @@ class Completion3DDataset(Dataset):
             prior_feat = data["prior_feat"].astype(np.float32)
             target_disp = data["target_disp"].astype(np.float32)
             valid = data["valid_mask"].astype(bool)
+            # segment_id from SAM Auto (-1 means "no SAM Auto data" or
+            # "key absent in older npz"); the segment-aware EdgeConv
+            # treats the all-equal case (e.g. all -1) as no masking.
+            if "segment_id" in data.files:
+                segment_id = data["segment_id"].astype(np.int64)
+            else:
+                segment_id = np.full(prior_xyz.shape[0], -1, dtype=np.int64)
 
         idx = self._subsample(prior_xyz.shape[0], valid)
         prior_xyz = prior_xyz[idx]
@@ -133,6 +140,7 @@ class Completion3DDataset(Dataset):
         prior_feat = prior_feat[idx]
         target_disp = target_disp[idx]
         valid = valid[idx]
+        segment_id = segment_id[idx]
 
         # Centre + scale XYZ.
         centre = prior_xyz.mean(axis=0, keepdims=True)
@@ -154,6 +162,7 @@ class Completion3DDataset(Dataset):
             "prior_xyz": torch.from_numpy(prior_xyz_c.astype(np.float32)),
             "prior_rgb": torch.from_numpy(prior_rgb.astype(np.float32)),
             "prior_feat": torch.from_numpy(prior_feat),
+            "segment_id": torch.from_numpy(segment_id.astype(np.int64)),
             "target_disp": torch.from_numpy(target_disp_n),
             "valid": torch.from_numpy(valid.astype(np.float32)),
             "centre": torch.from_numpy(centre.squeeze(0).astype(np.float32)),

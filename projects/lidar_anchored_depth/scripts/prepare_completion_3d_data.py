@@ -226,6 +226,8 @@ def _build_one_sample(
     require_target_pts: int,
     ground_max_dz: float,
     target_search_radius: float,
+    sam_auto_dir: Path | None = None,
+    ground_target_band_m: float = 0.4,
 ) -> dict | None:
     try:
         idx = loader.find_frame_idx(scene_id, ts_ms, cam_id)
@@ -263,8 +265,6 @@ def _build_one_sample(
         return None
     prior_xyz, prior_rgb, prior_uv = prior
 
-    # FOV cull prior cloud against ALL cams (so the network sees the
-    # same support a multi-camera fusion would).
     fov = np.zeros(prior_xyz.shape[0], dtype=bool)
     for v in cam_views:
         fov |= points_in_camera_fov(prior_xyz, v, z_min=z_min, z_max=z_max)
@@ -276,7 +276,6 @@ def _build_one_sample(
     if prior_xyz.shape[0] < 100:
         return None
 
-    # Target = static LiDAR (FOV-clipped).
     target_fov = np.zeros(static_lidar.shape[0], dtype=bool)
     for v in cam_views:
         target_fov |= points_in_camera_fov(static_lidar, v, z_min=z_min, z_max=z_max)
@@ -284,8 +283,6 @@ def _build_one_sample(
     if target_xyz.shape[0] < require_target_pts:
         return None
 
-    # Per-prior-point displacement target = (nearest LiDAR) - prior,
-    # only valid within ``target_search_radius`` metres.
     try:
         from scipy.spatial import cKDTree
 
@@ -297,7 +294,6 @@ def _build_one_sample(
             target_xyz[nn_idx[valid]] - prior_xyz[valid]
         ).astype(np.float32)
     except ModuleNotFoundError:
-        # Fallback: brute force (slow but correct).
         target_disp = np.zeros((prior_xyz.shape[0], 3), dtype=np.float32)
         valid = np.zeros(prior_xyz.shape[0], dtype=bool)
         for i in range(prior_xyz.shape[0]):
@@ -306,28 +302,63 @@ def _build_one_sample(
             if d[j] <= target_search_radius:
                 target_disp[i] = (target_xyz[j] - prior_xyz[i]).astype(np.float32)
                 valid[i] = True
+        dists = np.full(prior_xyz.shape[0], target_search_radius + 1.0, dtype=np.float32)
+
+    # B1: ground-aware target rule. Points whose Z is within
+    # ground_target_band_m of the LiDAR-derived ground grid are
+    # treated as 'road' and assigned target_disp = 0 — the network
+    # learns "identify ground -> output 0", and the road geometry is
+    # locked to the LiDAR ground (cm-precise) at inference. valid
+    # stays True for these points (we DO supervise them, just with
+    # the deterministic zero target).
+    n_ground = 0
+    if ground_grid is not None and ground_target_band_m > 0:
+        z_g, in_grid = ground_grid.query(prior_xyz[:, :2])
+        near_ground = in_grid & (np.abs(prior_xyz[:, 2] - z_g) <= ground_target_band_m)
+        target_disp[near_ground] = 0.0
+        valid[near_ground] = True
+        n_ground = int(near_ground.sum())
+
     valid_count = int(valid.sum())
     if valid_count < require_target_pts:
         return None
 
-    # Build per-point conditioning features.
     rows, cols = prior_uv[:, 1], prior_uv[:, 0]
     d_at = d_image[rows, cols].astype(np.float32)
     aahad_init = (a * d_at + b).astype(np.float32)
     dist_to_lidar = np.minimum(dists, 5.0).astype(np.float32)
-    sparse_present = (dists <= 0.10).astype(np.float32)  # near a LiDAR pt
-    source_label = np.zeros(prior_xyz.shape[0], dtype=np.float32)  # 0 = AA-HAD
+    sparse_present = (dists <= 0.10).astype(np.float32)
+    source_label = np.zeros(prior_xyz.shape[0], dtype=np.float32)
     prior_feat = np.stack([
         source_label, d_at, aahad_init, dist_to_lidar, sparse_present,
     ], axis=1).astype(np.float32)
+
+    # A1: per-point segment id from SAM Auto. -1 means "no SAM Auto
+    # data for this frame"; the dataset/network will treat -1 as a
+    # singleton segment (no cross-edge masking effect).
+    if sam_auto_dir is not None:
+        sa_path = sam_auto_dir / f"{scene_id}_ts{ts_ms}_cam{cam_id}_sam_auto.npz"
+        if sa_path.is_file():
+            with np.load(sa_path) as sa:
+                seg_image = sa["segment_id"]
+            if seg_image.shape == (H, W):
+                segment_id = seg_image[rows, cols].astype(np.int32)
+            else:
+                segment_id = np.full(prior_xyz.shape[0], -1, dtype=np.int32)
+        else:
+            segment_id = np.full(prior_xyz.shape[0], -1, dtype=np.int32)
+    else:
+        segment_id = np.full(prior_xyz.shape[0], -1, dtype=np.int32)
 
     return {
         "prior_xyz": prior_xyz.astype(np.float32),
         "prior_rgb": prior_rgb.astype(np.uint8),
         "prior_feat": prior_feat,
+        "segment_id": segment_id,
         "target_xyz": target_xyz.astype(np.float32),
         "target_disp": target_disp,
         "valid_mask": valid,
+        "n_ground_targets": n_ground,
         "scene_id": scene_id,
         "ts_ms": int(ts_ms),
         "cam_id": cam_id,
@@ -363,6 +394,22 @@ def main() -> int:
     parser.add_argument("--ground-low-quantile", type=float, default=0.10)
     parser.add_argument("--ground-snap-max-dz", type=float, default=0.4)
     parser.add_argument("--target-search-radius", type=float, default=2.0)
+    parser.add_argument(
+        "--sam-auto-dir", default=None,
+        help="optional directory of SAM Auto npz files "
+        "(output of run_sam_auto.py). When set, each prior point gets "
+        "a segment_id from the SAM Auto segmentation, written into "
+        "the npz alongside the other arrays. The training-time "
+        "segment-aware EdgeConv uses this to mask cross-segment "
+        "neighbours. When unset, all segment_ids = -1 (no masking).",
+    )
+    parser.add_argument(
+        "--ground-target-band-m", type=float, default=0.4,
+        help="B1 rule: prior points whose Z is within this band of "
+        "the LiDAR ground grid are assigned target_disp = 0 instead "
+        "of 'nearest LiDAR'. Locks road geometry to the cm-precise "
+        "LiDAR ground at inference. 0 disables B1. Default 0.4 m.",
+    )
     parser.add_argument("--loader-min-points", type=int, default=0)
     args = parser.parse_args()
 
@@ -386,6 +433,9 @@ def main() -> int:
     print(f"[load] {len(d_paths_index)} d_tilde frames indexed")
 
     sam_dir = Path(args.sam_mask_dir) if args.sam_mask_dir else None
+    sam_auto_dir = Path(args.sam_auto_dir) if args.sam_auto_dir else None
+    if sam_auto_dir is not None and not sam_auto_dir.is_dir():
+        raise SystemExit(f"--sam-auto-dir {sam_auto_dir} not a directory")
 
     loader = RoadsideV2XLoader(
         data_root=args.data_root,
@@ -457,6 +507,8 @@ def main() -> int:
                 require_target_pts=args.require_target_pts,
                 ground_max_dz=args.ground_snap_max_dz,
                 target_search_radius=args.target_search_radius,
+                sam_auto_dir=sam_auto_dir,
+                ground_target_band_m=args.ground_target_band_m,
             )
             if sample is None:
                 n_skipped += 1
@@ -464,7 +516,7 @@ def main() -> int:
             out_path = out_dir / f"{scene_id}_ts{ts_ms}_cam{cam_id}_3d.npz"
             np.savez_compressed(out_path, **{
                 k: v for k, v in sample.items() if k in {
-                    "prior_xyz", "prior_rgb", "prior_feat",
+                    "prior_xyz", "prior_rgb", "prior_feat", "segment_id",
                     "target_xyz", "target_disp", "valid_mask",
                 }
             })

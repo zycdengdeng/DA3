@@ -224,6 +224,14 @@ def main() -> int:
         default=["Car", "Suv", "Bus", "Truck"],
     )
     parser.add_argument("--motion-drift-threshold-m", type=float, default=0.5)
+    parser.add_argument(
+        "--sam-auto-dir", default=None,
+        help="optional dir of SAM Auto npz (output of run_sam_auto.py). "
+        "When set, the predictor receives a per-prior-point segment_id "
+        "and the segment-aware EdgeConv masks cross-segment edges. "
+        "Required when the residual checkpoint was trained with "
+        "segment_id; harmless to omit otherwise.",
+    )
     parser.add_argument("--loader-min-points", type=int, default=0)
     args = parser.parse_args()
 
@@ -244,6 +252,9 @@ def main() -> int:
     print(f"[load] {len(d_paths_index)} d_tilde frames indexed")
 
     sam_dir = Path(args.sam_mask_dir) if args.sam_mask_dir else None
+    sam_auto_dir = Path(args.sam_auto_dir) if args.sam_auto_dir else None
+    if sam_auto_dir is not None and not sam_auto_dir.is_dir():
+        raise SystemExit(f"--sam-auto-dir {sam_auto_dir} not a directory")
 
     loader = RoadsideV2XLoader(
         data_root=args.data_root,
@@ -379,9 +390,23 @@ def main() -> int:
             )
             dist_to_lidar = feat[:, 3]  # 4th channel is dist_to_lidar (clipped)
 
+            # A1: per-prior-point segment id from SAM Auto (if provided).
+            seg_per_pt = None
+            if sam_auto_dir is not None:
+                sa_path = sam_auto_dir / f"{scene_id}_ts{ts_ms}_cam{cam_id}_sam_auto.npz"
+                if sa_path.is_file():
+                    with np.load(sa_path) as sa:
+                        seg_image = sa["segment_id"]
+                    H_img, W_img = frame.image.shape[:2]
+                    if seg_image.shape == (H_img, W_img):
+                        seg_per_pt = seg_image[
+                            prior_uv[:, 1], prior_uv[:, 0],
+                        ].astype(np.int64)
+
             refined_xyz = predictor.refine_cloud(
                 prior_xyz, prior_rgb, feat,
                 dist_to_lidar=dist_to_lidar,
+                segment_id=seg_per_pt,
             )
 
             if args.post_network_ground_snap:

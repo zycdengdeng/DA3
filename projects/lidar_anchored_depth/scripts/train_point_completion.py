@@ -117,9 +117,13 @@ def _train_one_epoch(
         prior_feat = batch["prior_feat"].to(device, non_blocking=True)
         target_disp = batch["target_disp"].to(device, non_blocking=True)
         valid = batch["valid"].to(device, non_blocking=True)
+        segment_id = batch.get("segment_id")
+        if segment_id is not None:
+            segment_id = segment_id.to(device, non_blocking=True)
 
         fm = matcher.sample_train_pair(target_disp)
-        v_pred = net(prior_xyz, prior_rgb, prior_feat, fm.x_t, fm.t)
+        v_pred = net(prior_xyz, prior_rgb, prior_feat, fm.x_t, fm.t,
+                     segment_id=segment_id)
         loss = _flow_loss(
             v_pred, fm.u_target, valid,
             valid_weight=valid_weight, invalid_weight=invalid_weight,
@@ -150,9 +154,13 @@ def _eval_one_epoch(net, matcher, loader, device, *, n_sample_steps):
             prior_feat = batch["prior_feat"].to(device, non_blocking=True)
             target_disp = batch["target_disp"].to(device, non_blocking=True)
             valid = batch["valid"].to(device, non_blocking=True)
+            segment_id = batch.get("segment_id")
+            if segment_id is not None:
+                segment_id = segment_id.to(device, non_blocking=True)
 
             fm = matcher.sample_train_pair(target_disp)
-            v_pred = net(prior_xyz, prior_rgb, prior_feat, fm.x_t, fm.t)
+            v_pred = net(prior_xyz, prior_rgb, prior_feat, fm.x_t, fm.t,
+                         segment_id=segment_id)
             loss = _flow_loss(
                 v_pred, fm.u_target, valid,
                 valid_weight=1.0, invalid_weight=0.0,
@@ -160,7 +168,6 @@ def _eval_one_epoch(net, matcher, loader, device, *, n_sample_steps):
             total += float(loss.item())
             n += 1
 
-            # Sample Δxyz with N-step Euler integration.
             x_init = torch.randn_like(target_disp)
             x = x_init
             dt = 1.0 / n_sample_steps
@@ -169,7 +176,8 @@ def _eval_one_epoch(net, matcher, loader, device, *, n_sample_steps):
                     (x.shape[0],), float(k * dt),
                     device=x.device, dtype=x.dtype,
                 )
-                v = net(prior_xyz, prior_rgb, prior_feat, x, t_now)
+                v = net(prior_xyz, prior_rgb, prior_feat, x, t_now,
+                        segment_id=segment_id)
                 x = x + dt * v
             err2 = ((x - target_disp) * DISP_SCALE).pow(2).sum(dim=-1)
             valid_mask = valid > 0

@@ -107,7 +107,17 @@ if _TORCH_OK:
             return torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
 
     class _EdgeConv(nn.Module):
-        """EdgeConv layer with FiLM time-conditioning."""
+        """EdgeConv layer with FiLM time-conditioning.
+
+        Optional segment-aware masking (Q1, A1): if ``segment_id`` is
+        passed to ``forward``, edges between points in different
+        SAM-Auto segments are zeroed out before max-pooling, so the
+        per-point feature for point ``i`` only sees neighbours that
+        share its segment. Self is always a same-segment neighbour
+        (distance 0 in feature space → it is in the K-NN), so even a
+        point with no other same-segment neighbours falls back to its
+        own self-edge.
+        """
 
         def __init__(
             self, in_ch: int, out_ch: int, k: int, time_dim: int,
@@ -124,13 +134,29 @@ if _TORCH_OK:
             self.norm = nn.LayerNorm(out_ch)
             self.time_proj = nn.Linear(time_dim, 2 * out_ch)
 
-        def forward(self, x: "Tensor", t_emb: "Tensor") -> "Tensor":
+        def forward(
+            self, x: "Tensor", t_emb: "Tensor",
+            segment_id: "Tensor | None" = None,
+        ) -> "Tensor":
             # x: (B, N, C); KNN in feature space
             idx = _knn_indices(x, self.k, chunk=self.knn_chunk)
             nb = _gather_neighbours(x, idx)               # (B, N, k, C)
             cur = x.unsqueeze(2).expand_as(nb)
-            edge = torch.cat([cur, nb - cur], dim=-1)
-            f = self.mlp(edge).max(dim=2).values          # (B, N, out_ch)
+            edge = torch.cat([cur, nb - cur], dim=-1)     # (B, N, k, 2C)
+            f = self.mlp(edge)                             # (B, N, k, out_ch)
+
+            if segment_id is not None:
+                seg_self = segment_id.unsqueeze(-1)                    # (B, N, 1)
+                # Gather neighbour segment ids (B, N, k).
+                B_, N_, K_ = idx.shape
+                idx_flat = idx.reshape(B_, N_ * K_)                     # (B, N*k)
+                seg_nb_flat = torch.gather(segment_id, 1, idx_flat)     # (B, N*k)
+                seg_nb = seg_nb_flat.reshape(B_, N_, K_)                # (B, N, k)
+                same_seg = (seg_nb == seg_self).to(f.dtype)             # (B, N, k)
+                # Multiply edge features by same-seg mask before pool.
+                f = f * same_seg.unsqueeze(-1)
+
+            f = f.max(dim=2).values                       # (B, N, out_ch)
             f = self.norm(f)
             scale_shift = self.time_proj(t_emb)
             scale, shift = scale_shift.chunk(2, dim=-1)
@@ -177,15 +203,16 @@ if _TORCH_OK:
             prior_feat: "Tensor",
             x_t: "Tensor",
             t: "Tensor",
+            segment_id: "Tensor | None" = None,
         ) -> "Tensor":
             B, N, _ = prior_xyz.shape
             h = torch.cat([prior_xyz, prior_rgb, prior_feat, x_t], dim=-1)
             h = self.in_proj(h)
             t_emb = self.time_emb(t)
-            h = self.layer1(h, t_emb) + h
-            h = self.layer2(h, t_emb)
-            h = self.layer3(h, t_emb) + h
-            h = self.layer4(h, t_emb)
+            h = self.layer1(h, t_emb, segment_id) + h
+            h = self.layer2(h, t_emb, segment_id)
+            h = self.layer3(h, t_emb, segment_id) + h
+            h = self.layer4(h, t_emb, segment_id)
             return self.out_mlp(h)
 
 

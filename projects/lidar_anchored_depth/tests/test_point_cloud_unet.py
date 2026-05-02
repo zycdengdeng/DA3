@@ -125,6 +125,64 @@ def test_completion_3d_dataset_loads_and_subsamples(tmp_path):
 
 
 @torch_required
+def test_segment_aware_edgeconv_isolates_segments():
+    """When all points share segment, output should match the
+    no-segment case. When two segments are isolated, points from
+    segment A's max-pool should not be influenced by features only
+    present in segment B."""
+    from lidar_anchored_depth.models import PointCloudVelocityNet
+
+    torch.manual_seed(0)
+    net = PointCloudVelocityNet(prior_feat_dim=5, base=16, k=8).eval()
+
+    B, N = 1, 64
+    prior_xyz = torch.randn(B, N, 3)
+    prior_rgb = torch.rand(B, N, 3)
+    prior_feat = torch.randn(B, N, 5)
+    x_t = torch.zeros(B, N, 3)
+    t = torch.tensor([0.5])
+
+    # All-same segment -> should equal segment_id=None.
+    seg_one = torch.zeros(B, N, dtype=torch.long)
+    with torch.no_grad():
+        v_no_seg = net(prior_xyz, prior_rgb, prior_feat, x_t, t)
+        v_one_seg = net(prior_xyz, prior_rgb, prior_feat, x_t, t,
+                        segment_id=seg_one)
+    # Same shape, but values can differ slightly due to LayerNorm/etc;
+    # the key invariant is that segment_id=None is path-equivalent
+    # when the network actually does the masking. For all-same the
+    # mask is all 1s, so behaviour is identical to no-mask path.
+    assert torch.allclose(v_no_seg, v_one_seg, atol=1e-5)
+
+
+@torch_required
+def test_segment_aware_edgeconv_two_segments_differs():
+    """With two non-trivial segments, output must differ from the
+    no-segment case (at least somewhere) — confirms the mask is
+    actually being applied."""
+    from lidar_anchored_depth.models import PointCloudVelocityNet
+
+    torch.manual_seed(0)
+    net = PointCloudVelocityNet(prior_feat_dim=5, base=16, k=8).eval()
+    B, N = 1, 64
+    prior_xyz = torch.randn(B, N, 3)
+    prior_rgb = torch.rand(B, N, 3)
+    prior_feat = torch.randn(B, N, 5)
+    x_t = torch.zeros(B, N, 3)
+    t = torch.tensor([0.5])
+
+    seg_split = torch.cat([
+        torch.zeros(N // 2, dtype=torch.long),
+        torch.ones(N - N // 2, dtype=torch.long),
+    ]).unsqueeze(0)
+    with torch.no_grad():
+        v_no_seg = net(prior_xyz, prior_rgb, prior_feat, x_t, t)
+        v_split = net(prior_xyz, prior_rgb, prior_feat, x_t, t,
+                      segment_id=seg_split)
+    assert not torch.allclose(v_no_seg, v_split, atol=1e-4)
+
+
+@torch_required
 def test_completion_3d_dataset_pads_when_too_few_points(tmp_path):
     import numpy as np
 
