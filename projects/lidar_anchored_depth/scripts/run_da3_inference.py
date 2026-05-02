@@ -78,6 +78,22 @@ def main() -> int:
         help="ms timestamp; default = first available in the scene",
     )
     parser.add_argument(
+        "--all-timestamps", action="store_true",
+        help="iterate every ts in the scene. Overrides --timestamp.",
+    )
+    parser.add_argument(
+        "--ts-shard", default=None,
+        help="distribute ts across N workers. Format 'k/N' picks every "
+        "ts whose ordinal index satisfies (i %% N == k). Use with "
+        "CUDA_VISIBLE_DEVICES to shard across 8 GPUs in parallel.",
+    )
+    parser.add_argument(
+        "--skip-existing", action="store_true",
+        help="skip (scene, ts, cam) triples whose .npz already exists "
+        "in --output. Default OFF (rewrite). With ON, re-running the "
+        "same command picks up where a crash left off.",
+    )
+    parser.add_argument(
         "--cam", default="3",
         help="pinhole cam id (0/3/6/9) or 'all' for all 4",
     )
@@ -121,7 +137,25 @@ def main() -> int:
         loader.scene_filter = [args.scene]
     scene_id = _resolve_scene_id(loader, args.scene)
     scene = next(s for s in loader.scenes if s.scene_id == scene_id)
-    ts_ms = int(args.timestamp) if args.timestamp else scene.timestamps_ms[0]
+
+    # Build the list of timestamps to process.
+    if args.all_timestamps:
+        ts_list = list(scene.timestamps_ms)
+    elif args.timestamp:
+        ts_list = [int(args.timestamp)]
+    else:
+        ts_list = [scene.timestamps_ms[0]]
+
+    if args.ts_shard:
+        try:
+            shard_k_str, shard_n_str = args.ts_shard.split("/")
+            shard_k, shard_n = int(shard_k_str), int(shard_n_str)
+        except ValueError as e:
+            raise SystemExit(f"--ts-shard must be 'k/N', got {args.ts_shard!r}") from e
+        if not (0 <= shard_k < shard_n):
+            raise SystemExit(f"--ts-shard k must be in [0, N), got {args.ts_shard!r}")
+        ts_list = [ts for i, ts in enumerate(ts_list) if i % shard_n == shard_k]
+        print(f"[shard] {shard_k}/{shard_n}  -> {len(ts_list)} ts on this worker")
 
     cams: list[str]
     if args.cam == "all":
@@ -133,11 +167,23 @@ def main() -> int:
             )
         cams = [args.cam]
 
-    print(f"[scene] {scene_id}  ts={ts_ms}  cams={cams}")
+    print(f"[scene] {scene_id}  ts_count={len(ts_list)}  cams={cams}")
     print()
 
-    for cam_id in cams:
-        idx = loader.find_frame_idx(scene_id, ts_ms, cam_id)
+    n_done = 0
+    n_skipped = 0
+    t_total = time.time()
+    for ts_ms in ts_list:
+      for cam_id in cams:
+        out_path = out_dir / f"{scene_id}_ts{ts_ms}_cam{cam_id}_d.npz"
+        if args.skip_existing and out_path.is_file():
+            n_skipped += 1
+            continue
+        try:
+            idx = loader.find_frame_idx(scene_id, ts_ms, cam_id)
+        except ValueError:
+            print(f"  ts={ts_ms} cam{cam_id}: no frame, skipping")
+            continue
         frame = loader.get_frame(idx)
         H_orig, W_orig = frame.image.shape[:2]
 
@@ -167,7 +213,6 @@ def main() -> int:
                 interpolation=cv2.INTER_LINEAR,
             )
 
-        out_path = out_dir / f"{scene_id}_ts{ts_ms}_cam{cam_id}_d.npz"
         save_kwargs = dict(
             depth=depth_full,
             proc_h=h_p, proc_w=w_p,
@@ -185,13 +230,14 @@ def main() -> int:
         d_max = float(np.nanmax(depth_full))
         d_med = float(np.nanmedian(depth_full))
         print(
-            f"  cam{cam_id}  ->  {out_path.name}    "
-            f"d̃ range [{d_min:.3f}, {d_max:.3f}] median {d_med:.3f}    "
-            f"DA3 inference {t_inf*1000:.0f} ms"
+            f"  ts={ts_ms} cam{cam_id}  ->  {out_path.name}    "
+            f"d̃ [{d_min:.3f}, {d_max:.3f}] median {d_med:.3f}    "
+            f"{t_inf*1000:.0f} ms"
         )
+        n_done += 1
 
     print()
-    print("done.")
+    print(f"done.  wrote {n_done}  skipped {n_skipped}  total {time.time() - t_total:.1f}s")
     return 0
 
 
