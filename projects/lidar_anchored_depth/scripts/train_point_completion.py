@@ -54,20 +54,37 @@ def _flow_loss(
     *,
     valid_weight: float,
     invalid_weight: float,
+    loss_type: str = "l2",
+    huber_delta: float = 0.5,
 ):
+    """Per-point flow-matching loss.
+
+    ``loss_type``:
+      * ``"l2"``  — squared error per channel, summed over xyz.
+      * ``"huber"`` — Huber / smooth-L1 with threshold ``huber_delta``.
+        Robust to "valid-but-extreme" target displacements that are
+        close to ``--target-search-radius`` and dominate L2 gradients.
+    """
     import torch
 
-    diff = (v_pred - u_target).pow(2).sum(dim=-1)  # (B, N)
+    if loss_type == "l2":
+        per_pt = (v_pred - u_target).pow(2).sum(dim=-1)
+    elif loss_type == "huber":
+        per_pt = torch.nn.functional.smooth_l1_loss(
+            v_pred, u_target, beta=float(huber_delta), reduction="none",
+        ).sum(dim=-1)
+    else:
+        raise ValueError(f"unknown loss_type {loss_type!r}")
+
     if invalid_weight == 0.0:
-        # Only supervise valid points.
         denom = valid.sum().clamp_min(1.0)
-        return (diff * valid).sum() / denom
+        return (per_pt * valid).sum() / denom
     w = torch.where(
         valid > 0,
-        torch.full_like(diff, float(valid_weight)),
-        torch.full_like(diff, float(invalid_weight)),
+        torch.full_like(per_pt, float(valid_weight)),
+        torch.full_like(per_pt, float(invalid_weight)),
     )
-    return (diff * w).sum() / w.sum().clamp_min(1.0)
+    return (per_pt * w).sum() / w.sum().clamp_min(1.0)
 
 
 def _per_point_rmse_m(
@@ -85,7 +102,10 @@ def _per_point_rmse_m(
     return float(err2[valid_mask].mean().sqrt().item())
 
 
-def _train_one_epoch(net, matcher, loader, optimizer, device, *, valid_weight, invalid_weight):
+def _train_one_epoch(
+    net, matcher, loader, optimizer, device,
+    *, valid_weight, invalid_weight, loss_type, huber_delta,
+):
     import torch
 
     net.train()
@@ -103,6 +123,7 @@ def _train_one_epoch(net, matcher, loader, optimizer, device, *, valid_weight, i
         loss = _flow_loss(
             v_pred, fm.u_target, valid,
             valid_weight=valid_weight, invalid_weight=invalid_weight,
+            loss_type=loss_type, huber_delta=huber_delta,
         )
 
         optimizer.zero_grad(set_to_none=True)
@@ -186,6 +207,17 @@ def main() -> int:
         "all visible CUDA devices. Effective batch = batch_size; "
         "per-GPU batch = batch_size / n_gpus. With 8 cards you'll want "
         "--batch-size 16 or 32 for good utilisation.",
+    )
+    parser.add_argument(
+        "--loss-type", default="huber", choices=["l2", "huber"],
+        help="per-point flow-matching loss. 'huber' (default) is "
+        "robust to extreme valid targets near --target-search-radius; "
+        "'l2' is the textbook CFM loss but heavier-tailed gradients.",
+    )
+    parser.add_argument(
+        "--huber-delta", type=float, default=0.5,
+        help="Huber threshold (default 0.5; targets are normalised by "
+        "DISP_SCALE=5 m, so 0.5 corresponds to 2.5 m of true Δxyz).",
     )
     parser.add_argument(
         "--valid-weight", type=float, default=1.0,
@@ -280,6 +312,8 @@ def main() -> int:
             net, matcher, train_loader, optimizer, device,
             valid_weight=args.valid_weight,
             invalid_weight=args.invalid_weight,
+            loss_type=args.loss_type,
+            huber_delta=args.huber_delta,
         )
         elapsed = time.time() - t0
         ev = (
