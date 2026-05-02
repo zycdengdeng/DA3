@@ -143,7 +143,11 @@ def main() -> int:
     parser.add_argument("--bbox-expand", type=float, default=0.10)
     parser.add_argument("--z-min", type=float, default=0.5)
     parser.add_argument("--z-max", type=float, default=300.0)
-    parser.add_argument("--sam-dilate-px", type=int, default=5)
+    parser.add_argument("--sam-dilate-px", type=int, default=12,
+        help="dilate dynamic SAM masks before subtracting from the "
+        "static prior. Larger values eat more of the moving-object "
+        "edges that DA3 hallucinates as 'static'. Default 12 px.",
+    )
     parser.add_argument("--require-v2x-frames", action="store_true", default=True)
     parser.add_argument(
         "--no-require-v2x-frames", action="store_false",
@@ -164,6 +168,19 @@ def main() -> int:
         "to nearest LiDAR exceeds this (matches the inference-side "
         "gating discussed for the 2-D head). Default: no gating.",
     )
+    parser.add_argument(
+        "--post-network-ground-snap", action="store_true", default=True,
+        help="re-apply ground_snap on the network output so road "
+        "points that were displaced by the residual flow get pinned "
+        "back to the LiDAR-derived ground grid. Default ON — without "
+        "this the road becomes scattered after the network because "
+        "the per-point regression target = nearest-LiDAR is itself "
+        "scattered around the true ground.",
+    )
+    parser.add_argument(
+        "--no-post-network-ground-snap", action="store_false",
+        dest="post_network_ground_snap",
+    )
 
     parser.add_argument(
         "--include-lidar-priority", action="store_true", default=True,
@@ -181,6 +198,32 @@ def main() -> int:
                         help="cap per-(ts, cam) prior cloud size before "
                         "calling the network; KNN cost is O(N²) so this "
                         "controls peak memory.")
+    parser.add_argument(
+        "--recon-dir", default=None,
+        help="optional directory of per-object PLYs from run_object_"
+        "accumulation.py. When set, dynamic objects are placed into "
+        "the final hybrid via the per-object accumulated reconstruction "
+        "(0.27 m chamfer) at one anchor ts pose. The diffusion network "
+        "is NOT applied to dynamic objects — they bypass it entirely.",
+    )
+    parser.add_argument("--object-anchor-ts-ms", type=int, default=None)
+    parser.add_argument("--strict-anchor", action="store_true", default=True)
+    parser.add_argument(
+        "--no-strict-anchor", action="store_false", dest="strict_anchor",
+    )
+    parser.add_argument("--object-fusion", default="lidar-priority",
+                        choices=["lidar-priority", "lidar-only", "aa-had-only"])
+    parser.add_argument("--object-voxel-size", type=float, default=0.05)
+    parser.add_argument("--object-max-dist-to-lidar", type=float, default=0.5)
+    parser.add_argument(
+        "--mirror-axis", default=None,
+        choices=["x", "y", "z", None],
+    )
+    parser.add_argument(
+        "--mirror-classes", nargs="+",
+        default=["Car", "Suv", "Bus", "Truck"],
+    )
+    parser.add_argument("--motion-drift-threshold-m", type=float, default=0.5)
     parser.add_argument("--loader-min-points", type=int, default=0)
     args = parser.parse_args()
 
@@ -341,6 +384,13 @@ def main() -> int:
                 dist_to_lidar=dist_to_lidar,
             )
 
+            if args.post_network_ground_snap:
+                refined_xyz_snapped, _ = snap_to_ground(
+                    refined_xyz.astype(np.float64), ground_grid,
+                    max_dz=args.ground_snap_max_dz,
+                )
+                refined_xyz = refined_xyz_snapped.astype(np.float32)
+
             refined_chunks.append(refined_xyz)
             refined_rgb_chunks.append(prior_rgb)
             baseline_chunks.append(prior_xyz.astype(np.float32))
@@ -405,6 +455,63 @@ def main() -> int:
             fused_v_xyz, fused_v_rgb, binary=args.ply_binary,
         )
 
+    inj_log: list[dict] = []
+    n_dyn_total = 0
+    if args.recon_dir:
+        from lidar_anchored_depth.pipeline.object_snapshot import (
+            discover_object_clouds, inject_object_snapshots,
+        )
+        from lidar_anchored_depth.pipeline.v2x_static_classifier import (
+            classify_v2x_objects, split_static_dynamic_ids,
+        )
+
+        recon_dir = Path(args.recon_dir)
+        if not recon_dir.is_dir():
+            raise SystemExit(f"--recon-dir {recon_dir} not a directory")
+        print()
+        print(f"[layer5] dynamic snapshot injection from {recon_dir}")
+        clouds = discover_object_clouds(recon_dir, prefer_icp=True)
+        motion = classify_v2x_objects(
+            loader, scene_id,
+            cam_for_discovery=args.cams[0],
+            drift_threshold_m=args.motion_drift_threshold_m,
+        )
+        static_ids, dyn_ids = split_static_dynamic_ids(motion)
+        print(
+            f"  motion: {len(static_ids)} static (always-on), "
+            f"{len(dyn_ids)} dynamic (anchor only)"
+        )
+        dyn_xyz, dyn_rgb, inj_log = inject_object_snapshots(
+            loader, scene_id, clouds,
+            cam_for_discovery=args.cams[0],
+            anchor_ts_ms=args.object_anchor_ts_ms,
+            strict_anchor=args.strict_anchor,
+            object_fusion=args.object_fusion,
+            object_voxel_size=args.object_voxel_size,
+            object_max_dist_to_lidar=args.object_max_dist_to_lidar,
+            mirror_axis=args.mirror_axis,
+            mirror_classes=frozenset(args.mirror_classes) if args.mirror_classes else None,
+            static_obj_ids=static_ids,
+        )
+        n_dyn_total = int(dyn_xyz.shape[0])
+        n_kept = sum(1 for r in inj_log if r["n_pts"] > 0)
+        print(f"  injected {n_dyn_total} pts across {n_kept}/{len(inj_log)} objs")
+
+        # Stack on top of the hybrid produced above (refined static +
+        # LiDAR backbone) and write a separate "_with_dyn.ply" so the
+        # user can compare static-only vs static+dynamic side-by-side.
+        if args.include_lidar_priority and n_dyn_total > 0:
+            fused_with_dyn_xyz = np.concatenate([fused_xyz, dyn_xyz], axis=0)
+            fused_with_dyn_rgb = np.concatenate([fused_rgb, dyn_rgb], axis=0)
+            full_v_xyz, full_v_rgb = voxel_downsample(
+                fused_with_dyn_xyz, args.voxel_size, colors=fused_with_dyn_rgb,
+            )
+            write_ply_xyz(
+                out_dir / f"{scene_id}_completion_3d_hybrid_with_dyn.ply",
+                full_v_xyz, full_v_rgb, binary=args.ply_binary,
+            )
+            print(f"  ↳ hybrid_with_dyn voxels = {full_v_xyz.shape[0]}")
+
     summary = {
         "scene_id": scene_id,
         "n_refined_frames": n_refined_frames,
@@ -412,6 +519,8 @@ def main() -> int:
         "n_refined_points": int(refined_xyz.shape[0]),
         "n_voxels_refined": int(refined_v_xyz.shape[0]),
         "n_voxels_baseline": int(baseline_v_xyz.shape[0]),
+        "n_dynamic_points": n_dyn_total,
+        "object_snapshots": inj_log,
         "args": {k: (list(v) if isinstance(v, tuple) else v)
                  for k, v in vars(args).items()},
     }
