@@ -175,6 +175,19 @@ def main() -> int:
     parser.add_argument("--base-channels", type=int, default=64)
     parser.add_argument("--knn-k", type=int, default=16)
     parser.add_argument(
+        "--knn-chunk", type=int, default=2048,
+        help="row-chunk size for KNN distance matrix to cap peak "
+        "memory at (B * chunk * N * 4) bytes. Default 2048; set 0 "
+        "to disable chunking (faster but more memory).",
+    )
+    parser.add_argument(
+        "--multi-gpu", action="store_true",
+        help="wrap the model in nn.DataParallel; splits batch across "
+        "all visible CUDA devices. Effective batch = batch_size; "
+        "per-GPU batch = batch_size / n_gpus. With 8 cards you'll want "
+        "--batch-size 16 or 32 for good utilisation.",
+    )
+    parser.add_argument(
         "--valid-weight", type=float, default=1.0,
     )
     parser.add_argument(
@@ -231,14 +244,20 @@ def main() -> int:
         ) if val_ds else None
     )
 
+    knn_chunk = None if args.knn_chunk <= 0 else int(args.knn_chunk)
     net = PointCloudVelocityNet(
         prior_feat_dim=PRIOR_FEAT_DIM,
         base=args.base_channels,
         k=args.knn_k,
+        knn_chunk=knn_chunk,
     ).to(device)
     n_params = sum(p.numel() for p in net.parameters())
     print(f"[net] PointCloudVelocityNet  params={n_params / 1e6:.2f}M  "
-          f"base={args.base_channels}  k={args.knn_k}  N={args.n_points}")
+          f"base={args.base_channels}  k={args.knn_k}  N={args.n_points}  "
+          f"knn_chunk={knn_chunk}")
+    if args.multi_gpu and torch.cuda.device_count() > 1:
+        net = torch.nn.DataParallel(net)
+        print(f"[multi-gpu] DataParallel across {torch.cuda.device_count()} GPUs")
 
     matcher = RectifiedFlowMatcher(sigma=0.0)
     optimizer = torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=1e-4)
@@ -270,15 +289,16 @@ def main() -> int:
             + f"({elapsed:.1f}s)"
         )
 
+        save_module = net.module if isinstance(net, torch.nn.DataParallel) else net
         torch.save(
-            {"state_dict": net.state_dict(),
+            {"state_dict": save_module.state_dict(),
              "args": vars(args), "epoch": epoch + 1},
             out_dir / "last.pt",
         )
         if val_loader and ev.get("val_loss", float("inf")) < best_val:
             best_val = ev["val_loss"]
             torch.save(
-                {"state_dict": net.state_dict(),
+                {"state_dict": save_module.state_dict(),
                  "args": vars(args), "epoch": epoch + 1,
                  "val_loss": best_val,
                  "val_rmse_m": ev["val_rmse_m"]},

@@ -50,30 +50,44 @@ def _require_torch() -> None:
 
 if _TORCH_OK:
 
-    def _knn_indices(x: "Tensor", k: int) -> "Tensor":
+    def _knn_indices(x: "Tensor", k: int, chunk: int | None = None) -> "Tensor":
         """Pairwise-distance K-NN.
 
         ``x`` is ``(B, N, C)``. Returns ``(B, N, k)`` int64 indices.
-        Uses the standard ``-2 a.bᵀ + |a|² + |b|²`` trick. For
-        ``N <= 8192`` and ``k <= 16`` this fits comfortably in A100
-        memory.
+        For large ``N`` use ``chunk`` to compute distances row-block by
+        row-block, capping peak memory at ``B * chunk * N * 4`` bytes
+        instead of ``B * N * N * 4``.
         """
-        B, N, _ = x.shape
-        inner = 2 * torch.bmm(x, x.transpose(1, 2))
-        sq = (x * x).sum(dim=-1, keepdim=True)
-        d = sq + sq.transpose(1, 2) - inner  # (B, N, N), small means close
-        return d.topk(k=k, dim=-1, largest=False).indices
+        B, N, C = x.shape
+        sq = (x * x).sum(dim=-1, keepdim=True)  # (B, N, 1)
+        if chunk is None or chunk >= N:
+            inner = 2 * torch.bmm(x, x.transpose(1, 2))
+            d = sq + sq.transpose(1, 2) - inner
+            return d.topk(k=k, dim=-1, largest=False).indices
+        out_chunks: list[Tensor] = []
+        for i in range(0, N, chunk):
+            x_c = x[:, i:i + chunk, :]
+            sq_c = sq[:, i:i + chunk, :]
+            inner = 2 * torch.bmm(x_c, x.transpose(1, 2))
+            d_c = sq_c + sq.transpose(1, 2) - inner  # (B, chunk, N)
+            out_chunks.append(d_c.topk(k=k, dim=-1, largest=False).indices)
+        return torch.cat(out_chunks, dim=1)
 
     def _gather_neighbours(x: "Tensor", idx: "Tensor") -> "Tensor":
-        """Gather neighbour features.
+        """Gather neighbour features without materialising ``(B, N, N, C)``.
 
         ``x`` ``(B, N, C)``, ``idx`` ``(B, N, k)`` -> ``(B, N, k, C)``.
+        Implemented as ``torch.gather`` along dim 1 with a flattened
+        index tensor so peak memory is only ``B * N * k * C`` instead
+        of ``B * N * N * C`` (the previous implementation blew up the
+        memory because ``expand`` is materialised by ``torch.gather``
+        on the expanded axis).
         """
         B, N, C = x.shape
         k = idx.shape[-1]
-        idx_b = idx.unsqueeze(-1).expand(B, N, k, C)
-        x_e = x.unsqueeze(1).expand(B, N, N, C)
-        return torch.gather(x_e, 2, idx_b)
+        idx_flat = idx.reshape(B, N * k).unsqueeze(-1).expand(-1, -1, C)
+        gathered = torch.gather(x, 1, idx_flat)
+        return gathered.reshape(B, N, k, C)
 
     class _SinusoidalTimeEmbedding(nn.Module):
         def __init__(self, dim: int) -> None:
@@ -95,9 +109,13 @@ if _TORCH_OK:
     class _EdgeConv(nn.Module):
         """EdgeConv layer with FiLM time-conditioning."""
 
-        def __init__(self, in_ch: int, out_ch: int, k: int, time_dim: int) -> None:
+        def __init__(
+            self, in_ch: int, out_ch: int, k: int, time_dim: int,
+            knn_chunk: int | None = None,
+        ) -> None:
             super().__init__()
             self.k = k
+            self.knn_chunk = knn_chunk
             self.mlp = nn.Sequential(
                 nn.Linear(2 * in_ch, out_ch),
                 nn.GELU(),
@@ -108,11 +126,11 @@ if _TORCH_OK:
 
         def forward(self, x: "Tensor", t_emb: "Tensor") -> "Tensor":
             # x: (B, N, C); KNN in feature space
-            idx = _knn_indices(x, self.k)
-            nb = _gather_neighbours(x, idx)
+            idx = _knn_indices(x, self.k, chunk=self.knn_chunk)
+            nb = _gather_neighbours(x, idx)               # (B, N, k, C)
             cur = x.unsqueeze(2).expand_as(nb)
             edge = torch.cat([cur, nb - cur], dim=-1)
-            f = self.mlp(edge).max(dim=2).values  # (B, N, out_ch)
+            f = self.mlp(edge).max(dim=2).values          # (B, N, out_ch)
             f = self.norm(f)
             scale_shift = self.time_proj(t_emb)
             scale, shift = scale_shift.chunk(2, dim=-1)
@@ -129,6 +147,7 @@ if _TORCH_OK:
             base: int = 64,
             time_dim: int = 128,
             k: int = 16,
+            knn_chunk: int | None = 2048,
         ) -> None:
             super().__init__()
             in_ch = 3 + 3 + prior_feat_dim + 3  # xyz + rgb + feat + x_t
@@ -139,10 +158,10 @@ if _TORCH_OK:
                 nn.Linear(time_dim, time_dim),
             )
             self.in_proj = nn.Linear(in_ch, base)
-            self.layer1 = _EdgeConv(base, base, k=k, time_dim=time_dim)
-            self.layer2 = _EdgeConv(base, base * 2, k=k, time_dim=time_dim)
-            self.layer3 = _EdgeConv(base * 2, base * 2, k=k, time_dim=time_dim)
-            self.layer4 = _EdgeConv(base * 2, base, k=k, time_dim=time_dim)
+            self.layer1 = _EdgeConv(base, base, k=k, time_dim=time_dim, knn_chunk=knn_chunk)
+            self.layer2 = _EdgeConv(base, base * 2, k=k, time_dim=time_dim, knn_chunk=knn_chunk)
+            self.layer3 = _EdgeConv(base * 2, base * 2, k=k, time_dim=time_dim, knn_chunk=knn_chunk)
+            self.layer4 = _EdgeConv(base * 2, base, k=k, time_dim=time_dim, knn_chunk=knn_chunk)
             self.out_mlp = nn.Sequential(
                 nn.LayerNorm(base),
                 nn.GELU(),
