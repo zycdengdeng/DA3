@@ -227,6 +227,7 @@ def _build_one_sample(
     ground_max_dz: float,
     target_search_radius: float,
     sam_auto_dir: Path | None = None,
+    segformer_dir: Path | None = None,
     ground_target_band_m: float = 0.4,
 ) -> dict | None:
     try:
@@ -333,22 +334,26 @@ def _build_one_sample(
         source_label, d_at, aahad_init, dist_to_lidar, sparse_present,
     ], axis=1).astype(np.float32)
 
-    # A1: per-point segment id from SAM Auto. -1 means "no SAM Auto
-    # data for this frame"; the dataset/network will treat -1 as a
-    # singleton segment (no cross-edge masking effect).
-    if sam_auto_dir is not None:
+    # A1: per-point segment id. SegFormer (per-pixel Cityscapes class)
+    # is preferred — every pixel has a class so there are no "empty
+    # background" pixels that would all collapse to id=0 and defeat
+    # the cross-segment masking. SAM Auto is the fallback (instance-
+    # level partitioning, but leaves road/sky/poles unsegmented).
+    segment_id = np.full(prior_xyz.shape[0], -1, dtype=np.int32)
+    if segformer_dir is not None:
+        sf_path = segformer_dir / f"{scene_id}_ts{ts_ms}_cam{cam_id}_seg.npz"
+        if sf_path.is_file():
+            with np.load(sf_path) as sf:
+                class_image = sf["class_id"]
+            if class_image.shape == (H, W):
+                segment_id = class_image[rows, cols].astype(np.int32)
+    elif sam_auto_dir is not None:
         sa_path = sam_auto_dir / f"{scene_id}_ts{ts_ms}_cam{cam_id}_sam_auto.npz"
         if sa_path.is_file():
             with np.load(sa_path) as sa:
                 seg_image = sa["segment_id"]
             if seg_image.shape == (H, W):
                 segment_id = seg_image[rows, cols].astype(np.int32)
-            else:
-                segment_id = np.full(prior_xyz.shape[0], -1, dtype=np.int32)
-        else:
-            segment_id = np.full(prior_xyz.shape[0], -1, dtype=np.int32)
-    else:
-        segment_id = np.full(prior_xyz.shape[0], -1, dtype=np.int32)
 
     return {
         "prior_xyz": prior_xyz.astype(np.float32),
@@ -397,11 +402,20 @@ def main() -> int:
     parser.add_argument(
         "--sam-auto-dir", default=None,
         help="optional directory of SAM Auto npz files "
-        "(output of run_sam_auto.py). When set, each prior point gets "
-        "a segment_id from the SAM Auto segmentation, written into "
-        "the npz alongside the other arrays. The training-time "
-        "segment-aware EdgeConv uses this to mask cross-segment "
-        "neighbours. When unset, all segment_ids = -1 (no masking).",
+        "(output of run_sam_auto.py). Class-agnostic instance "
+        "partitioning. For roadside scenes SAM tends to leave large "
+        "uniform regions (road, sky, poles) unsegmented; if you have "
+        "SegFormer outputs prefer --segformer-dir.",
+    )
+    parser.add_argument(
+        "--segformer-dir", default=None,
+        help="optional directory of SegFormer Cityscapes npz files "
+        "(output of run_segformer_inference.py). Per-pixel 19-class "
+        "semantic labels — every pixel has a class, so the segment-"
+        "aware EdgeConv masking actually works on roads / poles / "
+        "buildings / sky. RECOMMENDED over --sam-auto-dir for the "
+        "static-scene refinement task. If both are given, "
+        "--segformer-dir wins.",
     )
     parser.add_argument(
         "--ground-target-band-m", type=float, default=0.4,
@@ -436,6 +450,13 @@ def main() -> int:
     sam_auto_dir = Path(args.sam_auto_dir) if args.sam_auto_dir else None
     if sam_auto_dir is not None and not sam_auto_dir.is_dir():
         raise SystemExit(f"--sam-auto-dir {sam_auto_dir} not a directory")
+    segformer_dir = Path(args.segformer_dir) if args.segformer_dir else None
+    if segformer_dir is not None and not segformer_dir.is_dir():
+        raise SystemExit(f"--segformer-dir {segformer_dir} not a directory")
+    if segformer_dir is not None:
+        print(f"[seg] using SegFormer class_id from {segformer_dir}")
+    elif sam_auto_dir is not None:
+        print(f"[seg] using SAM Auto segment_id from {sam_auto_dir}")
 
     loader = RoadsideV2XLoader(
         data_root=args.data_root,
@@ -508,6 +529,7 @@ def main() -> int:
                 ground_max_dz=args.ground_snap_max_dz,
                 target_search_radius=args.target_search_radius,
                 sam_auto_dir=sam_auto_dir,
+                segformer_dir=segformer_dir,
                 ground_target_band_m=args.ground_target_band_m,
             )
             if sample is None:
