@@ -42,6 +42,7 @@ from lidar_anchored_depth.alignment.bbox_anchor import points_in_oriented_bbox
 from lidar_anchored_depth.alignment.projection import (
     camera_to_world,
     pixel_to_camera_ray,
+    world_to_image,
 )
 from lidar_anchored_depth.data import RoadsideV2XLoader
 from lidar_anchored_depth.pipeline.ground_height_grid import (
@@ -127,6 +128,77 @@ def _build_prior_for_frame(
     rgb = frame.image[rows, cols].astype(np.uint8)
     uv_int = np.stack([cols, rows], axis=1).astype(np.int32)
     return P_world.astype(np.float64), rgb, uv_int
+
+
+def _build_anchor_views(loader, scene_id, anchor_ts, cams):
+    """Snapshot the K, T_wc, image, and distortion of each camera at
+    the anchor ts. Used to project the fused world cloud back into
+    the cameras for image-RGB colour transfer."""
+    out = []
+    for cam_id in cams:
+        try:
+            idx = loader.find_frame_idx(scene_id, anchor_ts, cam_id)
+        except ValueError:
+            continue
+        f = loader.get_frame(idx)
+        out.append({
+            "cam_id": cam_id,
+            "image": f.image,
+            "K": f.K,
+            "T_wc": f.T_wc,
+            "distortion": f.meta.get("distortion"),
+            "image_hw": f.image.shape[:2],
+        })
+    return out
+
+
+def _colorize_cloud_from_views(xyz, fallback_rgb, views):
+    """For every point pick the anchor-ts camera with the smallest
+    z_cam (closest in front -> most likely to actually see the point,
+    short of full occlusion testing) and sample its RGB at the
+    projected pixel. Points that no camera sees keep ``fallback_rgb``.
+
+    Returns
+    -------
+    rgb : (N, 3) uint8 — re-coloured cloud.
+    n_recoloured : int  — how many points received a fresh image colour.
+    """
+    N = xyz.shape[0]
+    if fallback_rgb is None:
+        rgb_out = np.full((N, 3), 180, dtype=np.uint8)
+    else:
+        rgb_out = fallback_rgb.astype(np.uint8, copy=True)
+    z_best = np.full(N, np.inf, dtype=np.float64)
+
+    n_recoloured_total = 0
+    for v in views:
+        uv, z_cam, in_front = world_to_image(
+            xyz, v["K"], v["T_wc"], v["distortion"],
+        )
+        if uv.size == 0:
+            continue
+        H, W = v["image_hw"]
+        u_int = np.round(uv[:, 0]).astype(np.int64)
+        v_int = np.round(uv[:, 1]).astype(np.int64)
+        in_image = (
+            (u_int >= 0) & (u_int < W)
+            & (v_int >= 0) & (v_int < H)
+        )
+        idx_orig = np.flatnonzero(in_front)
+        keep = in_image
+        idx_orig_keep = idx_orig[keep]
+        z_keep = z_cam[keep]
+        u_keep = u_int[keep]
+        v_keep = v_int[keep]
+
+        is_closer = z_keep < z_best[idx_orig_keep]
+        upd = idx_orig_keep[is_closer]
+        z_best[upd] = z_keep[is_closer]
+        rgb_out[upd] = v["image"][v_keep[is_closer], u_keep[is_closer]]
+        n_recoloured_total += int(is_closer.sum())
+
+    n_recoloured = int(np.isfinite(z_best).sum())
+    return rgb_out, n_recoloured
 
 
 def main() -> int:
@@ -237,6 +309,18 @@ def main() -> int:
         "segment_id. Should match what was used at training time. "
         "If both --sam-auto-dir and --segformer-dir are given, "
         "--segformer-dir wins.",
+    )
+    parser.add_argument(
+        "--colorize-lidar", action="store_true", default=True,
+        help="re-colour every fused-cloud point by projecting it into "
+        "the anchor-ts cameras and sampling image RGB (closest camera "
+        "wins). LiDAR points that started out grey now get their real "
+        "photographic colour, so the final hybrid PLY is no longer "
+        "dominated by grey. Default ON.",
+    )
+    parser.add_argument(
+        "--no-colorize-lidar", action="store_false",
+        dest="colorize_lidar",
     )
     parser.add_argument("--loader-min-points", type=int, default=0)
     args = parser.parse_args()
@@ -475,6 +559,15 @@ def main() -> int:
         f"baseline voxels = {baseline_v_xyz.shape[0]}"
     )
 
+    # Build anchor-ts views once for image colour transfer.
+    anchor_views = []
+    if args.colorize_lidar and args.object_anchor_ts_ms is not None:
+        anchor_views = _build_anchor_views(
+            loader, scene_id, int(args.object_anchor_ts_ms), args.cams,
+        )
+        print(f"[colorize] anchor cams available at ts={args.object_anchor_ts_ms}: "
+              f"{len(anchor_views)} of {len(args.cams)}")
+
     # Optional Layer 4 LiDAR-priority fusion.
     if args.include_lidar_priority:
         print()
@@ -491,6 +584,15 @@ def main() -> int:
         n_lidar = int((source == 0).sum())
         n_aahad = int((source == 1).sum())
         print(f"  LiDAR backbone={n_lidar}  refined fill={n_aahad}")
+
+        if args.colorize_lidar and anchor_views:
+            fused_rgb_col, n_recol = _colorize_cloud_from_views(
+                fused_xyz, fused_rgb, anchor_views,
+            )
+            print(f"  [colorize] {n_recol}/{fused_xyz.shape[0]} points "
+                  f"received fresh image RGB")
+            fused_rgb = fused_rgb_col
+
         fused_v_xyz, fused_v_rgb = voxel_downsample(
             fused_xyz, args.voxel_size, colors=fused_rgb,
         )
@@ -547,6 +649,15 @@ def main() -> int:
         if args.include_lidar_priority and n_dyn_total > 0:
             fused_with_dyn_xyz = np.concatenate([fused_xyz, dyn_xyz], axis=0)
             fused_with_dyn_rgb = np.concatenate([fused_rgb, dyn_rgb], axis=0)
+
+            if args.colorize_lidar and anchor_views:
+                fused_with_dyn_rgb_col, n_recol = _colorize_cloud_from_views(
+                    fused_with_dyn_xyz, fused_with_dyn_rgb, anchor_views,
+                )
+                print(f"  [colorize-with-dyn] {n_recol}/"
+                      f"{fused_with_dyn_xyz.shape[0]} points coloured")
+                fused_with_dyn_rgb = fused_with_dyn_rgb_col
+
             full_v_xyz, full_v_rgb = voxel_downsample(
                 fused_with_dyn_xyz, args.voxel_size, colors=fused_with_dyn_rgb,
             )
