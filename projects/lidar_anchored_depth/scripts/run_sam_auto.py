@@ -129,6 +129,7 @@ def main() -> int:
     # Heavy imports here so --help is fast.
     print(f"[load] {args.model}")
     t0 = time.time()
+    from PIL import Image
     from transformers import pipeline
 
     generator = pipeline(
@@ -191,8 +192,11 @@ def main() -> int:
         H, W = frame.image.shape[:2]
 
         t_inf = time.time()
+        # HF mask-generation pipeline doesn't accept numpy arrays;
+        # wrap the (H, W, 3) uint8 RGB into a PIL Image first.
+        pil_image = Image.fromarray(frame.image)
         out = generator(
-            frame.image,
+            pil_image,
             points_per_side=args.points_per_side,
             pred_iou_thresh=args.pred_iou_thresh,
             stability_score_thresh=args.stability_score_thresh,
