@@ -152,6 +152,75 @@ def _build_anchor_views(loader, scene_id, anchor_ts, cams):
     return out
 
 
+def _render_bev(
+    xyz: np.ndarray,
+    rgb: np.ndarray | None,
+    *,
+    x_range: tuple[float, float],
+    y_range: tuple[float, float],
+    image_hw: tuple[int, int] = (1024, 1024),
+    background: tuple[int, int, int] = (0, 0, 0),
+) -> np.ndarray:
+    """Top-down z-buffer BEV renderer (highest Z wins per pixel).
+
+    Coordinate convention: world X grows to the right, world Y grows
+    downwards (image row index). World Z determines depth ordering.
+    """
+    H, W = image_hw
+    img = np.zeros((H, W, 3), dtype=np.uint8)
+    img[:] = background
+    if xyz.shape[0] == 0:
+        return img
+    z_buf = np.full((H, W), -np.inf, dtype=np.float32)
+
+    x_min, x_max = x_range
+    y_min, y_max = y_range
+    cell_x = (x_max - x_min) / W
+    cell_y = (y_max - y_min) / H
+
+    px = np.floor((xyz[:, 0] - x_min) / cell_x).astype(np.int64)
+    py = np.floor((xyz[:, 1] - y_min) / cell_y).astype(np.int64)
+    py = (H - 1) - py  # flip so +Y in world is up in image
+    z = xyz[:, 2].astype(np.float32)
+
+    in_image = (px >= 0) & (px < W) & (py >= 0) & (py < H)
+    px = px[in_image]; py = py[in_image]; z = z[in_image]
+    if rgb is not None:
+        rgb_v = rgb[in_image]
+    else:
+        rgb_v = np.full((px.size, 3), 200, dtype=np.uint8)
+
+    # z-buffer: highest z wins. Sort ascending so high z overwrites.
+    order = np.argsort(z, kind="stable")
+    px = px[order]; py = py[order]; z = z[order]; rgb_v = rgb_v[order]
+
+    # numpy vectorised "last write wins" via direct assignment in
+    # ascending-z order is exactly what we want.
+    img[py, px] = rgb_v
+    z_buf[py, px] = z
+    _ = z_buf
+    return img
+
+
+def _auto_bev_range(
+    xyz: np.ndarray,
+    pad_m: float = 5.0,
+    quantile: float = 0.02,
+) -> tuple[tuple[float, float], tuple[float, float]]:
+    """Robust X/Y range = quantile-trimmed bounds + padding."""
+    if xyz.shape[0] == 0:
+        return (-50.0, 50.0), (-50.0, 50.0)
+    x_lo = float(np.quantile(xyz[:, 0], quantile)) - pad_m
+    x_hi = float(np.quantile(xyz[:, 0], 1.0 - quantile)) + pad_m
+    y_lo = float(np.quantile(xyz[:, 1], quantile)) - pad_m
+    y_hi = float(np.quantile(xyz[:, 1], 1.0 - quantile)) + pad_m
+    # Make square so the BEV isn't stretched.
+    cx = 0.5 * (x_lo + x_hi)
+    cy = 0.5 * (y_lo + y_hi)
+    half = max(x_hi - x_lo, y_hi - y_lo) * 0.5
+    return (cx - half, cx + half), (cy - half, cy + half)
+
+
 def _colorize_cloud_from_views(xyz, fallback_rgb, views):
     """For every point pick the anchor-ts camera with the smallest
     z_cam (closest in front -> most likely to actually see the point,
@@ -309,6 +378,39 @@ def main() -> int:
         "segment_id. Should match what was used at training time. "
         "If both --sam-auto-dir and --segformer-dir are given, "
         "--segformer-dir wins.",
+    )
+    parser.add_argument(
+        "--video-mode", action="store_true",
+        help="iterate every ts in the scene; for each ts inject the "
+        "per-object snapshots at THAT ts (so dynamic objects move "
+        "naturally across frames) and render a BEV PNG. The static "
+        "refined+LiDAR cloud is computed once and reused. Output: "
+        "<output>/bev_<i:04d>.png + optional per-frame PLY.",
+    )
+    parser.add_argument(
+        "--video-ts-stride", type=int, default=1,
+        help="render every Nth ts (default 1 = every ts).",
+    )
+    parser.add_argument(
+        "--video-write-plys", action="store_true",
+        help="also save per-frame .ply (debug; lots of disk).",
+    )
+    parser.add_argument(
+        "--bev-image-size", type=int, nargs=2, default=[1024, 1024],
+        metavar=("H", "W"),
+    )
+    parser.add_argument(
+        "--bev-x-range", type=float, nargs=2, default=None,
+        metavar=("X_MIN", "X_MAX"),
+        help="world X range in metres (auto-computed from data if unset)",
+    )
+    parser.add_argument(
+        "--bev-y-range", type=float, nargs=2, default=None,
+        metavar=("Y_MIN", "Y_MAX"),
+    )
+    parser.add_argument(
+        "--bev-pad-m", type=float, default=5.0,
+        help="padding around the auto-computed BEV bounds (default 5 m)",
     )
     parser.add_argument(
         "--colorize-lidar", action="store_true", default=True,
@@ -666,6 +768,99 @@ def main() -> int:
                 full_v_xyz, full_v_rgb, binary=args.ply_binary,
             )
             print(f"  ↳ hybrid_with_dyn voxels = {full_v_xyz.shape[0]}")
+
+        # ------- VIDEO MODE -----------------------------------------
+        if args.video_mode:
+            try:
+                from PIL import Image as PILImage
+            except ModuleNotFoundError as e:
+                raise SystemExit("--video-mode requires Pillow") from e
+
+            print()
+            print("[video] per-ts BEV rendering")
+            x_range = (
+                tuple(args.bev_x_range) if args.bev_x_range else None
+            )
+            y_range = (
+                tuple(args.bev_y_range) if args.bev_y_range else None
+            )
+            if x_range is None or y_range is None:
+                auto_x, auto_y = _auto_bev_range(
+                    fused_xyz, pad_m=args.bev_pad_m,
+                )
+                x_range = x_range or auto_x
+                y_range = y_range or auto_y
+            print(f"  BEV  x={x_range}  y={y_range}  size={tuple(args.bev_image_size)}")
+
+            bev_dir = out_dir / "bev_frames"
+            bev_dir.mkdir(parents=True, exist_ok=True)
+            ply_dir = None
+            if args.video_write_plys:
+                ply_dir = out_dir / "frame_plys"
+                ply_dir.mkdir(parents=True, exist_ok=True)
+
+            ts_list = list(scene.timestamps_ms)[::max(1, args.video_ts_stride)]
+            print(f"  rendering {len(ts_list)} frames (stride={args.video_ts_stride})")
+
+            t_video = time.time()
+            for i, ts in enumerate(ts_list):
+                # Per-ts dynamic injection. Don't drop objects not at
+                # this exact ts (strict_anchor=False) — let them fall
+                # back to their median ts, so the video doesn't gap.
+                dyn_xyz_t, dyn_rgb_t, _ = inject_object_snapshots(
+                    loader, scene_id, clouds,
+                    cam_for_discovery=args.cams[0],
+                    anchor_ts_ms=int(ts),
+                    strict_anchor=False,
+                    object_fusion=args.object_fusion,
+                    object_voxel_size=args.object_voxel_size,
+                    object_max_dist_to_lidar=args.object_max_dist_to_lidar,
+                    mirror_axis=args.mirror_axis,
+                    mirror_classes=(
+                        frozenset(args.mirror_classes)
+                        if args.mirror_classes else None
+                    ),
+                    static_obj_ids=static_ids,
+                )
+
+                if dyn_xyz_t.shape[0] > 0:
+                    full_xyz = np.concatenate([fused_xyz, dyn_xyz_t], axis=0)
+                    full_rgb = np.concatenate([fused_rgb, dyn_rgb_t], axis=0)
+                else:
+                    full_xyz = fused_xyz
+                    full_rgb = fused_rgb
+
+                v_xyz, v_rgb = voxel_downsample(
+                    full_xyz, args.voxel_size, colors=full_rgb,
+                )
+                bev_img = _render_bev(
+                    v_xyz, v_rgb,
+                    x_range=x_range, y_range=y_range,
+                    image_hw=tuple(args.bev_image_size),
+                )
+                PILImage.fromarray(bev_img).save(
+                    bev_dir / f"bev_{i:04d}.png", quality=92,
+                )
+                if ply_dir is not None:
+                    write_ply_xyz(
+                        ply_dir / f"frame_{i:04d}.ply",
+                        v_xyz, v_rgb, binary=True,
+                    )
+
+                if (i + 1) % 10 == 0 or i == len(ts_list) - 1:
+                    elapsed = time.time() - t_video
+                    print(
+                        f"  frame {i + 1:>4}/{len(ts_list)}  "
+                        f"ts={ts}  N={v_xyz.shape[0]}  "
+                        f"({elapsed:.1f}s, {(i + 1) / elapsed:.1f} fps)"
+                    )
+
+            print()
+            print(f"  ↳ {len(ts_list)} BEV PNGs in {bev_dir}")
+            print(f"  ↳ to assemble video:")
+            print(f"     ffmpeg -framerate 10 -i {bev_dir}/bev_%04d.png \\")
+            print(f"            -c:v libx264 -pix_fmt yuv420p -crf 18 \\")
+            print(f"            {out_dir}/bev_video.mp4")
 
     summary = {
         "scene_id": scene_id,
