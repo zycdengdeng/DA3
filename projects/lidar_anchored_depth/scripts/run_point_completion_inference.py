@@ -246,6 +246,15 @@ def _colorize_cloud_from_views(xyz, fallback_rgb, views):
         )
         if uv.size == 0:
             continue
+        # World-to-image can return NaN/inf for degenerate projections
+        # (e.g. points exactly at the principal point with zero z); the
+        # subsequent int cast warns and produces undefined behaviour.
+        finite = np.isfinite(uv).all(axis=1)
+        if not finite.any():
+            continue
+        uv = uv[finite]
+        z_cam = z_cam[finite]
+        idx_orig = np.flatnonzero(in_front)[finite]
         H, W = v["image_hw"]
         u_int = np.round(uv[:, 0]).astype(np.int64)
         v_int = np.round(uv[:, 1]).astype(np.int64)
@@ -253,12 +262,10 @@ def _colorize_cloud_from_views(xyz, fallback_rgb, views):
             (u_int >= 0) & (u_int < W)
             & (v_int >= 0) & (v_int < H)
         )
-        idx_orig = np.flatnonzero(in_front)
-        keep = in_image
-        idx_orig_keep = idx_orig[keep]
-        z_keep = z_cam[keep]
-        u_keep = u_int[keep]
-        v_keep = v_int[keep]
+        idx_orig_keep = idx_orig[in_image]
+        z_keep = z_cam[in_image]
+        u_keep = u_int[in_image]
+        v_keep = v_int[in_image]
 
         is_closer = z_keep < z_best[idx_orig_keep]
         upd = idx_orig_keep[is_closer]
@@ -802,6 +809,24 @@ def main() -> int:
             ts_list = list(scene.timestamps_ms)[::max(1, args.video_ts_stride)]
             print(f"  rendering {len(ts_list)} frames (stride={args.video_ts_stride})")
 
+            # Pre-voxelise the static cloud ONCE outside the per-ts
+            # loop. Otherwise voxel_downsample on the full 50 M-point
+            # static + dyn cloud is called per frame (~45 min/frame
+            # via np.unique on a 50 M × 3 array). We pre-voxel down
+            # to ~3.5 M; per-frame we only voxel-down the small dyn
+            # part (~1 M -> ~100 k) and concatenate with the static
+            # voxels. The BEV renderer's z-buffer correctly handles
+            # any residual XY collisions between static and dyn.
+            print("  pre-voxelising static cloud (one-time)...")
+            t_pv = time.time()
+            static_v_xyz, static_v_rgb = voxel_downsample(
+                fused_xyz, args.voxel_size, colors=fused_rgb,
+            )
+            print(
+                f"    static {fused_xyz.shape[0]} -> "
+                f"{static_v_xyz.shape[0]} voxels  ({time.time() - t_pv:.1f}s)"
+            )
+
             t_video = time.time()
             for i, ts in enumerate(ts_list):
                 # Per-ts dynamic injection. Don't drop objects not at
@@ -824,35 +849,41 @@ def main() -> int:
                 )
 
                 if dyn_xyz_t.shape[0] > 0:
-                    full_xyz = np.concatenate([fused_xyz, dyn_xyz_t], axis=0)
-                    full_rgb = np.concatenate([fused_rgb, dyn_rgb_t], axis=0)
+                    # Voxel-down the dyn part (small, fast) so the
+                    # combined cloud fed to BEV stays manageable.
+                    dyn_v_xyz, dyn_v_rgb = voxel_downsample(
+                        dyn_xyz_t, args.voxel_size, colors=dyn_rgb_t,
+                    )
+                    full_xyz = np.concatenate(
+                        [static_v_xyz, dyn_v_xyz], axis=0,
+                    )
+                    full_rgb = np.concatenate(
+                        [static_v_rgb, dyn_v_rgb], axis=0,
+                    )
                 else:
-                    full_xyz = fused_xyz
-                    full_rgb = fused_rgb
+                    full_xyz = static_v_xyz
+                    full_rgb = static_v_rgb
 
-                v_xyz, v_rgb = voxel_downsample(
-                    full_xyz, args.voxel_size, colors=full_rgb,
-                )
                 bev_img = _render_bev(
-                    v_xyz, v_rgb,
+                    full_xyz, full_rgb,
                     x_range=x_range, y_range=y_range,
                     image_hw=tuple(args.bev_image_size),
                 )
                 PILImage.fromarray(bev_img).save(
-                    bev_dir / f"bev_{i:04d}.png", quality=92,
+                    bev_dir / f"bev_{i:04d}.png",
                 )
                 if ply_dir is not None:
                     write_ply_xyz(
                         ply_dir / f"frame_{i:04d}.ply",
-                        v_xyz, v_rgb, binary=True,
+                        full_xyz, full_rgb, binary=True,
                     )
 
                 if (i + 1) % 10 == 0 or i == len(ts_list) - 1:
                     elapsed = time.time() - t_video
                     print(
                         f"  frame {i + 1:>4}/{len(ts_list)}  "
-                        f"ts={ts}  N={v_xyz.shape[0]}  "
-                        f"({elapsed:.1f}s, {(i + 1) / elapsed:.1f} fps)"
+                        f"ts={ts}  N={full_xyz.shape[0]}  "
+                        f"({elapsed:.1f}s, {(i + 1) / elapsed:.2f} fps)"
                     )
 
             print()
