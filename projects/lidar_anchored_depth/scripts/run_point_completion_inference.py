@@ -714,7 +714,8 @@ def main() -> int:
     n_dyn_total = 0
     if args.recon_dir:
         from lidar_anchored_depth.pipeline.object_snapshot import (
-            discover_object_clouds, inject_object_snapshots,
+            build_object_pose_cache, discover_object_clouds,
+            inject_object_snapshots,
         )
         from lidar_anchored_depth.pipeline.v2x_static_classifier import (
             classify_v2x_objects, split_static_dynamic_ids,
@@ -736,6 +737,18 @@ def main() -> int:
             f"  motion: {len(static_ids)} static (always-on), "
             f"{len(dyn_ids)} dynamic (anchor only)"
         )
+
+        # Build ts_cache ONCE — turns inject_object_snapshots from
+        # O(n_objects × n_ts × frame_load) into O(n_objects) per call.
+        # Critical for video mode (where it is called per ts) but it
+        # also speeds up the single-anchor call by ~50x.
+        t_cache = time.time()
+        ts_cache = build_object_pose_cache(
+            loader, scene_id, cam_for_discovery=args.cams[0],
+        )
+        print(f"  built object pose cache: {len(ts_cache)} obj_ids "
+              f"({time.time() - t_cache:.1f}s)")
+
         dyn_xyz, dyn_rgb, inj_log = inject_object_snapshots(
             loader, scene_id, clouds,
             cam_for_discovery=args.cams[0],
@@ -747,6 +760,7 @@ def main() -> int:
             mirror_axis=args.mirror_axis,
             mirror_classes=frozenset(args.mirror_classes) if args.mirror_classes else None,
             static_obj_ids=static_ids,
+            ts_cache=ts_cache,
         )
         n_dyn_total = int(dyn_xyz.shape[0])
         n_kept = sum(1 for r in inj_log if r["n_pts"] > 0)
@@ -832,6 +846,8 @@ def main() -> int:
                 # Per-ts dynamic injection. Don't drop objects not at
                 # this exact ts (strict_anchor=False) — let them fall
                 # back to their median ts, so the video doesn't gap.
+                # ts_cache makes this call O(n_objects) rather than
+                # O(n_objects × n_ts × frame_load).
                 dyn_xyz_t, dyn_rgb_t, _ = inject_object_snapshots(
                     loader, scene_id, clouds,
                     cam_for_discovery=args.cams[0],
@@ -846,6 +862,7 @@ def main() -> int:
                         if args.mirror_classes else None
                     ),
                     static_obj_ids=static_ids,
+                    ts_cache=ts_cache,
                 )
 
                 if dyn_xyz_t.shape[0] > 0:

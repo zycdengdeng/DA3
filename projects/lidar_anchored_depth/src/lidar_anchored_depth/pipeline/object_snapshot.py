@@ -184,6 +184,55 @@ def discover_object_clouds(
     return out
 
 
+def build_object_pose_cache(
+    loader: RoadsideV2XLoader,
+    scene_id: str,
+    cam_for_discovery: str = "0",
+) -> dict[int, list[tuple[int, DynamicObject]]]:
+    """Walk every (ts, cam_for_discovery) frame in the scene ONCE and
+    collect, per V2X obj_id, the list of ``(ts, DynamicObject)`` pairs.
+
+    Use the returned dict with :func:`inject_object_snapshots` via the
+    ``ts_cache=`` argument: it skips the per-object inner loop that
+    otherwise reloads every frame for every object on every call,
+    which dominates the runtime of video-mode rendering.
+    """
+    scene = next((s for s in loader.scenes if s.scene_id == scene_id), None)
+    if scene is None:
+        return {}
+    cache: dict[int, list[tuple[int, DynamicObject]]] = {}
+    for ts in scene.timestamps_ms:
+        try:
+            idx = loader.find_frame_idx(scene_id, ts, cam_for_discovery)
+        except ValueError:
+            continue
+        frame = loader.get_frame(idx)
+        for obj in frame.dynamic_objects or []:
+            cache.setdefault(int(obj.id), []).append((int(ts), obj))
+    return cache
+
+
+def _pick_object_ts_cached(
+    cache: dict[int, list[tuple[int, DynamicObject]]],
+    obj_id: int,
+    *,
+    anchor_ts_ms: int | None = None,
+    strict_anchor: bool = False,
+) -> tuple[int, DynamicObject] | None:
+    """O(1) cache lookup version of ``_pick_object_ts``."""
+    matches = cache.get(int(obj_id))
+    if not matches:
+        return None
+    if anchor_ts_ms is not None:
+        for t, obj in matches:
+            if t == int(anchor_ts_ms):
+                return t, obj
+        if strict_anchor:
+            return None
+    matches_sorted = sorted(matches, key=lambda p: p[0])
+    return matches_sorted[len(matches_sorted) // 2]
+
+
 def _pick_object_ts(
     loader: RoadsideV2XLoader,
     scene_id: str,
@@ -242,6 +291,7 @@ def inject_object_snapshots(
     mirror_axis: str | None = None,
     mirror_classes: frozenset[str] | None = None,
     static_obj_ids: set[int] | None = None,
+    ts_cache: dict[int, list[tuple[int, "DynamicObject"]]] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, list[dict]]:
     """Place per-object clouds at their representative ts pose.
 
@@ -295,11 +345,18 @@ def inject_object_snapshots(
 
     for obj_id, clouds in object_clouds.items():
         is_static = int(obj_id) in static_set
-        pick = _pick_object_ts(
-            loader, scene_id, obj_id, cam_for_discovery,
-            anchor_ts_ms=anchor_ts_ms,
-            strict_anchor=strict_anchor and not is_static,
-        )
+        if ts_cache is not None:
+            pick = _pick_object_ts_cached(
+                ts_cache, obj_id,
+                anchor_ts_ms=anchor_ts_ms,
+                strict_anchor=strict_anchor and not is_static,
+            )
+        else:
+            pick = _pick_object_ts(
+                loader, scene_id, obj_id, cam_for_discovery,
+                anchor_ts_ms=anchor_ts_ms,
+                strict_anchor=strict_anchor and not is_static,
+            )
         if pick is None:
             reason = (
                 "not_at_anchor_ts"
@@ -414,6 +471,7 @@ def inject_object_snapshots(
 
 __all__ = [
     "ObjectClouds",
+    "build_object_pose_cache",
     "discover_object_clouds",
     "fuse_object_clouds",
     "inject_object_snapshots",
