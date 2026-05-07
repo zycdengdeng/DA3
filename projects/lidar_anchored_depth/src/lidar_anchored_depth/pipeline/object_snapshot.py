@@ -247,11 +247,19 @@ def _pick_object_ts_video(
     current_ts_ms: int,
     *,
     max_extrap_ms: int = 200,
+    max_gap_ms: int = 500,
 ) -> tuple[int, DynamicObject] | None:
     """Video-mode picker: linearly interpolate the object's pose
     between its two surrounding annotated ts; return ``None`` when
-    ``current_ts_ms`` is outside the object's annotation window plus
-    a small extrapolation tolerance.
+
+    * ``current_ts_ms`` is outside the object's annotation window
+      plus ``max_extrap_ms`` tolerance, or
+    * ``current_ts_ms`` falls inside a gap between two consecutive
+      annotations that are farther apart than ``max_gap_ms``. Such a
+      gap usually means V2X tracking lost the object — interpolating
+      across it would slide a parked car across the scene to where
+      a re-acquired track happens to be (the user's reported "car
+      teleporting back to the intersection").
 
     This replaces the older "fall back to median ts" behaviour, which
     made sparsely-annotated objects look stationary at one fixed
@@ -287,6 +295,14 @@ def _pick_object_ts_video(
 
     t_prev = timestamps[idx - 1]
     t_next = timestamps[idx]
+
+    # Tracker-loss detection: if the bracketing annotations are far
+    # apart, we are inside an annotation gap that almost certainly
+    # came from V2X failing to track this object across that span.
+    # Don't render — the object truly isn't visible there.
+    if (t_next - t_prev) > int(max_gap_ms):
+        return None
+
     obj_prev = matches_sorted[idx - 1][1]
     obj_next = matches_sorted[idx][1]
     alpha = (current_ts_ms - t_prev) / max(t_next - t_prev, 1)
@@ -372,6 +388,7 @@ def inject_object_snapshots(
     ts_cache: dict[int, list[tuple[int, "DynamicObject"]]] | None = None,
     video_anchor_ts_ms: int | None = None,
     video_max_extrap_ms: int = 200,
+    video_max_gap_ms: int = 500,
 ) -> tuple[np.ndarray, np.ndarray, list[dict]]:
     """Place per-object clouds at their representative ts pose.
 
@@ -453,11 +470,13 @@ def inject_object_snapshots(
                 pick = _pick_object_ts_video(
                     ts_cache_local, obj_id, int(video_anchor_ts_ms),
                     max_extrap_ms=video_max_extrap_ms,
+                    max_gap_ms=video_max_gap_ms,
                 )
             else:
                 pick = _pick_object_ts_video(
                     ts_cache, obj_id, int(video_anchor_ts_ms),
                     max_extrap_ms=video_max_extrap_ms,
+                    max_gap_ms=video_max_gap_ms,
                 )
         elif ts_cache is not None:
             pick = _pick_object_ts_cached(

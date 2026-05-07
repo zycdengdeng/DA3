@@ -149,3 +149,39 @@ def test_pick_video_returns_none_for_unknown_obj():
     from lidar_anchored_depth.pipeline.object_snapshot import _pick_object_ts_video
 
     assert _pick_object_ts_video({}, 7, 1000, max_extrap_ms=100) is None
+
+
+def test_pick_video_drops_inside_huge_gap():
+    """User-reported bug: V2X tracking lost between t=1100 and t=2100
+    (1 sec gap, 10x larger than normal 100 ms ts spacing). Linearly
+    interpolating across the gap teleported the object across the
+    scene. Now we drop it."""
+    from lidar_anchored_depth.pipeline.object_snapshot import _pick_object_ts_video
+
+    cache = {7: [
+        (1000, _make_obj(7, "Car", [50, 0, 0])),
+        (1100, _make_obj(7, "Car", [55, 0, 0])),  # smooth motion
+        (2100, _make_obj(7, "Car", [0, 0, 0])),   # 1 sec later, jump
+        (2200, _make_obj(7, "Car", [0, 0, 0])),
+    ]}
+    # Gap window 1100-2100 (1000 ms) > max_gap_ms 500 → cull
+    assert _pick_object_ts_video(cache, 7, 1500, max_extrap_ms=200, max_gap_ms=500) is None
+    assert _pick_object_ts_video(cache, 7, 1700, max_extrap_ms=200, max_gap_ms=500) is None
+    # Inside normal-spacing windows: still rendered
+    out = _pick_object_ts_video(cache, 7, 1050, max_extrap_ms=200, max_gap_ms=500)
+    assert out is not None
+    out = _pick_object_ts_video(cache, 7, 2150, max_extrap_ms=200, max_gap_ms=500)
+    assert out is not None
+
+
+def test_pick_video_max_gap_disabled_passes_through():
+    """With max_gap_ms = inf, even huge gaps interpolate (old behaviour)."""
+    from lidar_anchored_depth.pipeline.object_snapshot import _pick_object_ts_video
+
+    cache = {7: [
+        (1000, _make_obj(7, "Car", [0, 0, 0])),
+        (5000, _make_obj(7, "Car", [100, 0, 0])),
+    ]}
+    out = _pick_object_ts_video(cache, 7, 3000, max_extrap_ms=0, max_gap_ms=10**9)
+    assert out is not None
+    assert abs(out[1].xyz[0] - 50.0) < 1e-3

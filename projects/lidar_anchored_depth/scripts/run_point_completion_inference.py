@@ -412,6 +412,15 @@ def main() -> int:
         "objects truly disappear when they leave the scene.",
     )
     parser.add_argument(
+        "--video-max-gap-ms", type=int, default=500,
+        help="if the two annotated ts that bracket the current "
+        "video ts are farther apart than this, the object is NOT "
+        "rendered (the gap usually means V2X tracking failed across "
+        "that span; interpolating across it teleports the object). "
+        "Default 500 ms (= 5 ts at 10 Hz). Set to a very large value "
+        "to disable the check.",
+    )
+    parser.add_argument(
         "--bev-image-size", type=int, nargs=2, default=[1024, 1024],
         metavar=("H", "W"),
     )
@@ -925,6 +934,7 @@ def main() -> int:
                     ts_cache=ts_cache,
                     video_anchor_ts_ms=int(ts),
                     video_max_extrap_ms=args.video_max_extrap_ms,
+                    video_max_gap_ms=args.video_max_gap_ms,
                 )
 
                 if dyn_xyz_t.shape[0] > 0:
