@@ -233,6 +233,84 @@ def _pick_object_ts_cached(
     return matches_sorted[len(matches_sorted) // 2]
 
 
+def _angle_lerp(a: float, b: float, alpha: float) -> float:
+    """Linearly interpolate between two angles (radians) along the
+    shortest direction; result is in ``[-pi, pi]`` modulo wrap."""
+    import math
+    diff = ((b - a) + math.pi) % (2.0 * math.pi) - math.pi
+    return float(a + alpha * diff)
+
+
+def _pick_object_ts_video(
+    cache: dict[int, list[tuple[int, DynamicObject]]],
+    obj_id: int,
+    current_ts_ms: int,
+    *,
+    max_extrap_ms: int = 200,
+) -> tuple[int, DynamicObject] | None:
+    """Video-mode picker: linearly interpolate the object's pose
+    between its two surrounding annotated ts; return ``None`` when
+    ``current_ts_ms`` is outside the object's annotation window plus
+    a small extrapolation tolerance.
+
+    This replaces the older "fall back to median ts" behaviour, which
+    made sparsely-annotated objects look stationary at one fixed
+    position across the whole video and never disappear.
+    """
+    import bisect
+    from dataclasses import replace
+
+    matches = cache.get(int(obj_id))
+    if not matches:
+        return None
+    matches_sorted = sorted(matches, key=lambda p: p[0])
+    timestamps = [m[0] for m in matches_sorted]
+    current_ts_ms = int(current_ts_ms)
+
+    if current_ts_ms < timestamps[0] - int(max_extrap_ms):
+        return None
+    if current_ts_ms > timestamps[-1] + int(max_extrap_ms):
+        return None
+
+    idx = bisect.bisect_left(timestamps, current_ts_ms)
+
+    # Exact match
+    if idx < len(timestamps) and timestamps[idx] == current_ts_ms:
+        return current_ts_ms, matches_sorted[idx][1]
+
+    # Within the extrapolation tolerance before first annotation
+    if idx == 0:
+        return current_ts_ms, matches_sorted[0][1]
+    # ... or after last
+    if idx >= len(timestamps):
+        return current_ts_ms, matches_sorted[-1][1]
+
+    t_prev = timestamps[idx - 1]
+    t_next = timestamps[idx]
+    obj_prev = matches_sorted[idx - 1][1]
+    obj_next = matches_sorted[idx][1]
+    alpha = (current_ts_ms - t_prev) / max(t_next - t_prev, 1)
+
+    xyz_prev = np.asarray(obj_prev.xyz, dtype=np.float64)
+    xyz_next = np.asarray(obj_next.xyz, dtype=np.float64)
+    interp_xyz = ((1.0 - alpha) * xyz_prev + alpha * xyz_next)
+    if hasattr(obj_prev.xyz, "tolist"):
+        interp_xyz = np.asarray(interp_xyz, dtype=xyz_prev.dtype)
+
+    interp_yaw = _angle_lerp(float(obj_prev.yaw), float(obj_next.yaw), alpha)
+    interp_pitch = _angle_lerp(float(obj_prev.pitch), float(obj_next.pitch), alpha)
+    interp_roll = _angle_lerp(float(obj_prev.roll), float(obj_next.roll), alpha)
+
+    interp_obj = replace(
+        obj_prev,
+        xyz=interp_xyz,
+        yaw=interp_yaw,
+        pitch=interp_pitch,
+        roll=interp_roll,
+    )
+    return current_ts_ms, interp_obj
+
+
 def _pick_object_ts(
     loader: RoadsideV2XLoader,
     scene_id: str,
@@ -292,6 +370,8 @@ def inject_object_snapshots(
     mirror_classes: frozenset[str] | None = None,
     static_obj_ids: set[int] | None = None,
     ts_cache: dict[int, list[tuple[int, "DynamicObject"]]] | None = None,
+    video_anchor_ts_ms: int | None = None,
+    video_max_extrap_ms: int = 200,
 ) -> tuple[np.ndarray, np.ndarray, list[dict]]:
     """Place per-object clouds at their representative ts pose.
 
@@ -345,7 +425,41 @@ def inject_object_snapshots(
 
     for obj_id, clouds in object_clouds.items():
         is_static = int(obj_id) in static_set
-        if ts_cache is not None:
+        if video_anchor_ts_ms is not None:
+            # Video mode: interpolate pose between the two annotated
+            # ts that bracket video_anchor_ts_ms; drop the object
+            # entirely if that ts is outside its annotation window
+            # (avoids the old "stuck at median pose, then disappears"
+            # behaviour the user reported).
+            if ts_cache is None:
+                # Build a tiny per-call cache as a fallback.
+                ts_cache_local: dict[int, list[tuple[int, DynamicObject]]] = {}
+                scene = next(
+                    (s for s in loader.scenes if s.scene_id == scene_id), None,
+                )
+                if scene is not None:
+                    for ts in scene.timestamps_ms:
+                        try:
+                            idx = loader.find_frame_idx(scene_id, ts, cam_for_discovery)
+                        except ValueError:
+                            continue
+                        frame = loader.get_frame(idx)
+                        for obj in frame.dynamic_objects or []:
+                            if int(obj.id) == int(obj_id):
+                                ts_cache_local.setdefault(int(obj_id), []).append(
+                                    (int(ts), obj),
+                                )
+                                break
+                pick = _pick_object_ts_video(
+                    ts_cache_local, obj_id, int(video_anchor_ts_ms),
+                    max_extrap_ms=video_max_extrap_ms,
+                )
+            else:
+                pick = _pick_object_ts_video(
+                    ts_cache, obj_id, int(video_anchor_ts_ms),
+                    max_extrap_ms=video_max_extrap_ms,
+                )
+        elif ts_cache is not None:
             pick = _pick_object_ts_cached(
                 ts_cache, obj_id,
                 anchor_ts_ms=anchor_ts_ms,

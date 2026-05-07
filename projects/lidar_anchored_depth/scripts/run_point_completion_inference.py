@@ -404,6 +404,14 @@ def main() -> int:
         help="also save per-frame .ply (debug; lots of disk).",
     )
     parser.add_argument(
+        "--video-max-extrap-ms", type=int, default=200,
+        help="for video pose interpolation: when the video ts is "
+        "outside the object's annotation window by more than this, "
+        "the object is not rendered. Default 200 ms — enough to "
+        "absorb V2X annotation gaps but small enough to make "
+        "objects truly disappear when they leave the scene.",
+    )
+    parser.add_argument(
         "--bev-image-size", type=int, nargs=2, default=[1024, 1024],
         metavar=("H", "W"),
     )
@@ -895,16 +903,16 @@ def main() -> int:
 
             t_video = time.time()
             for i, ts in enumerate(ts_list):
-                # Per-ts dynamic injection. Don't drop objects not at
-                # this exact ts (strict_anchor=False) — let them fall
-                # back to their median ts, so the video doesn't gap.
-                # ts_cache makes this call O(n_objects) rather than
-                # O(n_objects × n_ts × frame_load).
+                # Per-ts dynamic injection with linear pose
+                # interpolation between the two annotated ts that
+                # bracket this video frame. Objects outside their
+                # annotation window (extrapolation > video_max_extrap_ms)
+                # are dropped. Replaces the older "fall back to median
+                # ts" behaviour which left sparsely-annotated cars
+                # frozen at one position across the whole video.
                 dyn_xyz_t, dyn_rgb_t, _ = inject_object_snapshots(
                     loader, scene_id, clouds,
                     cam_for_discovery=args.cams[0],
-                    anchor_ts_ms=int(ts),
-                    strict_anchor=False,
                     object_fusion=args.object_fusion,
                     object_voxel_size=args.object_voxel_size,
                     object_max_dist_to_lidar=args.object_max_dist_to_lidar,
@@ -915,6 +923,8 @@ def main() -> int:
                     ),
                     static_obj_ids=static_ids,
                     ts_cache=ts_cache,
+                    video_anchor_ts_ms=int(ts),
+                    video_max_extrap_ms=args.video_max_extrap_ms,
                 )
 
                 if dyn_xyz_t.shape[0] > 0:
