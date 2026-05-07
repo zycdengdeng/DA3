@@ -56,6 +56,7 @@ from lidar_anchored_depth.pipeline.lidar_completion import (
 )
 from lidar_anchored_depth.reconstruction import (
     voxel_downsample,
+    voxel_downsample_robust,
     write_ply_xyz,
 )
 from lidar_anchored_depth.segmentation.sam_io import load_sam_dynamic_mask
@@ -420,6 +421,17 @@ def main() -> int:
         help="padding around the auto-computed BEV bounds (default 5 m)",
     )
     parser.add_argument(
+        "--robust-color", default="median",
+        choices=["mean", "median", "mad-trim"],
+        help="per-voxel colour aggregation when multiple (cam, ts) "
+        "samples land in the same voxel. 'mean' = simple average "
+        "(fast, but momentary occluders bleed in). 'median' = "
+        "outlier-immune up to 50%% bad samples per channel "
+        "(default; recommended for static accumulation where moving "
+        "vehicles briefly occlude road voxels). 'mad-trim' = median "
+        "+ MAD-based inlier filter, then mean of inliers.",
+    )
+    parser.add_argument(
         "--colorize-lidar", action="store_true", default=True,
         help="re-colour every fused-cloud point by projecting it into "
         "the anchor-ts cameras and sampling image RGB (closest camera "
@@ -430,6 +442,18 @@ def main() -> int:
     parser.add_argument(
         "--no-colorize-lidar", action="store_false",
         dest="colorize_lidar",
+    )
+    parser.add_argument(
+        "--colorize-only-lidar-points", action="store_true", default=True,
+        help="when re-colouring, only touch LiDAR-source points "
+        "(which started out fall-back grey) and leave AA-HAD points' "
+        "multi-frame median colours intact. Default ON. Set "
+        "--no-colorize-only-lidar-points to re-colour everything from "
+        "the anchor-ts cameras (matches the old behaviour).",
+    )
+    parser.add_argument(
+        "--no-colorize-only-lidar-points", action="store_false",
+        dest="colorize_only_lidar_points",
     )
     parser.add_argument("--loader-min-points", type=int, default=0)
     args = parser.parse_args()
@@ -648,12 +672,17 @@ def main() -> int:
     print(f"[accum] N refined = {refined_xyz.shape[0]}  "
           f"N baseline = {baseline_xyz.shape[0]}")
 
-    # Voxel-downsample for visualisation parity.
-    refined_v_xyz, refined_v_rgb = voxel_downsample(
+    # Voxel-downsample for visualisation parity. Robust per-voxel
+    # colour aggregation (median by default) handles the common
+    # multi-frame artefact of a moving vehicle briefly writing its
+    # colour onto a road voxel as it passes through.
+    refined_v_xyz, refined_v_rgb = voxel_downsample_robust(
         refined_xyz, args.voxel_size, colors=refined_rgb,
+        color_method=args.robust_color,
     )
-    baseline_v_xyz, baseline_v_rgb = voxel_downsample(
+    baseline_v_xyz, baseline_v_rgb = voxel_downsample_robust(
         baseline_xyz, args.voxel_size, colors=baseline_rgb,
+        color_method=args.robust_color,
     )
     write_ply_xyz(
         out_dir / f"{scene_id}_completion_3d_refined.ply",
@@ -695,15 +724,32 @@ def main() -> int:
         print(f"  LiDAR backbone={n_lidar}  refined fill={n_aahad}")
 
         if args.colorize_lidar and anchor_views:
-            fused_rgb_col, n_recol = _colorize_cloud_from_views(
-                fused_xyz, fused_rgb, anchor_views,
-            )
-            print(f"  [colorize] {n_recol}/{fused_xyz.shape[0]} points "
-                  f"received fresh image RGB")
-            fused_rgb = fused_rgb_col
+            if args.colorize_only_lidar_points:
+                # Only re-colour LiDAR-source points (which start out
+                # fall-back grey); keep the AA-HAD-fill points'
+                # multi-frame-aggregated image colours as-is.
+                lidar_mask = source == 0
+                lidar_xyz = fused_xyz[lidar_mask]
+                lidar_rgb = fused_rgb[lidar_mask]
+                lidar_rgb_col, n_recol = _colorize_cloud_from_views(
+                    lidar_xyz, lidar_rgb, anchor_views,
+                )
+                fused_rgb = fused_rgb.copy()
+                fused_rgb[lidar_mask] = lidar_rgb_col
+                print(f"  [colorize-lidar-only] {n_recol}/"
+                      f"{int(lidar_mask.sum())} LiDAR points "
+                      f"got image RGB")
+            else:
+                fused_rgb_col, n_recol = _colorize_cloud_from_views(
+                    fused_xyz, fused_rgb, anchor_views,
+                )
+                print(f"  [colorize] {n_recol}/{fused_xyz.shape[0]} points "
+                      f"received fresh image RGB")
+                fused_rgb = fused_rgb_col
 
-        fused_v_xyz, fused_v_rgb = voxel_downsample(
+        fused_v_xyz, fused_v_rgb = voxel_downsample_robust(
             fused_xyz, args.voxel_size, colors=fused_rgb,
+            color_method=args.robust_color,
         )
         write_ply_xyz(
             out_dir / f"{scene_id}_completion_3d_hybrid.ply",
@@ -773,7 +819,11 @@ def main() -> int:
             fused_with_dyn_xyz = np.concatenate([fused_xyz, dyn_xyz], axis=0)
             fused_with_dyn_rgb = np.concatenate([fused_rgb, dyn_rgb], axis=0)
 
-            if args.colorize_lidar and anchor_views:
+            # Colorize-with-dyn: don't touch dyn (it has per-object
+            # accumulated colours which average across the object's
+            # observations, useful when no single ts shows all sides);
+            # only re-colour LiDAR-source points if requested.
+            if args.colorize_lidar and anchor_views and not args.colorize_only_lidar_points:
                 fused_with_dyn_rgb_col, n_recol = _colorize_cloud_from_views(
                     fused_with_dyn_xyz, fused_with_dyn_rgb, anchor_views,
                 )
@@ -781,8 +831,9 @@ def main() -> int:
                       f"{fused_with_dyn_xyz.shape[0]} points coloured")
                 fused_with_dyn_rgb = fused_with_dyn_rgb_col
 
-            full_v_xyz, full_v_rgb = voxel_downsample(
+            full_v_xyz, full_v_rgb = voxel_downsample_robust(
                 fused_with_dyn_xyz, args.voxel_size, colors=fused_with_dyn_rgb,
+                color_method=args.robust_color,
             )
             write_ply_xyz(
                 out_dir / f"{scene_id}_completion_3d_hybrid_with_dyn.ply",
@@ -833,8 +884,9 @@ def main() -> int:
             # any residual XY collisions between static and dyn.
             print("  pre-voxelising static cloud (one-time)...")
             t_pv = time.time()
-            static_v_xyz, static_v_rgb = voxel_downsample(
+            static_v_xyz, static_v_rgb = voxel_downsample_robust(
                 fused_xyz, args.voxel_size, colors=fused_rgb,
+                color_method=args.robust_color,
             )
             print(
                 f"    static {fused_xyz.shape[0]} -> "

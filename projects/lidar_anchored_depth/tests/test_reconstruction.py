@@ -375,3 +375,85 @@ def test_ply_xyz_rgb_round_trip_binary(tmp_path):
     pts_back, rgb_back = read_ply_xyz_rgb(p)
     np.testing.assert_allclose(pts_back, pts, atol=1e-5)
     np.testing.assert_array_equal(rgb_back, rgb)
+
+
+# --- voxel_downsample_robust ---------------------------------------------
+
+def test_voxel_robust_median_resists_outlier():
+    """One voxel with three samples: two grey [120 120 120], one red
+    [255 0 0] (the "moving car" outlier). Mean would give pinkish;
+    median should return grey."""
+    from lidar_anchored_depth.reconstruction import voxel_downsample_robust
+
+    pts = np.array([
+        [0.01, 0.01, 0.01],
+        [0.02, 0.02, 0.02],
+        [0.03, 0.03, 0.03],
+    ])
+    rgb = np.array([
+        [120, 120, 120],
+        [120, 120, 120],
+        [255, 0, 0],
+    ], dtype=np.uint8)
+    _, rgb_out = voxel_downsample_robust(
+        pts, voxel_size=1.0, colors=rgb, color_method="median",
+    )
+    assert rgb_out.shape == (1, 3)
+    assert tuple(int(c) for c in rgb_out[0]) == (120, 120, 120)
+
+
+def test_voxel_robust_median_matches_mean_when_uniform():
+    from lidar_anchored_depth.reconstruction import voxel_downsample_robust
+
+    pts = np.array([[0.0, 0.0, 0.0], [0.01, 0.0, 0.0]])
+    rgb = np.array([[100, 50, 200], [100, 50, 200]], dtype=np.uint8)
+    _, mean_rgb = voxel_downsample_robust(
+        pts, 1.0, colors=rgb, color_method="mean",
+    )
+    _, med_rgb = voxel_downsample_robust(
+        pts, 1.0, colors=rgb, color_method="median",
+    )
+    assert np.array_equal(mean_rgb, med_rgb)
+
+
+def test_voxel_robust_madtrim_falls_back_to_mean_for_small_voxels():
+    from lidar_anchored_depth.reconstruction import voxel_downsample_robust
+
+    # 2 samples per voxel — too few for MAD; fall back to mean.
+    pts = np.array([[0.0, 0.0, 0.0], [0.01, 0.0, 0.0]])
+    rgb = np.array([[100, 100, 100], [200, 200, 200]], dtype=np.uint8)
+    _, rgb_out = voxel_downsample_robust(
+        pts, 1.0, colors=rgb, color_method="mad-trim",
+    )
+    assert tuple(int(c) for c in rgb_out[0]) == (150, 150, 150)
+
+
+def test_voxel_robust_separates_voxels_by_key():
+    from lidar_anchored_depth.reconstruction import voxel_downsample_robust
+
+    pts = np.array([
+        [0.0, 0.0, 0.0],
+        [0.01, 0.01, 0.01],
+        [10.0, 10.0, 10.0],
+    ])
+    rgb = np.array([
+        [120, 120, 120],
+        [120, 120, 120],
+        [50, 50, 50],
+    ], dtype=np.uint8)
+    xyz_out, rgb_out = voxel_downsample_robust(
+        pts, voxel_size=1.0, colors=rgb, color_method="median",
+    )
+    assert xyz_out.shape == (2, 3)
+    sorted_rgb = sorted(tuple(int(c) for c in row) for row in rgb_out)
+    assert sorted_rgb == [(50, 50, 50), (120, 120, 120)]
+
+
+def test_voxel_robust_unknown_method_raises():
+    import pytest
+    from lidar_anchored_depth.reconstruction import voxel_downsample_robust
+
+    pts = np.array([[0.0, 0.0, 0.0]])
+    rgb = np.array([[100, 100, 100]], dtype=np.uint8)
+    with pytest.raises(ValueError):
+        voxel_downsample_robust(pts, 1.0, colors=rgb, color_method="bogus")

@@ -33,6 +33,7 @@ from lidar_anchored_depth.reconstruction.io import (
 from lidar_anchored_depth.reconstruction.object_local import (
     object_local_to_world,
     voxel_downsample,
+    voxel_downsample_robust,
     world_to_object_local,
 )
 from lidar_anchored_depth.reconstruction.unproject import (
@@ -49,6 +50,7 @@ __all__ = [
     "read_ply_xyz",
     "read_ply_xyz_rgb",
     "voxel_downsample",
+    "voxel_downsample_robust",
     "world_to_object_local",
     "write_ply_xyz",
 ]
