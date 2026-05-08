@@ -343,6 +343,29 @@ def main() -> int:
     )
     parser.add_argument("--max-dist-to-lidar", type=float, default=2.0)
 
+    parser.add_argument(
+        "--lidar-skip-ground", action="store_true", default=True,
+        help="drop LiDAR points whose Z is within "
+        "--lidar-skip-ground-band-m of the LiDAR-derived ground grid "
+        "BEFORE Layer 4 LiDAR-priority fusion. The ground geometry is "
+        "already locked by ground-snap (Layer 3 + post-snap), so "
+        "keeping the LiDAR ground points only adds the polar scan-"
+        "ring pattern visible in the BEV. With this flag on, road "
+        "voxels are filled by the uniform refined cloud; verticals "
+        "(poles, walls, cars) still get LiDAR-priority. Default ON.",
+    )
+    parser.add_argument(
+        "--no-lidar-skip-ground", action="store_false",
+        dest="lidar_skip_ground",
+    )
+    parser.add_argument(
+        "--lidar-skip-ground-band-m", type=float, default=0.5,
+        help="ground-band thickness around the LiDAR ground grid, in "
+        "metres. Slightly larger than ground-snap-max-dz (default "
+        "0.4 m) so we also catch grazing returns just above / below "
+        "the snapped ground. Default 0.5 m.",
+    )
+
     parser.add_argument("--max-points-per-frame", type=int, default=12000,
                         help="cap per-(ts, cam) prior cloud size before "
                         "calling the network; KNN cost is O(N²) so this "
@@ -731,6 +754,25 @@ def main() -> int:
             static_lidar_full, cam_views, z_min=args.z_min, z_max=args.z_max,
         )
         lidar_for_fuse = static_lidar_full[lidar_fov]
+
+        # Optionally drop LiDAR points whose Z falls in the ground
+        # band — they only contribute the polar scan-ring artefact in
+        # the BEV. The road geometry is already locked by ground-snap
+        # so the cm-precision LiDAR brought to the ground voxels is
+        # decorative; removing it lets the uniform refined cloud fill
+        # those voxels instead.
+        if args.lidar_skip_ground and ground_grid is not None and lidar_for_fuse.size > 0:
+            z_g, in_grid = ground_grid.query(lidar_for_fuse[:, :2])
+            band = float(args.lidar_skip_ground_band_m)
+            is_ground = in_grid & (np.abs(lidar_for_fuse[:, 2] - z_g) <= band)
+            n_dropped = int(is_ground.sum())
+            lidar_for_fuse = lidar_for_fuse[~is_ground]
+            print(
+                f"  [skip-ground] dropped {n_dropped} LiDAR points in "
+                f"ground band (±{band:.2f}m); {lidar_for_fuse.shape[0]} "
+                f"non-ground LiDAR remain"
+            )
+
         fused_xyz, fused_rgb, source = lidar_priority_fill(
             lidar_for_fuse, refined_xyz, refined_rgb,
             voxel_size=args.voxel_size,
