@@ -131,6 +131,330 @@ def _build_prior_for_frame(
     return P_world.astype(np.float64), rgb, uv_int
 
 
+def _refine_one_frame(
+    scene_id,
+    cam_id,
+    ts_ms,
+    *,
+    loader,
+    predictor,
+    build_prior_features_fn,
+    calib,
+    d_paths_index,
+    ground_grid,
+    cam_views,
+    sam_dir,
+    sam_auto_dir,
+    segformer_dir,
+    args,
+):
+    """Run the per-(scene, cam, ts) prior build + network refinement.
+
+    Returns ``dict(refined_xyz, prior_rgb, prior_xyz, cam_id, ts_ms)``
+    on success or ``None`` if the frame should be skipped (no D, no
+    V2X, no FOV coverage, < 100 prior points, etc.).
+
+    A deterministic seed derived from ``(scene_id, cam_id, ts_ms)`` is
+    set up-front so that splitting work across GPUs gives results that
+    are reproducible across runs and identical to a single-GPU run for
+    the same (scene, cam, ts) triple.
+    """
+    import torch  # local: only imported in workers after CUDA_VISIBLE_DEVICES
+
+    seed = abs(hash((scene_id, cam_id, int(ts_ms)))) % (2**31)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    if cam_id not in calib:
+        return None
+    a = float(calib[cam_id]["a"])
+    b = float(calib[cam_id]["b"])
+
+    d_path = d_paths_index.get((scene_id, ts_ms, cam_id))
+    if d_path is None or not d_path.is_file():
+        return None
+    try:
+        idx = loader.find_frame_idx(scene_id, ts_ms, cam_id)
+    except ValueError:
+        return None
+    frame = loader.get_frame(idx)
+    if args.require_v2x_frames and not (frame.dynamic_objects or []):
+        return None
+
+    d_data = np.load(d_path, allow_pickle=True)
+    d_image = d_data["depth"].astype(np.float32)
+
+    dyn_mask = load_sam_dynamic_mask(
+        sam_dir, scene_id, ts_ms, cam_id, frame.image.shape[:2],
+        dilate_px=args.sam_dilate_px,
+    )
+    prior = _build_prior_for_frame(
+        frame, d_image, a, b, dyn_mask,
+        pixel_stride=args.aahad_pixel_stride,
+        z_min=args.z_min, z_max=args.z_max,
+        ground_grid=ground_grid,
+        ground_max_dz=args.ground_snap_max_dz,
+    )
+    if prior is None:
+        return None
+    prior_xyz, prior_rgb, prior_uv = prior
+
+    fov = np.zeros(prior_xyz.shape[0], dtype=bool)
+    for v in cam_views:
+        fov |= points_in_any_camera_fov(
+            prior_xyz, [v], z_min=args.z_min, z_max=args.z_max,
+        )
+    if not fov.any():
+        return None
+    prior_xyz = prior_xyz[fov]
+    prior_rgb = prior_rgb[fov]
+    prior_uv = prior_uv[fov]
+
+    if prior_xyz.shape[0] > args.max_points_per_frame:
+        sel = np.random.choice(
+            prior_xyz.shape[0],
+            size=args.max_points_per_frame,
+            replace=False,
+        )
+        prior_xyz = prior_xyz[sel]
+        prior_rgb = prior_rgb[sel]
+        prior_uv = prior_uv[sel]
+    if prior_xyz.shape[0] < 100:
+        return None
+
+    is_dyn = np.zeros(frame.lidar_world.shape[0], dtype=bool)
+    for obj in frame.dynamic_objects or []:
+        is_dyn |= points_in_oriented_bbox(
+            frame.lidar_world, obj, expand=args.bbox_expand,
+        )
+    target_lidar = frame.lidar_world[~is_dyn]
+
+    feat = build_prior_features_fn(
+        prior_xyz, prior_uv, d_image, a, b, target_lidar,
+    )
+    dist_to_lidar = feat[:, 3]
+
+    seg_per_pt = None
+    H_img, W_img = frame.image.shape[:2]
+    if segformer_dir is not None:
+        sf_path = (
+            segformer_dir / f"{scene_id}_ts{ts_ms}_cam{cam_id}_seg.npz"
+        )
+        if sf_path.is_file():
+            with np.load(sf_path) as sf:
+                cls_image = sf["class_id"]
+            if cls_image.shape == (H_img, W_img):
+                seg_per_pt = cls_image[
+                    prior_uv[:, 1], prior_uv[:, 0],
+                ].astype(np.int64)
+    elif sam_auto_dir is not None:
+        sa_path = (
+            sam_auto_dir / f"{scene_id}_ts{ts_ms}_cam{cam_id}_sam_auto.npz"
+        )
+        if sa_path.is_file():
+            with np.load(sa_path) as sa:
+                seg_image = sa["segment_id"]
+            if seg_image.shape == (H_img, W_img):
+                seg_per_pt = seg_image[
+                    prior_uv[:, 1], prior_uv[:, 0],
+                ].astype(np.int64)
+
+    refined_xyz = predictor.refine_cloud(
+        prior_xyz, prior_rgb, feat,
+        dist_to_lidar=dist_to_lidar,
+        segment_id=seg_per_pt,
+    )
+
+    if args.post_network_ground_snap:
+        refined_xyz_snapped, _ = snap_to_ground(
+            refined_xyz.astype(np.float64), ground_grid,
+            max_dz=args.ground_snap_max_dz,
+        )
+        refined_xyz = refined_xyz_snapped.astype(np.float32)
+
+    return {
+        "cam_id": cam_id,
+        "ts_ms": int(ts_ms),
+        "refined_xyz": refined_xyz,
+        "prior_rgb": prior_rgb,
+        "prior_xyz": prior_xyz.astype(np.float32),
+    }
+
+
+# ---- Multi-GPU worker plumbing ----------------------------------
+#
+# The parent process intentionally avoids importing torch / loading
+# the predictor when --gpu-ids is multi-valued, because each worker
+# needs to set CUDA_VISIBLE_DEVICES *before* its first torch import
+# so that ``cuda:0`` resolves to its own card. Worker state is held
+# in a module-level dict because :class:`multiprocessing.Pool`
+# initializers can only stash via globals.
+
+_WORKER_STATE: dict = {}
+
+
+def _init_worker(
+    gpu_q,
+    args_dict,
+    scene_id,
+    calib,
+    d_paths_index_serial,
+    ground_grid,
+    cam_views,
+):
+    """Pool initializer: pin to one GPU, load predictor + loader."""
+    import os
+    gpu_id = gpu_q.get()
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+
+    args = argparse.Namespace(**args_dict)
+
+    from lidar_anchored_depth.data import RoadsideV2XLoader as _Loader
+    loader = _Loader(
+        data_root=args.data_root,
+        scenes=[args.scene] if "_" in args.scene else None,
+        min_num_points=args.loader_min_points,
+    )
+    if "_" not in args.scene:
+        loader.scene_filter = [args.scene]
+
+    from lidar_anchored_depth.models import (
+        PointResidualPredictor as _Predictor,
+        build_prior_features as _build_feat,
+    )
+    predictor = _Predictor(
+        args.residual_checkpoint,
+        device="cuda:0",
+        n_steps=args.residual_steps,
+        gate_distance_m=args.gate_distance_m,
+    )
+
+    _WORKER_STATE.update({
+        "args": args,
+        "scene_id": scene_id,
+        "calib": calib,
+        "d_paths_index": {
+            tuple(k): Path(v) for k, v in d_paths_index_serial.items()
+        },
+        "ground_grid": ground_grid,
+        "cam_views": cam_views,
+        "loader": loader,
+        "predictor": predictor,
+        "build_prior_features": _build_feat,
+        "sam_dir": Path(args.sam_mask_dir) if args.sam_mask_dir else None,
+        "sam_auto_dir": (
+            Path(args.sam_auto_dir) if args.sam_auto_dir else None
+        ),
+        "segformer_dir": (
+            Path(args.segformer_dir) if args.segformer_dir else None
+        ),
+    })
+    print(
+        f"[worker pid={os.getpid()} gpu={gpu_id}] predictor loaded",
+        flush=True,
+    )
+
+
+def _worker_refine(item):
+    """Pool.map callback. ``item = (cam_id, ts_ms)``. Returns dict or None."""
+    cam_id, ts_ms = item
+    s = _WORKER_STATE
+    try:
+        return _refine_one_frame(
+            s["scene_id"], cam_id, ts_ms,
+            loader=s["loader"],
+            predictor=s["predictor"],
+            build_prior_features_fn=s["build_prior_features"],
+            calib=s["calib"],
+            d_paths_index=s["d_paths_index"],
+            ground_grid=s["ground_grid"],
+            cam_views=s["cam_views"],
+            sam_dir=s["sam_dir"],
+            sam_auto_dir=s["sam_auto_dir"],
+            segformer_dir=s["segformer_dir"],
+            args=s["args"],
+        )
+    except Exception as e:
+        import traceback
+        return {
+            "cam_id": cam_id,
+            "ts_ms": int(ts_ms),
+            "error": f"{e}\n{traceback.format_exc()}",
+        }
+
+
+def _run_refine_parallel(
+    gpu_ids,
+    args,
+    scene_id,
+    calib,
+    d_paths_index,
+    ground_grid,
+    cam_views,
+    work_items,
+):
+    """Spawn ``len(gpu_ids)`` worker processes, distribute ``work_items``.
+
+    Returns a list of result dicts (or ``None`` for skipped frames),
+    in the order they completed (the caller does not depend on order).
+    """
+    import multiprocessing as mp_std
+    import torch.multiprocessing as mp
+
+    # ``spawn`` is required: ``fork`` would inherit the parent's
+    # CUDA state if the parent ever touched torch.cuda, and would
+    # deadlock when the child tries to re-init.
+    ctx = mp.get_context("spawn")
+    gpu_q = ctx.Queue()
+    for gid in gpu_ids:
+        gpu_q.put(int(gid))
+
+    args_dict = vars(args)
+    d_paths_index_serial = {k: str(v) for k, v in d_paths_index.items()}
+
+    init_args = (
+        gpu_q,
+        args_dict,
+        scene_id,
+        calib,
+        d_paths_index_serial,
+        ground_grid,
+        cam_views,
+    )
+
+    print(
+        f"[parallel] spawning {len(gpu_ids)} workers on gpus={gpu_ids}",
+        flush=True,
+    )
+    n_total = len(work_items)
+    results = []
+    t0 = time.time()
+    with ctx.Pool(
+        processes=len(gpu_ids),
+        initializer=_init_worker,
+        initargs=init_args,
+    ) as pool:
+        for i, res in enumerate(
+            pool.imap_unordered(_worker_refine, work_items, chunksize=1)
+        ):
+            results.append(res)
+            if (i + 1) % 20 == 0 or (i + 1) == n_total:
+                elapsed = time.time() - t0
+                rate = (i + 1) / max(elapsed, 1e-6)
+                eta = (n_total - (i + 1)) / max(rate, 1e-6)
+                print(
+                    f"  [parallel] {i + 1}/{n_total} frames "
+                    f"({rate:.2f} fps, ETA {eta:.0f}s)",
+                    flush=True,
+                )
+    # ``mp_std`` reference silences a flake8 unused-import warning;
+    # we keep the import because some torch builds need both.
+    _ = mp_std
+    return results
+
+
 def _build_anchor_views(loader, scene_id, anchor_ts, cams):
     """Snapshot the K, T_wc, image, and distortion of each camera at
     the anchor ts. Used to project the fused world cloud back into
@@ -310,6 +634,16 @@ def main() -> int:
     parser.add_argument("--ply-binary", action="store_true")
 
     parser.add_argument("--residual-device", default="cuda")
+    parser.add_argument(
+        "--gpu-ids", default=None,
+        help="comma-separated GPU ids for multi-GPU sharding of the "
+        "per-(cam, ts) refinement, e.g. '0,1,2,3'. Each id gets its "
+        "own worker process; (cam, ts) work units are distributed "
+        "round-robin. When unset (default), runs serially on "
+        "--residual-device. Per-frame seeds are derived from "
+        "(scene, cam, ts) so results are reproducible regardless of "
+        "the number of workers.",
+    )
     parser.add_argument("--residual-steps", type=int, default=4)
     parser.add_argument(
         "--gate-distance-m", type=float, default=None,
@@ -558,20 +892,20 @@ def main() -> int:
             except ValueError:
                 continue
 
-    # Load predictor (lazy import torch).
-    from lidar_anchored_depth.models import (
-        PointResidualPredictor, build_prior_features,
-    )
-    predictor = PointResidualPredictor(
-        args.residual_checkpoint,
-        device=args.residual_device,
-        n_steps=args.residual_steps,
-        gate_distance_m=args.gate_distance_m,
-    )
-    print(
-        f"[net] loaded {args.residual_checkpoint}  device={predictor.device}  "
-        f"steps={predictor.n_steps}"
-    )
+    # Build the (cam, ts) work list. Both serial and parallel paths
+    # consume this same list; the per-frame body lives in
+    # _refine_one_frame() so the two paths cannot drift.
+    work_items: list[tuple[str, int]] = []
+    for cam_id in args.cams:
+        if cam_id not in calib:
+            print(f"  cam{cam_id}: missing from calib, skipping")
+            continue
+        for ts_ms in scene.timestamps_ms:
+            work_items.append((cam_id, int(ts_ms)))
+
+    gpu_ids: list[int] = []
+    if args.gpu_ids:
+        gpu_ids = [int(x) for x in args.gpu_ids.split(",") if x.strip()]
 
     refined_chunks: list[np.ndarray] = []
     refined_rgb_chunks: list[np.ndarray] = []
@@ -581,125 +915,101 @@ def main() -> int:
     n_skipped = 0
     t_total = time.time()
     print()
-    for cam_id in args.cams:
-        if cam_id not in calib:
-            print(f"  cam{cam_id}: missing from calib, skipping")
-            continue
-        a = float(calib[cam_id]["a"])
-        b = float(calib[cam_id]["b"])
-        cam_t0 = time.time()
-        cam_n = 0
-        for ts_ms in scene.timestamps_ms:
-            d_path = d_paths_index.get((scene_id, ts_ms, cam_id))
-            if d_path is None or not d_path.is_file():
-                continue
-            try:
-                idx = loader.find_frame_idx(scene_id, ts_ms, cam_id)
-            except ValueError:
-                continue
-            frame = loader.get_frame(idx)
-            if args.require_v2x_frames and not (frame.dynamic_objects or []):
-                continue
-            d_data = np.load(d_path, allow_pickle=True)
-            d_image = d_data["depth"].astype(np.float32)
 
-            dyn_mask = load_sam_dynamic_mask(
-                sam_dir, scene_id, ts_ms, cam_id, frame.image.shape[:2],
-                dilate_px=args.sam_dilate_px,
-            )
-            prior = _build_prior_for_frame(
-                frame, d_image, a, b, dyn_mask,
-                pixel_stride=args.aahad_pixel_stride,
-                z_min=args.z_min, z_max=args.z_max,
-                ground_grid=ground_grid,
-                ground_max_dz=args.ground_snap_max_dz,
-            )
-            if prior is None:
+    if len(gpu_ids) > 1:
+        # ---- Multi-GPU parallel path ----
+        # Parent has not imported torch yet, which is intentional:
+        # workers must be the first to touch CUDA so each child sees
+        # only its assigned card under CUDA_VISIBLE_DEVICES.
+        results = _run_refine_parallel(
+            gpu_ids,
+            args,
+            scene_id,
+            calib,
+            d_paths_index,
+            ground_grid,
+            cam_views,
+            work_items,
+        )
+        for res in results:
+            if res is None:
                 n_skipped += 1
                 continue
-            prior_xyz, prior_rgb, prior_uv = prior
-
-            # FOV cull
-            fov = np.zeros(prior_xyz.shape[0], dtype=bool)
-            for v in cam_views:
-                fov |= points_in_any_camera_fov(prior_xyz, [v],
-                                                z_min=args.z_min, z_max=args.z_max)
-            if not fov.any():
+            if "error" in res:
+                print(
+                    f"  [worker error] cam{res['cam_id']} ts{res['ts_ms']}: "
+                    f"{res['error'].splitlines()[0]}"
+                )
                 n_skipped += 1
                 continue
-            prior_xyz = prior_xyz[fov]
-            prior_rgb = prior_rgb[fov]
-            prior_uv = prior_uv[fov]
-
-            # Subsample if too large
-            if prior_xyz.shape[0] > args.max_points_per_frame:
-                sel = np.random.choice(
-                    prior_xyz.shape[0], size=args.max_points_per_frame, replace=False,
-                )
-                prior_xyz = prior_xyz[sel]
-                prior_rgb = prior_rgb[sel]
-                prior_uv = prior_uv[sel]
-            if prior_xyz.shape[0] < 100:
-                n_skipped += 1
-                continue
-
-            # Build per-frame static LiDAR target for KDTree distance.
-            is_dyn = np.zeros(frame.lidar_world.shape[0], dtype=bool)
-            for obj in frame.dynamic_objects or []:
-                is_dyn |= points_in_oriented_bbox(
-                    frame.lidar_world, obj, expand=args.bbox_expand,
-                )
-            target_lidar = frame.lidar_world[~is_dyn]
-
-            feat = build_prior_features(
-                prior_xyz, prior_uv, d_image, a, b, target_lidar,
-            )
-            dist_to_lidar = feat[:, 3]  # 4th channel is dist_to_lidar (clipped)
-
-            # A1: per-prior-point segment id. SegFormer (per-pixel
-            # Cityscapes class) is preferred; SAM Auto is the fallback.
-            seg_per_pt = None
-            H_img, W_img = frame.image.shape[:2]
-            if segformer_dir is not None:
-                sf_path = segformer_dir / f"{scene_id}_ts{ts_ms}_cam{cam_id}_seg.npz"
-                if sf_path.is_file():
-                    with np.load(sf_path) as sf:
-                        cls_image = sf["class_id"]
-                    if cls_image.shape == (H_img, W_img):
-                        seg_per_pt = cls_image[
-                            prior_uv[:, 1], prior_uv[:, 0],
-                        ].astype(np.int64)
-            elif sam_auto_dir is not None:
-                sa_path = sam_auto_dir / f"{scene_id}_ts{ts_ms}_cam{cam_id}_sam_auto.npz"
-                if sa_path.is_file():
-                    with np.load(sa_path) as sa:
-                        seg_image = sa["segment_id"]
-                    if seg_image.shape == (H_img, W_img):
-                        seg_per_pt = seg_image[
-                            prior_uv[:, 1], prior_uv[:, 0],
-                        ].astype(np.int64)
-
-            refined_xyz = predictor.refine_cloud(
-                prior_xyz, prior_rgb, feat,
-                dist_to_lidar=dist_to_lidar,
-                segment_id=seg_per_pt,
-            )
-
-            if args.post_network_ground_snap:
-                refined_xyz_snapped, _ = snap_to_ground(
-                    refined_xyz.astype(np.float64), ground_grid,
-                    max_dz=args.ground_snap_max_dz,
-                )
-                refined_xyz = refined_xyz_snapped.astype(np.float32)
-
-            refined_chunks.append(refined_xyz)
-            refined_rgb_chunks.append(prior_rgb)
-            baseline_chunks.append(prior_xyz.astype(np.float32))
-            baseline_rgb_chunks.append(prior_rgb)
+            refined_chunks.append(res["refined_xyz"])
+            refined_rgb_chunks.append(res["prior_rgb"])
+            baseline_chunks.append(res["prior_xyz"])
+            baseline_rgb_chunks.append(res["prior_rgb"])
             n_refined_frames += 1
-            cam_n += 1
+        print(
+            f"[parallel] refined {n_refined_frames} frames "
+            f"({time.time() - t_total:.1f}s wall)"
+        )
+    else:
+        # ---- Serial single-GPU path (default) ----
+        from lidar_anchored_depth.models import (
+            PointResidualPredictor, build_prior_features,
+        )
+        device = args.residual_device
+        if gpu_ids:
+            device = f"cuda:{gpu_ids[0]}"
+        predictor = PointResidualPredictor(
+            args.residual_checkpoint,
+            device=device,
+            n_steps=args.residual_steps,
+            gate_distance_m=args.gate_distance_m,
+        )
+        print(
+            f"[net] loaded {args.residual_checkpoint}  "
+            f"device={predictor.device}  steps={predictor.n_steps}"
+        )
 
-        print(f"  cam{cam_id}  refined {cam_n} frames  ({time.time() - cam_t0:.1f}s)")
+        per_cam_count: dict[str, int] = {c: 0 for c in args.cams}
+        per_cam_t0: dict[str, float] = {c: time.time() for c in args.cams}
+        last_cam = None
+        for cam_id, ts_ms in work_items:
+            if cam_id != last_cam:
+                if last_cam is not None:
+                    print(
+                        f"  cam{last_cam}  refined {per_cam_count[last_cam]} "
+                        f"frames  ({time.time() - per_cam_t0[last_cam]:.1f}s)"
+                    )
+                per_cam_t0[cam_id] = time.time()
+                last_cam = cam_id
+            res = _refine_one_frame(
+                scene_id, cam_id, ts_ms,
+                loader=loader,
+                predictor=predictor,
+                build_prior_features_fn=build_prior_features,
+                calib=calib,
+                d_paths_index=d_paths_index,
+                ground_grid=ground_grid,
+                cam_views=cam_views,
+                sam_dir=sam_dir,
+                sam_auto_dir=sam_auto_dir,
+                segformer_dir=segformer_dir,
+                args=args,
+            )
+            if res is None:
+                n_skipped += 1
+                continue
+            refined_chunks.append(res["refined_xyz"])
+            refined_rgb_chunks.append(res["prior_rgb"])
+            baseline_chunks.append(res["prior_xyz"])
+            baseline_rgb_chunks.append(res["prior_rgb"])
+            n_refined_frames += 1
+            per_cam_count[cam_id] += 1
+        if last_cam is not None:
+            print(
+                f"  cam{last_cam}  refined {per_cam_count[last_cam]} "
+                f"frames  ({time.time() - per_cam_t0[last_cam]:.1f}s)"
+            )
 
     print()
     if not refined_chunks:
