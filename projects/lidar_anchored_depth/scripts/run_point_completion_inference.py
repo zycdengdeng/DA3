@@ -754,6 +754,13 @@ def main() -> int:
             static_lidar_full, cam_views, z_min=args.z_min, z_max=args.z_max,
         )
         lidar_for_fuse = static_lidar_full[lidar_fov]
+        # Keep an un-thinned copy for the outlier-rejection KD-tree.
+        # If we hand `lidar_priority_fill` only the post-skip-ground
+        # backbone, refined points on the road surface end up with
+        # "nearest LiDAR" several metres up on the verticals and get
+        # falsely dropped — leaving a halo of refined points around
+        # each LiDAR sensor (visible as concentric BEV rings).
+        lidar_outlier_ref = lidar_for_fuse
 
         # Optionally drop LiDAR points whose Z falls in the ground
         # band — they only contribute the polar scan-ring artefact in
@@ -777,6 +784,7 @@ def main() -> int:
             lidar_for_fuse, refined_xyz, refined_rgb,
             voxel_size=args.voxel_size,
             max_dist_to_lidar=args.max_dist_to_lidar,
+            outlier_reference_lidar=lidar_outlier_ref,
         )
         n_lidar = int((source == 0).sum())
         n_aahad = int((source == 1).sum())

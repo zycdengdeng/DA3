@@ -101,6 +101,7 @@ def lidar_priority_fill(
     voxel_size: float,
     *,
     max_dist_to_lidar: float | None = None,
+    outlier_reference_lidar: np.ndarray | None = None,
     lidar_color: tuple[int, int, int] = (180, 180, 180),
     aahad_fallback_color: tuple[int, int, int] = (220, 220, 100),
 ) -> tuple[np.ndarray, np.ndarray | None, np.ndarray]:
@@ -129,6 +130,13 @@ def lidar_priority_fill(
     voxel_size : metres.
     max_dist_to_lidar : optional metres; if set, drop AA-HAD points
         whose nearest LiDAR neighbour is farther than this.
+    outlier_reference_lidar : optional (N, 3) cloud used **only** for
+        the ``max_dist_to_lidar`` outlier check. When ``None`` (default)
+        the check uses ``lidar_xyz``. Pass a *pre-filter* LiDAR cloud
+        here when ``lidar_xyz`` has been thinned (e.g. ground band
+        removed via ``--lidar-skip-ground``) so AA-HAD ground points
+        aren't falsely flagged as outliers just because the surviving
+        LiDAR backbone no longer covers the road surface.
     lidar_color : ``(R, G, B)`` uint8 for LiDAR points (default light
         grey ``(180, 180, 180)``); previously ``(0, 0, 0)`` made the
         cloud disappear in dark CloudCompare backgrounds.
@@ -192,7 +200,15 @@ def lidar_priority_fill(
         try:
             from scipy.spatial import cKDTree
 
-            tree = cKDTree(lidar_xyz)
+            # Build the outlier-rejection tree on the un-thinned LiDAR
+            # if provided; otherwise fall back to the backbone LiDAR.
+            tree_pts = (
+                outlier_reference_lidar
+                if outlier_reference_lidar is not None
+                and outlier_reference_lidar.size > 0
+                else lidar_xyz
+            )
+            tree = cKDTree(tree_pts)
             cand_idx = np.flatnonzero(keep_aahad)
             d, _ = tree.query(aahad_xyz[cand_idx], k=1)
             close = d <= float(max_dist_to_lidar)

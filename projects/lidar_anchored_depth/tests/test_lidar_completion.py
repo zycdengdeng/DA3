@@ -123,6 +123,43 @@ def test_priority_fill_max_dist_filter_drops_far_aahad():
     assert n_aa == 1
 
 
+def test_priority_fill_outlier_reference_lidar_keeps_aahad_near_ground():
+    """Regression: when ``lidar_xyz`` has been thinned (e.g. ground band
+    removed via --lidar-skip-ground) the outlier-rejection KD-tree
+    should be built on the **un-thinned** reference cloud so AA-HAD
+    ground points aren't falsely flagged as outliers just because the
+    surviving backbone no longer covers the road surface.
+    """
+    # Backbone: a single LiDAR point 5 m above origin (mimics what
+    # survives skip-ground: vertical structure tops only).
+    lidar_thinned = np.array([[0.0, 0.0, 5.0]])
+    # Reference: includes the ground LiDAR point that was dropped.
+    lidar_full = np.array([
+        [0.0, 0.0, 5.0],
+        [0.5, 0.0, 0.0],   # ground LiDAR — gone from backbone
+    ])
+    # AA-HAD ground point near the dropped ground LiDAR.
+    aahad = np.array([[0.6, 0.0, 0.0]])
+    aahad_rgb = np.array([[1, 2, 3]], dtype=np.uint8)
+
+    # Without the reference, max_dist=2 drops the ground AA-HAD because
+    # nearest LiDAR is the 5 m elevated point.
+    _, _, src_no_ref = lidar_priority_fill(
+        lidar_thinned, aahad, aahad_rgb,
+        voxel_size=0.05, max_dist_to_lidar=2.0,
+    )
+    assert int((src_no_ref == 1).sum()) == 0  # AA-HAD dropped
+
+    # With the un-thinned reference, the ground LiDAR is in the tree
+    # so the AA-HAD ground point passes (nearest LiDAR ≈ 0.1 m).
+    _, _, src_with_ref = lidar_priority_fill(
+        lidar_thinned, aahad, aahad_rgb,
+        voxel_size=0.05, max_dist_to_lidar=2.0,
+        outlier_reference_lidar=lidar_full,
+    )
+    assert int((src_with_ref == 1).sum()) == 1  # AA-HAD kept
+
+
 def test_priority_fill_empty_lidar_returns_aahad_only():
     aahad = np.array([[1.0, 1.0, 1.0], [2.0, 2.0, 2.0]])
     aahad_rgb = np.array([[1, 2, 3], [4, 5, 6]], dtype=np.uint8)
