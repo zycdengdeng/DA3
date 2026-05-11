@@ -22,8 +22,13 @@ from lidar_anchored_depth.configs.stages.pipeline import (
 from lidar_anchored_depth.engine import OutputManager
 from lidar_anchored_depth.stages.base import Stage
 from lidar_anchored_depth.stages.bev_render import BevRenderStage
+from lidar_anchored_depth.stages.da3_depth import DA3DepthStage
 from lidar_anchored_depth.stages.dense_completion import DenseCompletionStage
 from lidar_anchored_depth.stages.dynamic_inject import DynamicInjectStage
+from lidar_anchored_depth.stages.object_accum import ObjectAccumStage
+from lidar_anchored_depth.stages.sam_mask import SAMMaskStage
+from lidar_anchored_depth.stages.segformer_seg import SegFormerStage
+from lidar_anchored_depth.stages.static_calib import StaticCalibStage
 
 
 def _to_serialisable(obj: Any) -> Any:
@@ -51,6 +56,11 @@ class FullPipeline:
     """
 
     REGISTRY: ClassVar[dict[StageName, type[Stage]]] = {
+        "depth": DA3DepthStage,
+        "mask": SAMMaskStage,
+        "seg": SegFormerStage,
+        "calib": StaticCalibStage,
+        "object-accum": ObjectAccumStage,
         "complete": DenseCompletionStage,
         "inject": DynamicInjectStage,
         "render-bev": BevRenderStage,
@@ -64,7 +74,16 @@ class FullPipeline:
         scene / output / runtime blocks copied in from ``complete``."""
         if name == "complete":
             return self.cfg.complete
-        base = self.cfg.inject if name == "inject" else self.cfg.render_bev
+        per_stage_attr = {
+            "depth": "depth",
+            "mask": "mask",
+            "seg": "seg",
+            "calib": "calib",
+            "object-accum": "object_accum",
+            "inject": "inject",
+            "render-bev": "render_bev",
+        }[name]
+        base = getattr(self.cfg, per_stage_attr)
         return dataclasses.replace(
             base,
             scene=self.cfg.complete.scene,

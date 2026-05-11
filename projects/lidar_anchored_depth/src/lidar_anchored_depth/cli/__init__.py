@@ -33,15 +33,25 @@ from lidar_anchored_depth.configs.base import (
     RuntimeConfig,
     SceneConfig,
 )
+from lidar_anchored_depth.configs.stages.calib import CalibConfig
 from lidar_anchored_depth.configs.stages.complete import CompleteConfig
+from lidar_anchored_depth.configs.stages.depth import DepthConfig
 from lidar_anchored_depth.configs.stages.inject import InjectConfig
+from lidar_anchored_depth.configs.stages.mask import MaskConfig
+from lidar_anchored_depth.configs.stages.object_accum import ObjectAccumConfig
 from lidar_anchored_depth.configs.stages.pipeline import FullPipelineConfig
 from lidar_anchored_depth.configs.stages.render_bev import BevRenderConfig
+from lidar_anchored_depth.configs.stages.seg import SegConfig
 from lidar_anchored_depth.engine import OutputManager
 from lidar_anchored_depth.pipelines.full_pipeline import FullPipeline
 from lidar_anchored_depth.stages.bev_render import BevRenderStage
+from lidar_anchored_depth.stages.da3_depth import DA3DepthStage
 from lidar_anchored_depth.stages.dense_completion import DenseCompletionStage
 from lidar_anchored_depth.stages.dynamic_inject import DynamicInjectStage
+from lidar_anchored_depth.stages.object_accum import ObjectAccumStage
+from lidar_anchored_depth.stages.sam_mask import SAMMaskStage
+from lidar_anchored_depth.stages.segformer_seg import SegFormerStage
+from lidar_anchored_depth.stages.static_calib import StaticCalibStage
 
 
 # ---------------------------------------------------------------- info
@@ -114,6 +124,52 @@ def _execute_stage(cmd, stage_cls) -> int:
     print(f"[done] artifacts -> {om.latest_link}")
     return 0
 
+
+# -- upstream stages --------------------------------------------------
+
+@dataclass
+class DepthCmd(DepthConfig):
+    """DA3 monocular depth inference. Produces *_d.npz per (scene, ts, cam)."""
+
+    def run(self) -> int:
+        return _execute_stage(self, DA3DepthStage)
+
+
+@dataclass
+class MaskCmd(MaskConfig):
+    """SAM dynamic-object masks. Produces *_mask.npz per (scene, ts, cam)."""
+
+    def run(self) -> int:
+        return _execute_stage(self, SAMMaskStage)
+
+
+@dataclass
+class SegCmd(SegConfig):
+    """SegFormer Cityscapes 19-class segmentation."""
+
+    def run(self) -> int:
+        return _execute_stage(self, SegFormerStage)
+
+
+@dataclass
+class CalibCmd(CalibConfig):
+    """Static scene reconstruction + per-camera AA-HAD ``(a, b)`` calibration."""
+
+    def run(self) -> int:
+        return _execute_stage(self, StaticCalibStage)
+
+
+@dataclass
+class ObjectAccumCmd(ObjectAccumConfig):
+    """Per-object accumulation: per dynamic V2X object id, accumulate LiDAR +
+    AA-HAD prediction across all frames into one per-object PLY in the
+    object's local frame."""
+
+    def run(self) -> int:
+        return _execute_stage(self, ObjectAccumStage)
+
+
+# -- downstream stages ------------------------------------------------
 
 @dataclass
 class CompleteCmd(CompleteConfig):
@@ -198,6 +254,57 @@ Subcommand = Union[
         tyro.conf.subcommand(
             name="version",
             description="Print just the package version string.",
+        ),
+    ],
+    Annotated[
+        DepthCmd,
+        tyro.conf.subcommand(
+            name="depth",
+            description=(
+                "Upstream: DA3 monocular depth inference. Multi-GPU "
+                "via --runtime.gpu-ids (--ts-shard fan-out)."
+            ),
+        ),
+    ],
+    Annotated[
+        MaskCmd,
+        tyro.conf.subcommand(
+            name="mask",
+            description=(
+                "Upstream: SAM dynamic-object masks prompted by V2X "
+                "bboxes. Multi-GPU shards by camera."
+            ),
+        ),
+    ],
+    Annotated[
+        SegCmd,
+        tyro.conf.subcommand(
+            name="seg",
+            description=(
+                "Upstream: SegFormer Cityscapes 19-class segmentation. "
+                "Multi-GPU via --ts-shard fan-out."
+            ),
+        ),
+    ],
+    Annotated[
+        CalibCmd,
+        tyro.conf.subcommand(
+            name="calib",
+            description=(
+                "Upstream: static scene reconstruction + per-camera "
+                "AA-HAD (a, b) calibration. Single-GPU."
+            ),
+        ),
+    ],
+    Annotated[
+        ObjectAccumCmd,
+        tyro.conf.subcommand(
+            name="object-accum",
+            description=(
+                "Upstream: per-object accumulation. For every dynamic "
+                "V2X object id, accumulate LiDAR + AA-HAD across all "
+                "frames into one per-object local-frame PLY."
+            ),
         ),
     ],
     Annotated[
