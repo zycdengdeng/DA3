@@ -78,7 +78,26 @@ def _resolve_scene_id(loader: RoadsideV2XLoader, scene_arg: str) -> str:
 
 
 
+_DEPRECATION_BANNER = """
+================================================================================
+  DEPRECATION: scripts/run_point_completion_inference.py is now legacy.
+
+  Equivalent commands (single-stage):
+    lad complete   --scene.scene <X> ...    # produces refined / baseline / hybrid PLYs
+    lad inject     --scene.scene <X> ...    # adds dynamic objects at one anchor ts
+    lad render-bev --scene.scene <X> ...    # per-ts BEV PNGs for video assembly
+
+  End-to-end:
+    lad pipeline --complete.scene.scene <X> ...
+
+  Migration guide: docs/cli.md
+================================================================================
+""".strip()
+
+
 def main() -> int:
+    import sys as _sys
+    print(_DEPRECATION_BANNER, file=_sys.stderr)
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--data-root", required=True)
     parser.add_argument("--scene", required=True)
