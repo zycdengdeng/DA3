@@ -73,6 +73,39 @@ def test_object_accum_config_defaults():
     assert cfg.solver_mode == "per-camera"
     assert cfg.lidar_color == "height"
     assert cfg.voxel_size == 0.05
+    # Per-object parallelism is on by default (script supports it
+    # natively via --workers; the wrapper just needed to set it).
+    assert cfg.workers > 0
+    assert cfg.skip_existing is True
+
+
+def test_pipeline_does_not_propagate_run_id(tmp_path):
+    """Setting --complete.output.run-id X must not force every other
+    stage to share the same run_id (which would clobber each other's
+    output dirs). Verified at the dataclass-composition level."""
+    from lidar_anchored_depth.configs.base import OutputConfig
+    from lidar_anchored_depth.configs.stages.complete import CompleteConfig
+    from lidar_anchored_depth.configs.stages.pipeline import (
+        FullPipelineConfig,
+    )
+    from lidar_anchored_depth.pipelines.full_pipeline import FullPipeline
+
+    cfg = FullPipelineConfig(
+        complete=CompleteConfig(
+            scene=SceneConfig(scene="008"),
+            output=OutputConfig(root=tmp_path, run_id="2026-05-11_12-26-18"),
+        ),
+    )
+    pipe = FullPipeline(cfg)
+    # complete uses the explicit run_id; the other stages do not
+    # inherit it (each gets its own timestamp).
+    assert pipe._stage_cfg("complete").output.run_id == "2026-05-11_12-26-18"
+    assert pipe._stage_cfg("inject").output.run_id is None
+    assert pipe._stage_cfg("object-accum").output.run_id is None
+    assert pipe._stage_cfg("render-bev").output.run_id is None
+    # …but the shared root + scene still propagate.
+    assert pipe._stage_cfg("inject").output.root == tmp_path
+    assert pipe._stage_cfg("inject").scene.scene == "008"
 
 
 # ---- stage classes have the right name ----------------------------------

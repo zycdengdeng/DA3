@@ -65,3 +65,14 @@ class ObjectAccumConfig:
     z_max: float = 250.0
     dense_min_pixels: int = 50
     ply_binary: bool = True
+
+    workers: int = 16
+    """Per-object ProcessPoolExecutor size. Default 16; bump to 32+
+    on a many-core box. 0 falls back to deterministic serial
+    execution. Per-object work is independent (no shared RNG, no
+    ordering requirement) so the parallel result is bit-exact."""
+
+    skip_existing: bool = True
+    """Skip bbox ids whose ``<scene>_obj<id>_lidar.ply`` AND
+    ``<scene>_obj<id>_aa_had.ply`` already exist in the run dir.
+    Lets a killed run resume without re-doing the finished objects."""

@@ -749,6 +749,12 @@ def main() -> int:
         "once at startup. Per-bbox work is independent (no shared RNG, "
         "no ordering requirement) so results are bit-exact.",
     )
+    parser.add_argument(
+        "--skip-existing", action="store_true",
+        help="skip a bbox if both its '<scene>_obj<id>_lidar.ply' and "
+        "'<scene>_obj<id>_aa_had.ply' already exist in --output. "
+        "Useful when resuming a crashed/killed run.",
+    )
     args = parser.parse_args()
 
     out_dir = Path(args.output)
@@ -790,8 +796,28 @@ def main() -> int:
             raise SystemExit("specify --bbox-id N or --all-bboxes")
         target_ids = [args.bbox_id]
 
+    if args.skip_existing:
+        before = len(target_ids)
+        target_ids = [
+            bid for bid in target_ids
+            if not (
+                (out_dir / f"{scene_id}_obj{bid}_lidar.ply").is_file()
+                and (out_dir / f"{scene_id}_obj{bid}_aa_had.ply").is_file()
+            )
+        ]
+        n_skipped = before - len(target_ids)
+        if n_skipped:
+            print(
+                f"[skip-existing] {n_skipped}/{before} bbox ids already "
+                f"have both PLYs; resuming with the remaining "
+                f"{len(target_ids)}"
+            )
+
     print(f"[run] cams={args.cams}  voxel={args.voxel_size}m  workers={args.workers}")
     print()
+    if not target_ids:
+        print("[run] nothing to do; all bboxes already accumulated.")
+        return 0
 
     fmt = "  bbox {:>4}  {:<22} N_frames(L,A)=({:>3},{:>3})  N_pts(L,A)=({:>6},{:>6})  chamfer={:>8}"
     aggregated: list[dict] = []

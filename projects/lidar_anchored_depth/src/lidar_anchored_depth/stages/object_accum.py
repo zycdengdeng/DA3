@@ -58,7 +58,10 @@ class ObjectAccumStage(Stage[ObjectAccumConfig]):
             "--dense-min-pixels", str(cfg.dense_min_pixels),
             "--lidar-color", cfg.lidar_color,
             "--solver-mode", cfg.solver_mode,
+            "--workers", str(cfg.workers),
         ]
+        if cfg.skip_existing:
+            argv.append("--skip-existing")
         if sam_mask_dir is not None:
             argv += ["--sam-mask-dir", str(sam_mask_dir)]
         if cfg.ply_binary:

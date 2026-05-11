@@ -71,7 +71,16 @@ class FullPipeline:
 
     def _stage_cfg(self, name: StageName):
         """Return the dataclass config for ``name``, with the shared
-        scene / output / runtime blocks copied in from ``complete``."""
+        scene / output / runtime blocks copied in from ``complete``.
+
+        Per-stage ``output.run_id`` is **not** propagated — if it
+        were, setting ``--complete.output.run-id X`` would force every
+        stage to write into the same dir, which is wrong (each stage
+        needs its own timestamp). The user can still override the
+        run_id on any individual stage block (e.g.
+        ``--object-accum.output.run-id 2026-05-11_12-26-18`` to resume
+        a killed run).
+        """
         if name == "complete":
             return self.cfg.complete
         per_stage_attr = {
@@ -84,10 +93,16 @@ class FullPipeline:
             "render-bev": "render_bev",
         }[name]
         base = getattr(self.cfg, per_stage_attr)
+        # Output: share root + symlink behaviour, but keep this stage's
+        # own run_id (None unless the user explicitly set it).
+        shared_output = dataclasses.replace(
+            self.cfg.complete.output,
+            run_id=base.output.run_id,
+        )
         return dataclasses.replace(
             base,
             scene=self.cfg.complete.scene,
-            output=self.cfg.complete.output,
+            output=shared_output,
             runtime=self.cfg.complete.runtime,
         )
 
