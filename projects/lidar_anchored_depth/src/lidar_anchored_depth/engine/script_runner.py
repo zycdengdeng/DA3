@@ -50,10 +50,15 @@ def run_script_subprocess(
     log_path: Path,
     env: dict[str, str] | None = None,
 ) -> int:
-    """Run ``python scripts/<script_name> <argv>`` and tee everything
-    to ``log_path``. Returns the subprocess exit code (0 = success)."""
+    """Run ``python -u scripts/<script_name> <argv>`` and tee everything
+    to ``log_path``. Returns the subprocess exit code (0 = success).
+
+    ``-u`` forces unbuffered stdout/stderr so the log file updates in
+    real time — without it, Python block-buffers writes to a pipe and
+    long-running stages look frozen.
+    """
     script_path = _resolve_script(script_name)
-    cmd = [sys.executable, str(script_path), *argv]
+    cmd = [sys.executable, "-u", str(script_path), *argv]
     log_path.parent.mkdir(parents=True, exist_ok=True)
     # Write the command we ran at the top of the log for reproducibility.
     with log_path.open("w", encoding="utf-8") as logf:
@@ -97,7 +102,7 @@ def run_script_sharded_by_ts(
             *base_argv,
             "--ts-shard", f"{k}/{len(gpu_list)}",
         ]
-        cmd = [sys.executable, str(script_path), *argv]
+        cmd = [sys.executable, "-u", str(script_path), *argv]
         log_path = log_dir / f"shard_{k}_gpu{gpu}.log"
         f = log_path.open("w", encoding="utf-8")
         f.write("# cmd\n")
@@ -160,7 +165,7 @@ def run_script_sharded_by_cam(
         env = dict(os.environ)
         env["CUDA_VISIBLE_DEVICES"] = str(gpu)
         argv = [*base_argv, "--cam", cam]
-        cmd = [sys.executable, str(script_path), *argv]
+        cmd = [sys.executable, "-u", str(script_path), *argv]
         log_path = log_dir / f"cam{cam}_gpu{gpu}.log"
         f = log_path.open("w", encoding="utf-8")
         f.write("# cmd\n")
