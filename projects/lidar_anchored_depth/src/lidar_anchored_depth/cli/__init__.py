@@ -35,8 +35,10 @@ from lidar_anchored_depth.configs.base import (
 )
 from lidar_anchored_depth.configs.stages.complete import CompleteConfig
 from lidar_anchored_depth.configs.stages.inject import InjectConfig
+from lidar_anchored_depth.configs.stages.pipeline import FullPipelineConfig
 from lidar_anchored_depth.configs.stages.render_bev import BevRenderConfig
 from lidar_anchored_depth.engine import OutputManager
+from lidar_anchored_depth.pipelines.full_pipeline import FullPipeline
 from lidar_anchored_depth.stages.bev_render import BevRenderStage
 from lidar_anchored_depth.stages.dense_completion import DenseCompletionStage
 from lidar_anchored_depth.stages.dynamic_inject import DynamicInjectStage
@@ -143,6 +145,19 @@ class RenderBevCmd(BevRenderConfig):
         return _execute_stage(self, BevRenderStage)
 
 
+@dataclass
+class PipelineCmd(FullPipelineConfig):
+    """Run complete -> inject -> render-bev back-to-back.
+
+    Set ``--complete.scene.scene 008`` etc. once and the orchestrator
+    propagates those to the downstream stages. Use ``--stages`` to
+    pick a subset and ``--from-stage`` to resume after a failure.
+    """
+
+    def run(self) -> int:
+        return FullPipeline(cfg=self).run()
+
+
 def _dump(obj: object) -> object:
     """Lightweight recursive dataclass → dict for pretty-printing.
 
@@ -212,6 +227,17 @@ Subcommand = Union[
             description=(
                 "Render per-ts BEV PNGs with linear pose-interpolated "
                 "dynamic objects. Feed into ffmpeg for video assembly."
+            ),
+        ),
+    ],
+    Annotated[
+        PipelineCmd,
+        tyro.conf.subcommand(
+            name="pipeline",
+            description=(
+                "Run complete -> inject -> render-bev back-to-back. "
+                "Shared scene/output/runtime propagate from --complete.* "
+                "to the downstream stages."
             ),
         ),
     ],

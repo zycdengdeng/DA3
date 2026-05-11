@@ -241,3 +241,118 @@ def test_cli_top_help_lists_phase3_subcommands():
     assert r.returncode == 0, r.stderr
     assert "inject" in r.stdout
     assert "render-bev" in r.stdout
+
+
+# ---- Phase 4: pipeline orchestrator -------------------------------------
+
+def test_full_pipeline_config_importable():
+    from lidar_anchored_depth.configs.stages.complete import CompleteConfig
+    from lidar_anchored_depth.configs.stages.pipeline import (
+        FullPipelineConfig,
+    )
+
+    cfg = FullPipelineConfig(
+        complete=CompleteConfig(scene=SceneConfig(scene="008")),
+    )
+    assert cfg.complete.scene.scene == "008"
+    assert cfg.stages == ("complete", "inject", "render-bev")
+    assert cfg.from_stage is None
+    # Inject + render_bev get a placeholder scene that the runner overrides.
+    assert cfg.inject.scene.scene == "__from_complete__"
+    assert cfg.render_bev.scene.scene == "__from_complete__"
+
+
+def test_full_pipeline_propagates_shared_blocks():
+    """Pipeline must copy complete.scene / output / runtime into inject
+    and render-bev before they run."""
+    from lidar_anchored_depth.configs.base import (
+        OutputConfig, RuntimeConfig,
+    )
+    from lidar_anchored_depth.configs.stages.complete import CompleteConfig
+    from lidar_anchored_depth.configs.stages.pipeline import (
+        FullPipelineConfig,
+    )
+    from lidar_anchored_depth.pipelines.full_pipeline import FullPipeline
+
+    cfg = FullPipelineConfig(
+        complete=CompleteConfig(
+            scene=SceneConfig(scene="042", cams=("0",)),
+            output=OutputConfig(root="/tmp/pipe-out"),
+            runtime=RuntimeConfig(gpu_ids=(1, 2)),
+        ),
+    )
+    pipe = FullPipeline(cfg)
+
+    inj = pipe._stage_cfg("inject")
+    assert inj.scene.scene == "042"
+    assert inj.scene.cams == ("0",)
+    assert str(inj.output.root) == "/tmp/pipe-out"
+    assert inj.runtime.gpu_ids == (1, 2)
+
+    bev = pipe._stage_cfg("render-bev")
+    assert bev.scene.scene == "042"
+    assert bev.runtime.gpu_ids == (1, 2)
+
+
+def test_full_pipeline_from_stage_skips_earlier():
+    from lidar_anchored_depth.configs.stages.complete import CompleteConfig
+    from lidar_anchored_depth.configs.stages.pipeline import (
+        FullPipelineConfig,
+    )
+    from lidar_anchored_depth.pipelines.full_pipeline import FullPipeline
+
+    cfg = FullPipelineConfig(
+        complete=CompleteConfig(scene=SceneConfig(scene="008")),
+        from_stage="inject",
+    )
+    pipe = FullPipeline(cfg)
+    assert pipe._stages_to_run() == ["inject", "render-bev"]
+
+
+def test_full_pipeline_stages_subset_runs_only_selected():
+    from lidar_anchored_depth.configs.stages.complete import CompleteConfig
+    from lidar_anchored_depth.configs.stages.pipeline import (
+        FullPipelineConfig,
+    )
+    from lidar_anchored_depth.pipelines.full_pipeline import FullPipeline
+
+    cfg = FullPipelineConfig(
+        complete=CompleteConfig(scene=SceneConfig(scene="008")),
+        stages=("complete", "inject"),
+    )
+    assert FullPipeline(cfg)._stages_to_run() == ["complete", "inject"]
+
+
+def test_full_pipeline_from_stage_not_in_stages_errors():
+    from lidar_anchored_depth.configs.stages.complete import CompleteConfig
+    from lidar_anchored_depth.configs.stages.pipeline import (
+        FullPipelineConfig,
+    )
+    from lidar_anchored_depth.pipelines.full_pipeline import FullPipeline
+
+    cfg = FullPipelineConfig(
+        complete=CompleteConfig(scene=SceneConfig(scene="008")),
+        stages=("complete", "inject"),
+        from_stage="render-bev",
+    )
+    with pytest.raises(SystemExit) as exc:
+        FullPipeline(cfg)._stages_to_run()
+    assert "not in" in str(exc.value)
+
+
+def test_cli_pipeline_help():
+    r = _lad("pipeline", "--help")
+    assert r.returncode == 0, r.stderr
+    # Pipeline-specific knobs
+    assert "--stages" in r.stdout
+    assert "--from-stage" in r.stdout
+    # Nested per-stage blocks
+    assert "--complete." in r.stdout
+    assert "--inject." in r.stdout
+    assert "--render-bev." in r.stdout
+
+
+def test_cli_top_help_lists_pipeline():
+    r = _lad("--help")
+    assert r.returncode == 0, r.stderr
+    assert "pipeline" in r.stdout
