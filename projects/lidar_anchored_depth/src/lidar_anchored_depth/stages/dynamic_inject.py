@@ -16,6 +16,7 @@ import numpy as np
 from lidar_anchored_depth.configs.stages.inject import InjectConfig
 from lidar_anchored_depth.data import RoadsideV2XLoader
 from lidar_anchored_depth.engine import OutputManager
+from lidar_anchored_depth.engine.discovery import resolve_upstream_dir
 from lidar_anchored_depth.pipeline.object_snapshot import (
     build_object_pose_cache,
     discover_object_clouds,
@@ -87,10 +88,17 @@ class DynamicInjectStage(Stage[InjectConfig]):
         scene_id = _resolve_scene_id(loader, cfg.scene.scene)
         cam_for_discovery = cfg.scene.cams[0]
 
-        recon_dir = Path(cfg.recon_dir)
-        if not recon_dir.is_dir():
-            raise SystemExit(f"--recon-dir {recon_dir} not a directory")
-        print(f"[inject] recon_dir = {recon_dir}")
+        if cfg.recon_dir is None:
+            recon_dir = resolve_upstream_dir(
+                cfg.output.root, cfg.scene.scene, "object-accum",
+                flag_hint="recon-dir",
+            )
+            print(f"[auto] recon-dir <- {recon_dir}")
+        else:
+            recon_dir = Path(cfg.recon_dir)
+            if not recon_dir.is_dir():
+                raise SystemExit(f"--recon-dir {recon_dir} not a directory")
+            print(f"[inject] recon_dir = {recon_dir}")
         clouds = discover_object_clouds(recon_dir, prefer_icp=True)
         motion = classify_v2x_objects(
             loader, scene_id,

@@ -30,12 +30,13 @@ class CalibConfig:
     output: OutputConfig = field(default_factory=OutputConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
 
-    d_paths_glob: str = "preview/da3/*_d.npz"
-    """Glob for the DA3 .npz files (output of `lad depth`)."""
+    d_paths_glob: str | None = None
+    """DA3 ``.npz`` glob. Auto: ``outputs/<scene>/depth/latest/*_d.npz``."""
 
     sam_mask_dir: Path | None = None
-    """Dir of SAM mask npz (output of `lad mask`). Strongly recommended;
-    without it dynamic-object pixels leak into the static AA-HAD output."""
+    """SAM mask dir (strongly recommended — without it dynamic pixels
+    leak into the static AA-HAD output). Auto:
+    ``outputs/<scene>/mask/latest/``."""
 
     aahad_pixel_stride: int = 2
     """Stride on depth pixels when building the static prior."""

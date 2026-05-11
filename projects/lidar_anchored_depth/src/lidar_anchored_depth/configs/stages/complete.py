@@ -48,20 +48,25 @@ class CompleteConfig:
     """Multi-GPU sharding via ``runtime.gpu_ids``."""
 
     # ---- external artifact paths ----
-    d_paths_glob: str = "preview/da3/*_d.npz"
-    """Glob matching DA3 ``.npz`` files (one per (scene, ts, cam))."""
+    # When left at None, each path auto-resolves from the matching
+    # upstream-stage's ``<output.root>/<scene>/<upstream>/latest/``
+    # directory. Pass an explicit path to override (e.g. to point at a
+    # pre-existing preview/ tree).
+    d_paths_glob: str | None = None
+    """DA3 ``.npz`` glob. Auto: ``outputs/<scene>/depth/latest/*_d.npz``."""
 
     sam_mask_dir: Path | None = None
-    """Dir with SAM dynamic-mask npz; static prior subtracts these."""
+    """SAM dynamic-mask dir. Auto: ``outputs/<scene>/mask/latest/``."""
 
     sam_auto_dir: Path | None = None
     """Optional SAM Auto segmentation (deprecated; prefer SegFormer)."""
 
     segformer_dir: Path | None = None
-    """Dir with SegFormer per-pixel Cityscapes class npz."""
+    """SegFormer class npz dir. Auto: ``outputs/<scene>/seg/latest/``."""
 
-    calib_json: Path = Path("calib.json")
-    """Per-camera AA-HAD linear calibration ``(a, b)``."""
+    calib_json: Path | None = None
+    """Per-camera AA-HAD ``(a, b)``. Auto:
+    ``outputs/<scene>/calib/latest/*_static_calib.json``."""
 
     residual_checkpoint: Path = Path("ckpt.pt")
     """Trained point-cloud residual flow head weights."""

@@ -41,8 +41,10 @@ class BevRenderConfig:
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
 
     # ---- inputs ----
-    recon_dir: Path = Path("preview/recon_3I_full")
-    """Dir of per-object accumulated PLYs."""
+    recon_dir: Path | None = None
+    """Dir of per-object accumulated PLYs. Auto:
+    ``outputs/<scene>/object-accum/latest/``. Pass an explicit path to
+    use a pre-existing tree (e.g. ``preview/recon_3I_full/``)."""
 
     static_ply: Path | None = None
     """Override the auto-discovered static cloud

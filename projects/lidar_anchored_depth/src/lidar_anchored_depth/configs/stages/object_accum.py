@@ -26,12 +26,13 @@ class ObjectAccumConfig:
     output: OutputConfig = field(default_factory=OutputConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
 
-    d_paths_glob: str = "preview/da3/*_d.npz"
-    """Glob for the DA3 .npz files (output of `lad depth`)."""
+    d_paths_glob: str | None = None
+    """DA3 ``.npz`` glob. Auto: ``outputs/<scene>/depth/latest/*_d.npz``."""
 
     sam_mask_dir: Path | None = None
-    """Dir of SAM mask npz (output of `lad mask`). Without this, only
-    the LiDAR side is accumulated — AA-HAD prediction is skipped."""
+    """SAM mask dir (output of ``lad mask``). Without this, only the
+    LiDAR side is accumulated — AA-HAD prediction is skipped. Auto:
+    ``outputs/<scene>/mask/latest/``."""
 
     voxel_size: float = 0.05
     """Voxel size (m) for per-object downsampling."""

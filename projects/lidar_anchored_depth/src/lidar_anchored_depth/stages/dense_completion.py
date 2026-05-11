@@ -19,6 +19,7 @@ Outputs (written into ``<output_dir>/``):
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import glob
 import json
 import time
@@ -28,6 +29,11 @@ import numpy as np
 
 from lidar_anchored_depth.configs.stages.complete import CompleteConfig
 from lidar_anchored_depth.data import RoadsideV2XLoader
+from lidar_anchored_depth.engine.discovery import (
+    resolve_upstream_dir,
+    resolve_upstream_file,
+    resolve_upstream_glob,
+)
 from lidar_anchored_depth.pipeline.colorize import (
     build_anchor_views,
     colorize_cloud_from_views,
@@ -114,15 +120,63 @@ class DenseCompletionStage(Stage[CompleteConfig]):
     def run(self) -> StageArtifacts:
         cfg = self.cfg
         out_dir = self.output_dir
-        flat_args = _flatten_to_namespace(cfg)
         gpu_ids: list[int] = list(cfg.runtime.gpu_ids)
 
+        # ---- auto-resolve upstream artefacts ----
+        # Each path stays as-is when the user passed it explicitly;
+        # left as None it falls back to the convention path under
+        # ``<output.root>/<scene>/<upstream>/latest/``.
+        calib_json = cfg.calib_json
+        if calib_json is None:
+            calib_json = resolve_upstream_file(
+                cfg.output.root, cfg.scene.scene, "calib",
+                "*_static_calib.json",
+                flag_hint="calib-json",
+            )
+            print(f"[auto] calib-json <- {calib_json}")
+        d_paths_glob = cfg.d_paths_glob
+        if d_paths_glob is None:
+            d_paths_glob = resolve_upstream_glob(
+                cfg.output.root, cfg.scene.scene, "depth", "*_d.npz",
+                flag_hint="d-paths-glob",
+            )
+            print(f"[auto] d-paths-glob <- {d_paths_glob}")
+        sam_mask_dir = cfg.sam_mask_dir
+        if sam_mask_dir is None:
+            sam_mask_dir = resolve_upstream_dir(
+                cfg.output.root, cfg.scene.scene, "mask",
+                required=False, flag_hint="sam-mask-dir",
+            )
+            if sam_mask_dir is not None:
+                print(f"[auto] sam-mask-dir <- {sam_mask_dir}")
+        segformer_dir = cfg.segformer_dir
+        if segformer_dir is None:
+            segformer_dir = resolve_upstream_dir(
+                cfg.output.root, cfg.scene.scene, "seg",
+                required=False, flag_hint="segformer-dir",
+            )
+            if segformer_dir is not None:
+                print(f"[auto] segformer-dir <- {segformer_dir}")
+
+        # Stash the resolved paths back on cfg before flattening, so
+        # the per-worker namespace (which the underlying primitives
+        # were written against) sees the final values, not the Nones.
+        cfg = dataclasses.replace(
+            cfg,
+            calib_json=Path(calib_json),
+            d_paths_glob=str(d_paths_glob),
+            sam_mask_dir=Path(sam_mask_dir) if sam_mask_dir else None,
+            segformer_dir=Path(segformer_dir) if segformer_dir else None,
+        )
+        self.cfg = cfg
+        flat_args = _flatten_to_namespace(cfg)
+
         # ---- inputs index ----
-        calib = json.loads(Path(cfg.calib_json).read_text())
+        calib = json.loads(Path(calib_json).read_text())
         print(f"[load] static calib for cams: {sorted(calib.keys())}")
 
         d_paths_index: dict[tuple[str, int, str], Path] = {}
-        for p in sorted(glob.glob(cfg.d_paths_glob)):
+        for p in sorted(glob.glob(str(d_paths_glob))):
             try:
                 data = np.load(p, allow_pickle=True)
                 key = (
