@@ -34,8 +34,12 @@ from lidar_anchored_depth.configs.base import (
     SceneConfig,
 )
 from lidar_anchored_depth.configs.stages.complete import CompleteConfig
+from lidar_anchored_depth.configs.stages.inject import InjectConfig
+from lidar_anchored_depth.configs.stages.render_bev import BevRenderConfig
 from lidar_anchored_depth.engine import OutputManager
+from lidar_anchored_depth.stages.bev_render import BevRenderStage
 from lidar_anchored_depth.stages.dense_completion import DenseCompletionStage
+from lidar_anchored_depth.stages.dynamic_inject import DynamicInjectStage
 
 
 # ---------------------------------------------------------------- info
@@ -86,29 +90,57 @@ class VersionCmd:
 # loop can call ``cmd.run()`` uniformly. Subclassing keeps the tyro CLI
 # identical to bare CompleteConfig (no extra options injected).
 
+def _execute_stage(cmd, stage_cls) -> int:
+    """Common runner: provision OutputManager, dump config, run stage,
+    write summary, refresh latest symlink. Used by every stage CLI."""
+    om = OutputManager(
+        cmd.output.root,
+        cmd.scene.scene,
+        stage_cls.name,
+        run_id=cmd.output.run_id,
+        update_latest=cmd.output.overwrite_latest,
+    )
+    om.dump_config(cmd)
+    print(f"[output] run_dir = {om.run_dir}", flush=True)
+
+    stage = stage_cls(cfg=cmd, output_dir=om.run_dir)
+    artifacts = stage.run()
+
+    summary_path = om.run_dir / "summary.json"
+    summary_path.write_text(json.dumps(_dump(artifacts.summary), indent=2))
+    om.finalise()
+    print(f"[done] artifacts -> {om.latest_link}")
+    return 0
+
+
 @dataclass
 class CompleteCmd(CompleteConfig):
     """Run point-cloud completion + Layer 4 LiDAR-priority fuse on one scene."""
 
     def run(self) -> int:
-        om = OutputManager(
-            self.output.root,
-            self.scene.scene,
-            DenseCompletionStage.name,
-            run_id=self.output.run_id,
-            update_latest=self.output.overwrite_latest,
-        )
-        om.dump_config(self)
-        print(f"[output] run_dir = {om.run_dir}", flush=True)
+        return _execute_stage(self, DenseCompletionStage)
 
-        stage = DenseCompletionStage(cfg=self, output_dir=om.run_dir)
-        artifacts = stage.run()
 
-        summary_path = om.run_dir / "summary.json"
-        summary_path.write_text(json.dumps(_dump(artifacts.summary), indent=2))
-        om.finalise()
-        print(f"[done] artifacts -> {om.latest_link}")
-        return 0
+@dataclass
+class InjectCmd(InjectConfig):
+    """Inject per-object accumulated snapshots into the static cloud
+    at one anchor timestamp.
+
+    Auto-reads ``outputs/<scene>/complete/latest/hybrid.ply`` unless
+    ``--static-ply`` overrides.
+    """
+
+    def run(self) -> int:
+        return _execute_stage(self, DynamicInjectStage)
+
+
+@dataclass
+class RenderBevCmd(BevRenderConfig):
+    """Render per-ts BEV PNGs with linear pose-interpolated dynamic
+    objects. Output PNGs feed straight into ``ffmpeg``."""
+
+    def run(self) -> int:
+        return _execute_stage(self, BevRenderStage)
 
 
 def _dump(obj: object) -> object:
@@ -160,6 +192,26 @@ Subcommand = Union[
             description=(
                 "Stage 2/4: per-frame point-completion network + Layer 4 "
                 "LiDAR-priority fuse. Multi-GPU via --runtime.gpu-ids."
+            ),
+        ),
+    ],
+    Annotated[
+        InjectCmd,
+        tyro.conf.subcommand(
+            name="inject",
+            description=(
+                "Stage 5: inject per-object snapshots at one anchor ts. "
+                "Reads complete/latest/hybrid.ply by convention."
+            ),
+        ),
+    ],
+    Annotated[
+        RenderBevCmd,
+        tyro.conf.subcommand(
+            name="render-bev",
+            description=(
+                "Render per-ts BEV PNGs with linear pose-interpolated "
+                "dynamic objects. Feed into ffmpeg for video assembly."
             ),
         ),
     ],

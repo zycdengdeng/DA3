@@ -152,3 +152,92 @@ def test_cli_complete_help():
     assert "--scene.scene" in r.stdout
     assert "--runtime.gpu-ids" in r.stdout
     assert "--output.root" in r.stdout
+
+
+# ---- Phase 3: inject + render-bev stages --------------------------------
+
+def test_inject_config_importable():
+    from lidar_anchored_depth.configs.stages.inject import InjectConfig
+
+    cfg = InjectConfig(scene=SceneConfig(scene="008"))
+    assert cfg.scene.scene == "008"
+    assert cfg.object_fusion == "lidar-priority"
+    assert cfg.strict_anchor is True
+    assert cfg.mirror_classes == ("Car", "Suv", "Bus", "Truck")
+
+
+def test_render_bev_config_importable():
+    from lidar_anchored_depth.configs.stages.render_bev import BevRenderConfig
+
+    cfg = BevRenderConfig(scene=SceneConfig(scene="008"))
+    assert cfg.scene.scene == "008"
+    assert cfg.ts_stride == 1
+    assert cfg.image_size == (1024, 1024)
+    assert cfg.x_range is None
+    assert cfg.max_gap_ms == 500
+
+
+def test_inject_stage_has_correct_name():
+    from lidar_anchored_depth.stages.dynamic_inject import DynamicInjectStage
+
+    assert DynamicInjectStage.name == "inject"
+
+
+def test_render_bev_stage_has_correct_name():
+    from lidar_anchored_depth.stages.bev_render import BevRenderStage
+
+    assert BevRenderStage.name == "render-bev"
+
+
+def test_discover_static_ply_errors_when_no_upstream(tmp_path):
+    """Auto-discovery should surface a clear message when the user
+    forgot to run `lad complete` first."""
+    from lidar_anchored_depth.configs.stages.inject import InjectConfig
+    from lidar_anchored_depth.stages.dynamic_inject import _discover_static_ply
+
+    cfg = InjectConfig(scene=SceneConfig(scene="008"))
+    with pytest.raises(SystemExit) as exc:
+        _discover_static_ply(cfg, tmp_path, "008")
+    assert "no upstream `complete` run" in str(exc.value)
+
+
+def test_discover_static_ply_finds_latest(tmp_path):
+    """When a previous `complete` run wrote hybrid.ply, the discovery
+    helper resolves it via the ``latest`` symlink."""
+    from lidar_anchored_depth.configs.stages.inject import InjectConfig
+    from lidar_anchored_depth.engine import OutputManager
+    from lidar_anchored_depth.stages.dynamic_inject import _discover_static_ply
+
+    om = OutputManager(tmp_path, scene="008", stage="complete")
+    hybrid = om.run_dir / "hybrid.ply"
+    hybrid.write_text("ply\n")  # contents irrelevant for resolver
+    om.finalise()
+
+    cfg = InjectConfig(scene=SceneConfig(scene="008"))
+    found = _discover_static_ply(cfg, tmp_path, "008")
+    assert found == hybrid
+
+
+def test_cli_inject_help():
+    r = _lad("inject", "--help")
+    assert r.returncode == 0, r.stderr
+    assert "--recon-dir" in r.stdout
+    assert "--anchor-ts-ms" in r.stdout
+    assert "--static-ply" in r.stdout
+    assert "--scene.scene" in r.stdout
+
+
+def test_cli_render_bev_help():
+    r = _lad("render-bev", "--help")
+    assert r.returncode == 0, r.stderr
+    assert "--ts-stride" in r.stdout
+    assert "--max-gap-ms" in r.stdout
+    assert "--image-size" in r.stdout
+    assert "--scene.scene" in r.stdout
+
+
+def test_cli_top_help_lists_phase3_subcommands():
+    r = _lad("--help")
+    assert r.returncode == 0, r.stderr
+    assert "inject" in r.stdout
+    assert "render-bev" in r.stdout
