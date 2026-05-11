@@ -29,6 +29,7 @@ dependencies = [
     "loguru>=0.7",
     "tqdm>=4.66",
     "pyyaml>=6.0",
+    "tyro>=0.8",
 ]
 
 [project.optional-dependencies]
@@ -43,9 +44,9 @@ dev = [
 ]
 
 [project.scripts]
-lad-infer = "lidar_anchored_depth.cli.infer:main"
-lad-evaluate = "lidar_anchored_depth.cli.evaluate:main"
-lad-ablate = "lidar_anchored_depth.cli.ablate:main"
+# Single top-level CLI. Subcommands (`lad depth`, `lad complete`, ...) are
+# routed inside lidar_anchored_depth.cli.main via tyro Union dispatch.
+lad = "lidar_anchored_depth.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
