@@ -33,6 +33,9 @@ from lidar_anchored_depth.configs.base import (
     RuntimeConfig,
     SceneConfig,
 )
+from lidar_anchored_depth.configs.stages.complete import CompleteConfig
+from lidar_anchored_depth.engine import OutputManager
+from lidar_anchored_depth.stages.dense_completion import DenseCompletionStage
 
 
 # ---------------------------------------------------------------- info
@@ -77,6 +80,37 @@ class VersionCmd:
         return 0
 
 
+# --------------------------------------------------------------- complete
+#
+# Wrap CompleteConfig with a thin ``run()`` method so the CLI dispatch
+# loop can call ``cmd.run()`` uniformly. Subclassing keeps the tyro CLI
+# identical to bare CompleteConfig (no extra options injected).
+
+@dataclass
+class CompleteCmd(CompleteConfig):
+    """Run point-cloud completion + Layer 4 LiDAR-priority fuse on one scene."""
+
+    def run(self) -> int:
+        om = OutputManager(
+            self.output.root,
+            self.scene.scene,
+            DenseCompletionStage.name,
+            run_id=self.output.run_id,
+            update_latest=self.output.overwrite_latest,
+        )
+        om.dump_config(self)
+        print(f"[output] run_dir = {om.run_dir}", flush=True)
+
+        stage = DenseCompletionStage(cfg=self, output_dir=om.run_dir)
+        artifacts = stage.run()
+
+        summary_path = om.run_dir / "summary.json"
+        summary_path.write_text(json.dumps(_dump(artifacts.summary), indent=2))
+        om.finalise()
+        print(f"[done] artifacts -> {om.latest_link}")
+        return 0
+
+
 def _dump(obj: object) -> object:
     """Lightweight recursive dataclass → dict for pretty-printing.
 
@@ -117,6 +151,16 @@ Subcommand = Union[
         tyro.conf.subcommand(
             name="version",
             description="Print just the package version string.",
+        ),
+    ],
+    Annotated[
+        CompleteCmd,
+        tyro.conf.subcommand(
+            name="complete",
+            description=(
+                "Stage 2/4: per-frame point-completion network + Layer 4 "
+                "LiDAR-priority fuse. Multi-GPU via --runtime.gpu-ids."
+            ),
         ),
     ],
 ]

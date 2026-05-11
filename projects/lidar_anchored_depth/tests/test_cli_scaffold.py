@@ -119,3 +119,36 @@ def test_cli_top_help_lists_subcommands():
     assert r.returncode == 0, r.stderr
     assert "info" in r.stdout
     assert "version" in r.stdout
+    assert "complete" in r.stdout
+
+
+# ---- Phase 2: complete stage --------------------------------------------
+
+def test_complete_config_importable():
+    from lidar_anchored_depth.configs.stages.complete import CompleteConfig
+
+    # Required: scene block. Everything else has defaults.
+    cfg = CompleteConfig(scene=SceneConfig(scene="008"))
+    assert cfg.scene.scene == "008"
+    assert cfg.voxel_size == 0.05
+    assert cfg.robust_color == "median"
+    assert cfg.lidar_skip_ground is True
+
+
+def test_dense_completion_stage_has_correct_name():
+    from lidar_anchored_depth.stages.dense_completion import (
+        DenseCompletionStage,
+    )
+
+    assert DenseCompletionStage.name == "complete"
+
+
+def test_cli_complete_help():
+    r = _lad("complete", "--help")
+    assert r.returncode == 0, r.stderr
+    # Stage-specific flag
+    assert "--residual-checkpoint" in r.stdout
+    # Composed blocks
+    assert "--scene.scene" in r.stdout
+    assert "--runtime.gpu-ids" in r.stdout
+    assert "--output.root" in r.stdout
