@@ -112,7 +112,25 @@ class RoadsideV2XLoader(BaseDataset):
         min_num_points: int = 5,
         static_fixture_classes: frozenset[str] = STATIC_FIXTURE_CLASSES,
         pcd_tolerance_ms: int = PCD_TIMESTAMP_TOLERANCE_MS,
+        labels_source: str = "interpolation",
     ) -> None:
+        """
+        Parameters
+        ----------
+        labels_source : "interpolation" or "merged_pcd"
+            Which V2X bbox folder to read.
+
+            * ``"interpolation"`` (default): 10 Hz interpolated bboxes
+              from ``road_labels/interpolation_labels/``. Smooth for
+              video, but the interpolation jitter can leak per-object
+              LiDAR points into the static cloud.
+            * ``"merged_pcd"``: 1 Hz hand-labeled bboxes from
+              ``road_labels/merged_pcd_all/``. Much more accurate
+              (no interpolation jitter); used by the static-cloud
+              accumulator to avoid leaving a trail of car points
+              along the trajectory. Sparser timestamp list — not
+              suitable for video.
+        """
         self.data_root = Path(data_root)
         self.scene_filter = list(scenes) if scenes else None
 
@@ -125,6 +143,12 @@ class RoadsideV2XLoader(BaseDataset):
                 )
         self.cameras = cameras
 
+        if labels_source not in ("interpolation", "merged_pcd"):
+            raise ValueError(
+                f"labels_source must be 'interpolation' or 'merged_pcd', "
+                f"got {labels_source!r}"
+            )
+        self.labels_source = labels_source
         self.occlusion_max = occlusion_max
         self.min_num_points = min_num_points
         self.static_fixture_classes = static_fixture_classes
@@ -206,9 +230,15 @@ class RoadsideV2XLoader(BaseDataset):
         self._scenes = []
         self._scene_fixtures = {}
 
+        labels_subdir = (
+            "interpolation_labels"
+            if self.labels_source == "interpolation"
+            else "merged_pcd_all"
+        )
+
         for scene_dir in scene_dirs:
             scene_id = scene_dir.name
-            label_dir = scene_dir / "road_labels" / "interpolation_labels"
+            label_dir = scene_dir / "road_labels" / labels_subdir
             try:
                 if not label_dir.is_dir():
                     continue

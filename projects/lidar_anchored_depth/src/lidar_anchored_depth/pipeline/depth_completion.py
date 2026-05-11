@@ -280,10 +280,14 @@ def _init_worker(
     args = _argparse.Namespace(**args_dict)
 
     from lidar_anchored_depth.data import RoadsideV2XLoader as _Loader
+    # Workers do per-frame refine, which queries dynamic V2X bboxes
+    # to cull moving-vehicle LiDAR from the prior — use the
+    # dynamic-labels-source loader (10 Hz interpolation).
     loader = _Loader(
         data_root=args.data_root,
         scenes=[args.scene] if "_" in args.scene else None,
         min_num_points=args.loader_min_points,
+        labels_source=getattr(args, "dynamic_labels_source", "interpolation"),
     )
     if "_" not in args.scene:
         loader.scene_filter = [args.scene]

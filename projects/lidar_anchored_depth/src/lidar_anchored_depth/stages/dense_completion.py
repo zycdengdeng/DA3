@@ -67,6 +67,8 @@ def _flatten_to_namespace(cfg: CompleteConfig) -> argparse.Namespace:
         scene=cfg.scene.scene,
         cams=list(cfg.scene.cams),
         loader_min_points=cfg.scene.loader_min_points,
+        # Workers do per-frame refine on dynamic-labels-source loader.
+        dynamic_labels_source=cfg.scene.dynamic_labels_source,
         # External artifact paths
         sam_mask_dir=str(cfg.sam_mask_dir) if cfg.sam_mask_dir else None,
         sam_auto_dir=str(cfg.sam_auto_dir) if cfg.sam_auto_dir else None,
@@ -133,11 +135,13 @@ class DenseCompletionStage(Stage[CompleteConfig]):
             d_paths_index[key] = Path(p)
         print(f"[load] {len(d_paths_index)} d_tilde frames indexed")
 
-        # ---- loader + scene ----
+        # ---- dynamic-labels loader (10 Hz, used everywhere except
+        #      the static-cloud accumulation step) ----
         loader = RoadsideV2XLoader(
             data_root=cfg.scene.data_root,
             scenes=[cfg.scene.scene] if "_" in cfg.scene.scene else None,
             min_num_points=cfg.scene.loader_min_points,
+            labels_source=cfg.scene.dynamic_labels_source,
         )
         if "_" not in cfg.scene.scene:
             loader.scene_filter = [cfg.scene.scene]
@@ -145,13 +149,42 @@ class DenseCompletionStage(Stage[CompleteConfig]):
         scene = next(s for s in loader.scenes if s.scene_id == scene_id)
         print(
             f"[scene] {scene_id}  ts={len(scene.timestamps_ms)}  "
-            f"cams={list(cfg.scene.cams)}"
+            f"cams={list(cfg.scene.cams)}  "
+            f"dynamic_labels={cfg.scene.dynamic_labels_source}"
         )
 
-        # ---- ground grid ----
+        # ---- static-labels loader (typically 1 Hz hand-labels) ----
+        # When static and dynamic sources match, reuse the loader to
+        # avoid duplicating the V2X scene index. When they differ
+        # (the recommended default), build a second loader pointing at
+        # the hand-label folder so accumulate_static_lidar gets a
+        # cleaner bbox mask and the static cloud doesn't pick up a
+        # trail of leaked car points along moving-object trajectories.
+        if cfg.scene.static_labels_source == cfg.scene.dynamic_labels_source:
+            static_loader = loader
+        else:
+            static_loader = RoadsideV2XLoader(
+                data_root=cfg.scene.data_root,
+                scenes=(
+                    [cfg.scene.scene] if "_" in cfg.scene.scene else None
+                ),
+                min_num_points=cfg.scene.loader_min_points,
+                labels_source=cfg.scene.static_labels_source,
+            )
+            if "_" not in cfg.scene.scene:
+                static_loader.scene_filter = [cfg.scene.scene]
+            static_scene = next(
+                s for s in static_loader.scenes if s.scene_id == scene_id
+            )
+            print(
+                f"  static_labels={cfg.scene.static_labels_source}  "
+                f"({len(static_scene.timestamps_ms)} hand-label ts)"
+            )
+
+        # ---- ground grid (from hand-label-masked static LiDAR) ----
         print("[ground] aggregating static LiDAR for ground grid")
         static_lidar_full = accumulate_static_lidar(
-            loader, scene_id, list(cfg.scene.cams),
+            static_loader, scene_id, list(cfg.scene.cams),
             bbox_expand=cfg.bbox_expand,
         )
         ground_grid = build_ground_height_grid(

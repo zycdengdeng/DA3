@@ -60,11 +60,12 @@ class BevRenderStage(Stage[BevRenderConfig]):
         static_xyz, static_rgb = read_ply_xyz_rgb(static_ply)
         print(f"  loaded {static_xyz.shape[0]} static points")
 
-        # ---- loader + scene ----
+        # ---- loader + scene (10 Hz dynamic labels for smooth video) ----
         loader = RoadsideV2XLoader(
             data_root=cfg.scene.data_root,
             scenes=[cfg.scene.scene] if "_" in cfg.scene.scene else None,
             min_num_points=cfg.scene.loader_min_points,
+            labels_source=cfg.scene.dynamic_labels_source,
         )
         if "_" not in cfg.scene.scene:
             loader.scene_filter = [cfg.scene.scene]

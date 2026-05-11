@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 
 @dataclass
@@ -31,6 +32,24 @@ class SceneConfig:
 
     loader_min_points: int = 0
     """Drop frames whose LiDAR has fewer points than this."""
+
+    static_labels_source: Literal["interpolation", "merged_pcd"] = "merged_pcd"
+    """V2X label folder for *static-cloud* bbox masking. Hand-labeled
+    ``merged_pcd`` (1 Hz, ``road_labels/merged_pcd_all/``) is more
+    accurate than the ``interpolation`` set (10 Hz,
+    ``road_labels/interpolation_labels/``) — interpolation jitter at
+    bbox edges is what causes the "trail of car points in the static
+    cloud" artifact. Fall back to ``"interpolation"`` if a scene has
+    no hand-labels."""
+
+    dynamic_labels_source: Literal["interpolation", "merged_pcd"] = (
+        "interpolation"
+    )
+    """V2X label folder for *dynamic-object* handling (per-object
+    accumulation, snapshot injection, video BEV). 10 Hz interpolation
+    is needed for smooth motion across video frames; the 1 Hz hand-
+    labels are too sparse here. Only switch to ``"merged_pcd"`` for
+    debugging."""
 
 
 @dataclass
