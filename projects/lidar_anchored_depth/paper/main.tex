@@ -1,0 +1,893 @@
+% LAD-DA3: Height-Anchored Depth for Roadside V2X Scene Reconstruction
+%
+% Drafted in the CVPR-paper style. The official cvpr.sty is not vendored;
+% drop it next to this file before building. Falls back to a plain article
+% class so the source is still readable / compilable for quick iteration.
+
+\IfFileExists{cvpr.sty}{
+    \documentclass[10pt,twocolumn,letterpaper]{article}
+    \usepackage{cvpr}
+}{
+    % Fallback for quick local iteration without the CVPR kit.
+    \documentclass[10pt,twocolumn,letterpaper]{article}
+    \usepackage[margin=0.75in]{geometry}
+    \usepackage{times}
+    \newcommand{\cvprfinalcopy}{}
+    \newcommand{\confName}{CVPR}
+    \newcommand{\confYear}{20XX}
+}
+
+\usepackage{amsmath, amssymb, amsfonts}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{subcaption}
+\usepackage{xcolor}
+\usepackage{algorithm}
+\usepackage[noend]{algpseudocode}
+\usepackage[hidelinks]{hyperref}
+\usepackage{microtype}
+
+% Compact in-line TODOs, easy to grep.
+\newcommand{\todo}[1]{\textcolor{red}{[TODO: #1]}}
+% A short name for the system; saves typing and keeps it consistent.
+\newcommand{\ourmethod}{\textsc{Lad-DA3}\xspace}
+% xspace if not provided by cvpr.sty:
+\IfFileExists{xspace.sty}{\usepackage{xspace}}{\newcommand{\xspace}{}}
+
+% \cvprfinalcopy   % uncomment for the camera-ready
+\def\paperID{XXXX}
+\def\confName{CVPR}
+\def\confYear{20XX}
+
+\title{Height-Anchored Depth: Closed-Form Foundation Depth Calibration\\
+for Roadside V2X Scene Reconstruction}
+
+\author{Anonymous Authors\\
+Anonymous Institution\\
+{\tt\small anonymous@example.org}
+}
+
+\begin{document}
+\maketitle
+
+
+%======================================================================
+\begin{abstract}
+Foundation monocular depth models such as Depth Anything 3 produce
+relative depth maps that are remarkably faithful in shape but suffer
+from \emph{scale drift} in out-of-distribution settings — most notably
+the roadside vehicle-to-everything (V2X) configuration, where cameras
+are mounted 5–10\,m above the road plane and observe traffic 50–200\,m
+away. The standard fix is to align the predicted depth to LiDAR returns
+via a global scale or a per-pixel affine map; both rely on hundreds of
+thousands of noisy per-pixel anchors and both collapse at long range,
+exactly where roadside applications need the answer.
+
+We argue that the right primitive for roadside scenes is the
+\emph{world-frame height} of segmented instances, not per-pixel camera
+depth. From a Vehicle-to-Everything (V2X) bounding box we read off two
+height anchors — the road surface and the object top — and the
+predicted relative depth becomes metric via a one-line linear system,
+solved in closed form per camera and per instance. We call this formulation
+\textbf{Height-Anchored Depth} (HAD), and its axis-aligned variant
+\textbf{AA-HAD}. Around this core we build an end-to-end pipeline that
+combines AA-HAD with a LiDAR-derived 2.5D ground grid, a LiDAR-priority
+voxel fusion, a per-object accumulation in object-local frames, and a
+trained DGCNN+conditional-flow-matching residual head that refines the
+closed-form prediction. The full system is shipped as a typed CLI
+(\texttt{lad}) with multi-GPU sharding and an
+\texttt{outputs/<scene>/<stage>/<run>/} discovery convention that turns
+the whole eight-stage pipeline into one command.
+
+We demonstrate \ourmethod{} on the TianJin Roadside V2X dataset. A
+model trained on one intersection transfers zero-shot to an unseen
+intersection without retraining, producing dense static reconstructions
+that are visibly cleaner than the closed-form baseline and dynamic-object
+trajectories that move smoothly across bird's-eye-view video frames.
+\end{abstract}
+
+
+%======================================================================
+\section{Introduction}
+\label{sec:intro}
+
+Foundation monocular depth models~\cite{depthanything3,zoedepth,midas3}
+have closed the gap between research-grade and deployment-grade depth
+estimation on a wide spectrum of in-the-wild imagery — driving scenes,
+indoor scenes, hand-held captures. Two limitations remain stubborn,
+however, when the camera moves out of the training distribution. First,
+the predictions are typically \emph{relative} (or, in the metric heads,
+biased on scenes the model was not trained on), so a downstream
+calibration step is needed before the depth can be unprojected into a
+metric 3D scene. Second, the standard calibration step — align the
+predicted depth to LiDAR returns via a global scale or a per-pixel
+affine~\cite{lidaraligndepth} — fails on \emph{long-range} returns, the
+exact regime in which roadside Vehicle-to-Everything (V2X)
+applications operate.
+
+The roadside V2X setting (Fig.~\ref{fig:teaser}) is special in three
+ways relevant to depth estimation. (i) The camera is mounted 5–10\,m
+above the road plane and observes traffic at 20–200\,m, so per-pixel
+camera-axis depth varies across nearly two orders of magnitude in a
+single image. (ii) The available LiDAR is sparse at the same long
+ranges where the camera is most uncertain. (iii) V2X annotations
+provide \emph{per-instance 3D bounding boxes} for every annotated
+vehicle, pedestrian, and roadside fixture — a data product that is
+nearly always available in this setting and almost never exploited
+by current depth-calibration pipelines.
+
+\paragraph{Key insight.} Per-pixel \emph{camera-axis depth} is the
+wrong primitive for a roadside camera. The right primitive is
+\emph{world-frame height}: the road surface is approximately level,
+each annotated instance has a known vertical extent, and the camera's
+pose with respect to the world frame is provided by the calibration
+pack. From an instance's 3D bounding box we obtain two height anchors
+— the road surface ($Z_{\min}^i$) and the object top ($Z_{\max}^i$).
+A simple closed-form linear system maps the foundation model's relative
+depth to a metric scale that places those two anchors at the right
+heights. With 2 anchors per instance, a single least-squares solve per
+camera, and no iteration, the camera depth becomes metric.
+
+\paragraph{Contributions.} We introduce \ourmethod{}, a layered pipeline
+that combines this Height-Anchored Depth (HAD) formulation with the
+other components needed to produce a dense, multi-camera, multi-frame
+3D scene reconstruction in the roadside V2X setting. Concretely:
+
+\begin{itemize}
+\setlength{\itemsep}{1pt}
+\item We derive the \textbf{HAD calibration} (Sec.~\ref{sec:method-had})
+and its axis-aligned approximation \textbf{AA-HAD}
+(Sec.~\ref{sec:method-aahad}), giving a one-shot per-camera linear
+calibration of a foundation depth model against a handful of V2X
+bounding boxes.
+\item We design a \textbf{layered system}
+(Sec.~\ref{sec:method-pipeline}) — Layer~3 ground-snap on a
+LiDAR-derived 2.5D height grid, Layer~4 LiDAR-priority voxel fusion,
+and Layer~5 per-object accumulation in object-local frames — that turns
+per-frame metric depth into a static-scene reconstruction with
+smoothly-placed dynamic actors.
+\item We train a \textbf{point-cloud residual flow head}
+(Sec.~\ref{sec:method-residual}) — a DGCNN backbone with a conditional
+flow-matching head and segment-aware EdgeConv masking — that refines
+the closed-form prediction near object edges and on poorly-observed
+surfaces.
+\item We ship the full system as a \textbf{typed multi-stage CLI}
+(\texttt{lad}, Sec.~\ref{sec:impl}) with multi-GPU sharding and a
+convention-over-configuration output layout, so a fresh scene goes from
+raw frames to a BEV video with a single shell command.
+\item We provide a \textbf{dual labels-source} mechanism
+(Sec.~\ref{sec:impl-dual}) that uses hand-labeled 1\,Hz V2X bounding
+boxes for static-scene accumulation (high spatial precision) and
+interpolated 10\,Hz boxes for per-object accumulation and video
+rendering (smooth motion). The static-only cloud loses the "trail of
+leaked dynamic-object points" artefact that plagues purely-interpolated
+pipelines (Sec.~\ref{sec:exp-ablation}).
+\end{itemize}
+
+We demonstrate \ourmethod{} qualitatively on the TianJin Roadside V2X
+dataset (Sec.~\ref{sec:exp}). A model trained on one intersection
+transfers zero-shot to an unseen intersection; the refined point
+clouds are visibly cleaner than the closed-form baseline; and the
+generated BEV videos show dynamic objects moving smoothly across
+frames.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{figures/teaser.png}
+  \caption{\textbf{Roadside V2X reconstruction from \ourmethod{}.}
+  Top-down BEV of a busy intersection. Dense road surface and roadside
+  geometry come from a single foundation depth model (Depth Anything
+  3) calibrated by per-instance heights from V2X bounding boxes;
+  per-object accumulated reconstructions are placed in the scene at
+  the current timestamp with linear pose interpolation. No per-pixel
+  LiDAR alignment is used. Insets: zoom-ins on a vehicle and a
+  traffic-light pole.}
+  \label{fig:teaser}
+\end{figure}
+
+
+%======================================================================
+\section{Related Work}
+\label{sec:related}
+
+\paragraph{Foundation monocular depth.} Depth Anything 3
+\cite{depthanything3} and its predecessor Depth Anything~v2
+\cite{depthanything2} have set the standard for in-the-wild relative
+depth prediction by pre-training on $\sim$$10^7$ images with a
+combination of curated synthetic depth and self-distilled
+pseudo-labels. ZoeDepth \cite{zoedepth}, Marigold \cite{marigold}, and
+the recent generation of diffusion-based depth models target metric
+prediction directly, but typically saturate at $\sim$$80$\,m. None of
+these models — relative or metric — addresses the roadside V2X regime,
+where the depth distribution spans nearly two orders of magnitude in a
+single image.
+
+\paragraph{Depth-to-LiDAR alignment.} A long line of work aligns
+predicted depth to sparse LiDAR returns via a global scale-and-shift
+\cite{midas3}, a per-region affine \cite{regionaffinedepth}, or a
+learned per-pixel correction head \cite{learneddepthcalibration}. All
+of these treat per-pixel camera-axis depth as the primitive being
+aligned. \ourmethod{} differs in two ways: it aligns to per-instance
+world-frame heights (not per-pixel camera-axis depth), and the per-
+camera solve is closed-form (no iteration, no learned alignment head).
+
+\paragraph{V2X 3D scene reconstruction.} BEVFormer~\cite{bevformer},
+BEVFusion~\cite{bevfusion}, and the V2X-Sim/OPV2V family
+\cite{v2xsim,opv2v} construct 3D feature volumes from multi-view
+roadside imagery, then decode bird's-eye-view object detections.
+These pipelines target perception (detection, tracking), not dense
+scene reconstruction; their depth representation is implicit and
+internal. \ourmethod{} produces an explicit dense world-frame point
+cloud that is suitable for both perception and downstream simulation.
+
+\paragraph{Point-cloud refinement / completion.} PCN \cite{pcn},
+PoinTr \cite{pointr}, and the PointTransformer~v3
+\cite{pointtransformerv3} family refine partial point clouds via a
+learned encoder–decoder. \ourmethod{}'s residual head
+(Sec.~\ref{sec:method-residual}) uses a DGCNN backbone with a
+conditional flow-matching head; the output is a per-point Euclidean
+displacement applied to the AA-HAD prediction. This is closer in
+spirit to denoising than to completion: the input cloud is already
+metric and approximately correct, and the head's job is to remove
+residual structure that the closed-form prior does not capture.
+
+\paragraph{Per-object reconstruction.} The closest line of prior work
+is multi-frame per-object aggregation in the autonomous-driving stack
+\cite{multiframeperobject}, where bounding-box-cropped LiDAR returns
+from each frame are placed into an object-local frame and accumulated.
+We adopt the same idea (Sec.~\ref{sec:method-perobject}) and add a
+foundation-depth-based dense branch alongside the LiDAR branch.
+
+
+%======================================================================
+\section{Method}
+\label{sec:method}
+
+We describe \ourmethod{} in two parts. Sec.~\ref{sec:method-had}–
+\ref{sec:method-aahad} derive the closed-form HAD calibration that is
+the conceptual core of the system. Sec.~\ref{sec:method-pipeline}–
+\ref{sec:method-bev} walk through the eight-stage pipeline that wraps
+HAD into an end-to-end dense reconstruction.
+
+\subsection{Notation}
+\label{sec:method-notation}
+
+Let $\mathbf{K}\in\mathbb{R}^{3\times 3}$ be a pinhole camera's
+intrinsic matrix and $\mathbf{T}_{wc}\in\mathrm{SE}(3)$ its world-from-
+camera pose. A pixel $(u,v)$ unprojects to a metric world point via
+\begin{align}
+\mathbf{r}_{cam}(u,v) &= \mathbf{K}^{-1}\,(u, v, 1)^\top
+\label{eq:ray} \\
+\mathbf{p}_{cam}(u,v) &= z_{cam}(u,v)\,\mathbf{r}_{cam}(u,v)
+\label{eq:campt} \\
+\mathbf{p}_{world}(u,v) &= \mathbf{T}_{wc}\,\mathbf{p}_{cam}(u,v).
+\label{eq:worldpt}
+\end{align}
+The foundation depth model produces a relative depth map
+$\tilde{d}(u,v)$. The task is to recover the metric camera-axis depth
+$z_{cam}(u,v)$ from $\tilde{d}(u,v)$.
+
+
+\subsection{Height-Anchored Depth (HAD)}
+\label{sec:method-had}
+
+The standard global-affine calibration \cite{midas3} writes
+$z_{cam} = a\,\tilde{d} + b$ and solves for $(a, b)$ by matching $z_{cam}$
+to LiDAR returns at every pixel that has one. Two failure modes are
+well known: LiDAR returns are sparse at long ranges, so $(a, b)$ is
+dominated by close-range pixels; and the per-pixel camera-axis depth
+varies across two orders of magnitude in a single roadside image, so
+a single $(a, b)$ pair fits the foreground at the expense of the
+horizon (or vice versa).
+
+The HAD reformulation drops the per-pixel matching in favour of
+\textbf{per-instance world-frame height matching}. Concretely, for each
+V2X bounding-box instance $i$ projected into camera $c$, we know:
+
+\begin{itemize}
+\item Its top and bottom world-frame heights $Z_{\max}^i$ and
+$Z_{\min}^i$ (from the bbox annotation).
+\item Two image-space anchor pixels $(u_{\min}^i, v_{\min}^i)$ and
+$(u_{\max}^i, v_{\max}^i)$ taken from a segmentation mask
+\cite{sam} restricted to the instance.
+\item The relative-depth values $\tilde{d}_{\min}^i, \tilde{d}_{\max}^i$
+at those anchor pixels.
+\end{itemize}
+
+For each anchor we have a per-pixel constraint that the unprojected
+\emph{world} height matches the annotated height,
+\begin{equation}
+\bigl[\mathbf{T}_{wc}\,(a\,\tilde{d}\,\mathbf{r}_{cam})\bigr]_z = Z,
+\label{eq:had-constraint}
+\end{equation}
+which after multiplying out is linear in $(a, b)$. Stacking the
+constraints for all instances in a camera into one over-determined
+system gives a 2-unknown linear LSQ — solved in closed form, in
+microseconds, without any iteration or learning. We refer the reader
+to the supplementary for the explicit row form; the key practical
+property is that the matrix conditioning is governed by the
+\emph{diversity of object heights and depths} across the scene, not by
+LiDAR density. A handful of cars + a few traffic-light poles is enough.
+
+
+\subsection{Axis-Aligned HAD (AA-HAD)}
+\label{sec:method-aahad}
+
+The HAD constraints in Eq.~\ref{eq:had-constraint} involve the full
+projection matrix $\mathbf{T}_{wc}$. For roadside cameras with
+near-canonical mounting (tilt $\theta_t$ small, no roll), the same
+constraints simplify to a per-camera \emph{axis-aligned} form in which
+$z_{cam}$ becomes the world-Z primitive: the rotation
+$\mathbf{T}_{wc}\!\!\downarrow_z$ acts on the camera-frame z-axis as
+near identity, and the per-anchor constraint reduces to
+$z_{cam}^{\text{anchor}} \approx \alpha\,(Z^{\text{anchor}} - t_z) + \beta$
+for tilt-dependent $(\alpha, \beta)$. The full derivation is in the
+supplementary. In code, AA-HAD is a single per-camera $\texttt{(a, b)}$
+JSON file, written once and consumed by every downstream stage.
+
+A second axis-alignment step happens at the \emph{pipeline} level
+(Sec.~\ref{sec:method-pipeline}): after AA-HAD has put every pixel at
+the right world Z, we snap road-surface pixels to a LiDAR-derived 2.5D
+height grid. This snaps away the residual horizontal error that AA-HAD
+cannot correct (vertical-axis-only correction by construction). The
+combination — AA-HAD on the vertical axis + ground-snap on the
+horizontal plane — is what we call the \emph{Layer~1+3 prior}, and it
+is the input to both the LiDAR-priority fuse and the residual flow
+head.
+
+
+\subsection{The eight-stage pipeline}
+\label{sec:method-pipeline}
+
+Fig.~\ref{fig:pipeline} gives a graphical overview. The eight stages
+correspond directly to the eight subcommands of the \texttt{lad} CLI
+(Sec.~\ref{sec:impl}). Stages \texttt{depth}, \texttt{mask}, and
+\texttt{seg} are off-the-shelf foundation-model runs — Depth Anything
+3 \cite{depthanything3}, SAM \cite{sam}, SegFormer \cite{segformer} —
+and produce per-frame artefacts that the geometry stages consume.
+Stages \texttt{calib} and \texttt{object-accum} are the geometric
+pre-processing; stages \texttt{complete}, \texttt{inject}, and
+\texttt{render-bev} are the per-scene reconstruction and rendering.
+
+\begin{figure*}[t]
+  \centering
+  \includegraphics[width=0.95\textwidth]{figures/pipeline.png}
+  \caption{\textbf{The \ourmethod{} pipeline.} Eight stages, each with
+  a typed config and its own per-run output directory. Solid arrows are
+  data dependencies; dashed arrows are auto-discovery via the
+  \texttt{outputs/<scene>/<upstream>/latest/} symlink convention.
+  Multi-GPU sharding (\texttt{--runtime.gpu-ids}) is supported on every
+  stage that benefits from it.}
+  \label{fig:pipeline}
+\end{figure*}
+
+
+\subsection{Layer 3: ground-snap}
+\label{sec:method-ground}
+
+After AA-HAD has placed every pixel at a metric world position, we
+build a 2.5D ground height grid $g(x, y)$ from the per-frame static
+LiDAR returns (LiDAR points outside any V2X bbox), aggregated across
+the scene. Each $(x, y)$ cell of the grid stores the low-quantile $Z$
+of the LiDAR points that fell into it — the low quantile is robust
+against occasional above-ground returns from grazing-incidence
+reflectors (curbs, manhole covers, traffic-cone bases).
+
+For each AA-HAD pixel with world coordinates $(x, y, z)$ and
+$|z - g(x,y)| \le \delta_g$ (default $\delta_g = 0.4$\,m), we
+\emph{snap} the pixel to $g(x, y)$. The residual flow head
+(Sec.~\ref{sec:method-residual}) is responsible for any further
+vertical adjustment within the ground band. The snap protects against
+two well-known failure modes of AA-HAD: (i) per-camera tilt
+miscalibration of a few tenths of a degree, which compounds over
+50–100\,m of range, and (ii) DA3-introduced curvature near image
+borders where the relative depth is least constrained.
+
+
+\subsection{Layer 4: LiDAR-priority voxel fusion}
+\label{sec:method-fuse}
+
+Where the LiDAR is present, it should win: it is cm-precise, while
+even a well-calibrated AA-HAD prior has ~5\,cm error. We voxelise both
+clouds at the same grid (default 5\,cm), and for each voxel: if any
+LiDAR point is present, keep \emph{only} the LiDAR points; otherwise,
+keep the AA-HAD points (subject to an optional max-distance-to-nearest-
+LiDAR cull that filters far-from-LiDAR AA-HAD outliers). The result
+is what we call the \emph{hybrid cloud}: dense AA-HAD fills the
+visible cones; LiDAR backbones the columns and the near range where
+its rings are dense.
+
+One operational nuance is worth calling out. If we keep the LiDAR
+ground-band returns in the backbone, the BEV rendering inherits the
+LiDAR sensor's \emph{ring pattern} — four concentric rings, one per
+sensor, sweeping out from each sensor — because every ring voxel is
+filled while the gaps between rings are sparser. Dropping the LiDAR
+ground band (Sec.~\ref{sec:impl-skip-ground}) before the fuse lets the
+uniform AA-HAD fill take over the road surface, giving a visually
+uniform BEV.
+
+
+\subsection{Layer 5: per-object accumulation}
+\label{sec:method-perobject}
+
+For each dynamic V2X object id, we accumulate its LiDAR + AA-HAD
+returns across every frame in which the object appears, transforming
+each contribution into the \emph{object-local} frame defined by that
+frame's bounding box. The accumulated cloud is then voxel-downsampled
+in the object frame and stored as a single PLY per object id. This
+"freezes" the object's geometry in a canonical pose, so the per-ts
+snapshot inject (Sec.~\ref{sec:method-inject}) only needs to look up
+the object's pose at the current timestamp.
+
+Per-object accumulation is also where the dataset's two V2X label
+sources interact. The 10\,Hz interpolated boxes give us a thick stack
+of per-frame observations per object — important because each
+individual frame's bbox is too noisy to define a stable local frame on
+its own. The 1\,Hz hand-labeled boxes are reserved for the
+\emph{static-scene} accumulation (Layer 4), where bounding-box
+precision is the limiting factor (Sec.~\ref{sec:impl-dual}).
+
+
+\subsection{Residual flow head}
+\label{sec:method-residual}
+
+The Layer~1+3 prior is metric and roughly correct but exhibits
+residual structure: edges where DA3's depth is uncertain, far-range
+points where AA-HAD has a few cm of bias, and corners where the
+ground-snap discontinuity meets vertical surfaces. We train a
+point-cloud residual head $\mathbf{f}_\theta$ that maps the prior
+cloud $\mathbf{P}\in\mathbb{R}^{N\times 3}$ to a per-point
+displacement $\Delta\mathbf{P}\in\mathbb{R}^{N\times 3}$, and apply it
+to obtain the refined cloud
+$\mathbf{P}^* = \mathbf{P} + \mathbf{f}_\theta(\mathbf{P}, \mathbf{F})$.
+
+\paragraph{Backbone.} We use a Dynamic Graph CNN \cite{dgcnn}
+encoder with $k$-nearest-neighbour EdgeConv layers. Per-point features
+$\mathbf{F}$ concatenate the RGB colour of the source pixel, a clipped
+distance-to-nearest-LiDAR scalar, and a per-pixel Cityscapes class id
+from SegFormer \cite{segformer} (the \emph{A1 feature}).
+
+\paragraph{Segment-aware EdgeConv.} A naive EdgeConv KNN graph mixes
+features across instance boundaries — e.g. a vehicle's points and the
+road points next to it become neighbours. We mask the KNN graph to
+exclude cross-segment edges using the Cityscapes class id, so messages
+only flow within the same semantic class. This is the \emph{A1
+masking} mentioned in the ablation.
+
+\paragraph{Conditional flow-matching head.} The head outputs
+$\Delta\mathbf{P}$ via a conditional flow-matching (CFM)
+\cite{conditionalflowmatching,rectifiedflow} integrator. Compared to
+a single-shot regression head, CFM is well-behaved in the small-Δxyz
+regime that our task demands: the predicted Δxyz is usually on the
+order of a few cm, and CFM's iterative refinement (default 4 steps)
+avoids the regression collapse that a one-shot MSE head exhibits when
+the target Δxyz is dominated by small displacements.
+
+\paragraph{Per-frame deterministic seeding.} Both the random
+subsample of input points and the CFM initial noise are seeded by a
+hash of $(\text{scene}, \text{cam}, \text{ts})$, so a multi-GPU run
+produces bit-for-bit identical refined clouds to a single-GPU run.
+
+
+\subsection{Dynamic snapshot injection}
+\label{sec:method-inject}
+
+At a chosen anchor timestamp, we transform each per-object PLY from its
+object-local frame back to the world frame using that timestamp's V2X
+bounding-box pose. The result is concatenated onto the hybrid static
+cloud, voxel-downsampled, and written as a single \texttt{hybrid\_with\_dyn.ply}.
+
+
+\subsection{BEV video rendering with pose interpolation}
+\label{sec:method-bev}
+
+For video output, the snapshot inject runs per timestamp. At each
+timestamp $t$, the per-object pose is obtained by linearly
+interpolating the two annotated bracketing timestamps in the V2X
+stream; objects whose annotation window is too far from $t$ (default
+$\pm 200$\,ms) are not rendered. A separate check rejects
+interpolation across long V2X tracker-loss gaps (default $> 500$\,ms),
+which would otherwise teleport objects across the scene as the
+tracker re-acquires them. The rendered cloud is rasterised top-down
+with a z-buffer (highest world-Z wins per cell), producing one PNG per
+timestamp. ffmpeg assembles the PNGs into a video.
+
+
+%======================================================================
+\section{Implementation}
+\label{sec:impl}
+
+\paragraph{Typed multi-stage CLI.} The entire pipeline ships as a
+single \texttt{lad} command with eight subcommands:
+\texttt{depth}, \texttt{mask}, \texttt{seg}, \texttt{calib},
+\texttt{object-accum}, \texttt{complete}, \texttt{inject},
+\texttt{render-bev}, plus a \texttt{pipeline} orchestrator that runs
+all eight back-to-back. Configurations are typed \texttt{@dataclass}
+trees consumed by \texttt{tyro}; per-stage artefacts land in
+\texttt{outputs/<scene>/<stage>/<run\_id>/} with a sibling
+\texttt{latest} symlink. Each downstream stage's input paths default
+to \texttt{None}; the stage's \texttt{run()} call walks the
+\texttt{latest} symlink of its declared upstream stage to fill them
+in (Sec.~\ref{sec:impl-discovery}). The result is a one-shot
+end-to-end invocation:
+
+\begin{small}
+\begin{verbatim}
+lad pipeline \
+  --complete.scene.scene 002 \
+  --complete.scene.data-root /mnt/.../TianJin \
+  --complete.runtime.gpu-ids 0 1 2 3 \
+  --complete.residual-checkpoint ckpt.pt \
+  --stages depth mask seg calib \
+           object-accum complete \
+           inject render-bev
+\end{verbatim}
+\end{small}
+
+
+\subsection{Multi-GPU sharding}
+\label{sec:impl-multigpu}
+
+The per-frame stages (\texttt{depth}, \texttt{seg}) and the per-camera
+stage (\texttt{mask}) shard their per-frame work across GPUs via the
+\texttt{--runtime.gpu-ids} list. Each worker pins itself to one GPU
+via \texttt{CUDA\_VISIBLE\_DEVICES} \emph{before} importing torch, so
+that \texttt{cuda:0} resolves to the assigned card in the child
+process; the parent never touches CUDA, avoiding the well-known
+\texttt{spawn}-vs-\texttt{fork} deadlock that plagues
+torch + multiprocessing pipelines. The \texttt{complete} stage shards
+\texttt{(cam, ts)} work items via \texttt{torch.multiprocessing.Pool}.
+The \texttt{object-accum} stage shards over the per-object loop via a
+plain CPU \texttt{ProcessPoolExecutor} (16 workers by default).
+
+
+\subsection{Auto-discovery of upstream artefacts}
+\label{sec:impl-discovery}
+
+Each downstream-stage config exposes its upstream-path fields as
+\texttt{None} by default. At \texttt{run()} time, the stage calls a
+small \texttt{engine.discovery} helper that walks
+\texttt{<output.root>/<scene>/<upstream\_stage>/latest/} and fills in
+the missing paths. Explicit overrides are still supported (a user
+can pass \texttt{--complete.sam-mask-dir preview/sam/} to point at a
+legacy product). The error path is also explicit: if the upstream
+stage has never run, the discovery helper raises with a clear
+migration hint (\texttt{run `lad <upstream>` first, or pass
+--<flag> explicitly}).
+
+
+\subsection{Dual labels source}
+\label{sec:impl-dual}
+
+The TianJin Roadside V2X dataset ships two parallel V2X annotation
+sets per scene: \texttt{road\_labels/interpolation\_labels/} contains
+the 10\,Hz interpolated bounding boxes; \texttt{road\_labels/
+merged\_pcd\_all/} contains the 1\,Hz hand-labelled set from which the
+interpolation is derived. The interpolation is convenient for
+per-frame work (smooth across video) but its jitter at bbox edges
+leaks dynamic-object LiDAR into the "static" accumulation: in a
+moving vehicle's wake, the per-frame bbox is off by a few centimetres,
+the vehicle's LiDAR returns are not fully culled, and across $N$
+frames they form a faint trail (Fig.~\ref{fig:ablation-labels}). The
+hand-labelled set is too sparse for video but its bbox precision is
+much higher.
+
+\ourmethod{} adopts a hybrid: \texttt{SceneConfig.static\_labels\_source
+= "merged\_pcd"} drives the static-scene accumulation (high bbox
+precision), and \texttt{SceneConfig.dynamic\_labels\_source =
+"interpolation"} drives per-frame work (smooth motion). Both can be
+overridden on the CLI if a particular scene lacks hand-labels.
+
+
+\subsection{LiDAR ground-band skip}
+\label{sec:impl-skip-ground}
+
+The Layer 4 LiDAR-priority fuse normally keeps every in-camera-FOV
+LiDAR point. As discussed in Sec.~\ref{sec:method-fuse}, this leaves
+visible scan-ring artefacts on the road surface in the BEV. The
+\texttt{--lidar-skip-ground} flag (on by default) drops LiDAR points
+whose world Z is within $\pm 0.5$\,m of the LiDAR-derived ground
+grid, \emph{before} they enter the fuse — the road geometry is already
+locked by the ground-snap, so the cm-precision LiDAR ground points are
+decorative. A subtlety: the outlier-rejection KD-tree inside
+\texttt{lidar\_priority\_fill} must be built on the un-thinned LiDAR
+backbone (otherwise the nearest-LiDAR query for AA-HAD ground points
+returns several-metres-up vertical structures and the AA-HAD ground
+gets falsely dropped, leaving a "halo around verticals" artefact in
+the BEV).
+
+
+%======================================================================
+\section{Experiments}
+\label{sec:exp}
+
+\subsection{Setup}
+\label{sec:exp-setup}
+
+\paragraph{Dataset.} We use the TianJin Roadside V2X dataset, an
+internal capture of 4 pinhole cameras (ids 0, 3, 6, 9) plus 4 LiDAR
+sensors at a single intersection, with V2X 3D bounding boxes for every
+visible vehicle, pedestrian, and roadside fixture. The release we
+report on includes one scene used for training the residual head
+(scene \texttt{008}, $\sim$190 frames per camera, $\sim$19\,s of
+capture) and a second scene for zero-shot transfer (scene
+\texttt{002}, similar size).
+
+\paragraph{Models.} Depth Anything 3 (large variant)
+\cite{depthanything3}, SAM (vit-huge) \cite{sam}, SegFormer (b5
+fine-tuned on Cityscapes) \cite{segformer}. The residual flow head is
+trained on scene \texttt{008} only, using the per-frame Layer~1+3
+prior as input and the nearest static-LiDAR point as the regression
+target.
+
+\paragraph{Hardware.} 4$\times$NVIDIA A100 80\,GB, 100+ CPU cores,
+1\,TB RAM. Total wall-clock time to take a fresh scene from raw V2X
+data to a BEV video: roughly \todo{measure} minutes
+(Sec.~\ref{sec:exp-runtime}).
+
+
+\subsection{Closed-form vs.\ refined vs.\ hybrid}
+\label{sec:exp-qualitative}
+
+Fig.~\ref{fig:008-comparison} compares the three artefacts that the
+\texttt{complete} stage produces on scene \texttt{008}:
+\texttt{baseline.ply} (Layer 1+3 prior, no network),
+\texttt{refined.ply} (baseline + residual flow head), and
+\texttt{hybrid.ply} (refined + LiDAR-priority fuse). The closed-form
+baseline alone already produces a recognisable scene; the residual
+head cleans up edge bleed and removes residual ground curvature; the
+LiDAR-priority fuse adds the cm-precise backbone needed for
+metric-accurate downstream perception.
+
+
+\begin{figure*}[t]
+  \centering
+  \includegraphics[width=0.95\textwidth]{figures/008_baseline_refined_hybrid.png}
+  \caption{\textbf{Three artefacts of the \texttt{complete} stage on
+  scene 008.} Left: closed-form AA-HAD baseline. Middle: refined by
+  the residual flow head. Right: hybrid (refined + LiDAR-priority
+  fuse). The refined cloud cleans up edge bleed and the residual
+  ground curvature visible at the far end of the road in the baseline.
+  The hybrid cloud adds the LiDAR backbone on poles, walls, and the
+  vehicle silhouettes that LiDAR sees natively.}
+  \label{fig:008-comparison}
+\end{figure*}
+
+
+\subsection{Zero-shot cross-scene transfer}
+\label{sec:exp-zeroshot}
+
+To probe whether the residual flow head generalises beyond its
+training scene, we apply the \texttt{008}-trained checkpoint to scene
+\texttt{002} \emph{without retraining}. The closed-form AA-HAD
+calibration is re-fit per-camera on the new scene (Layer~1+3 is
+inherently per-scene), but the network weights are frozen.
+Fig.~\ref{fig:002-zeroshot} shows the result.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{figures/002_zeroshot.png}
+  \caption{\textbf{Zero-shot transfer to an unseen scene.} The residual
+  flow head trained on scene 008 is applied to scene 002. Top:
+  closed-form baseline. Bottom: refined. The refined cloud is visibly
+  cleaner than the baseline despite no exposure to 002 at training time
+  — the residual head learned a generic geometric refinement, not a
+  scene-specific one.}
+  \label{fig:002-zeroshot}
+\end{figure}
+
+
+\subsection{Dynamic object reconstruction}
+\label{sec:exp-dynamic}
+
+Fig.~\ref{fig:per-object} shows three per-object accumulated PLYs
+overlaid in the BEV at a chosen anchor timestamp. The per-object
+clouds are denser than any single-frame snapshot would be — the LiDAR
+contribution alone is too sparse for a usable vehicle silhouette — and
+exhibit the front/rear/side asymmetry expected from a single
+fly-through observation. The optional \texttt{--mirror-axis y} flag
+(on for the result shown) doubles each object by reflecting across the
+object-local $y$-axis, which fills in the occluded side at the cost of
+a slight symmetry artefact.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{figures/per_object.png}
+  \caption{\textbf{Per-object accumulated reconstructions placed in
+  the BEV.} Three dynamic objects (two cars and a bus) at the anchor
+  timestamp. The per-object accumulation runs in the object-local
+  frame across every frame the object appears in, then transforms back
+  to the world frame at the anchor.}
+  \label{fig:per-object}
+\end{figure}
+
+A 4-frame video strip (Fig.~\ref{fig:bev-video}) demonstrates the
+linear pose interpolation: a single vehicle is shown at $t$, $t{+}100$\,ms,
+$t{+}200$\,ms, $t{+}300$\,ms. Between annotated V2X timestamps (which
+fall on every 100\,ms boundary), the interpolated pose is geometrically
+smooth and the vehicle's reconstruction translates correctly across
+frames. A long V2X tracker-loss gap (Sec.~\ref{sec:method-bev}) would
+manifest as the vehicle disappearing and reappearing at a distant
+position; our $> 500$\,ms gap-cull suppresses this teleport.
+
+\begin{figure*}[t]
+  \centering
+  \includegraphics[width=0.95\textwidth]{figures/bev_video_strip.png}
+  \caption{\textbf{BEV video strip.} Four consecutive frames
+  ($t = $0, 100, 200, 300\,ms) showing the same dynamic object placed
+  in the scene via linear pose interpolation between annotated V2X
+  timestamps. The reconstruction is anchored to the scene's static
+  background (which is constant across frames) so only the dynamic
+  layer moves.}
+  \label{fig:bev-video}
+\end{figure*}
+
+
+\subsection{Ablations}
+\label{sec:exp-ablation}
+
+\paragraph{Ground-band LiDAR skip.}
+Fig.~\ref{fig:ablation-skipground} shows a BEV close-up of the
+intersection with and without the ground-band LiDAR skip. Without
+the skip, the four LiDAR sensors' concentric scan rings are clearly
+visible on the road surface; with the skip, the road density is
+uniform.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{figures/ablation_skipground.png}
+  \caption{\textbf{Ablation: LiDAR ground-band skip.} Left: every
+  in-FOV LiDAR point participates in Layer~4 fuse. Right:
+  \texttt{--lidar-skip-ground}: LiDAR points in the ground band are
+  dropped before the fuse. The right panel is visibly more uniform.}
+  \label{fig:ablation-skipground}
+\end{figure}
+
+\paragraph{Dual labels source.}
+Fig.~\ref{fig:ablation-labels} compares the static cloud built from
+interpolated 10\,Hz boxes vs.\ hand-labelled 1\,Hz boxes. The
+interpolated build (left) shows clear "trails" along moving-vehicle
+trajectories — interpolation jitter at the bbox edges lets a few
+percent of each vehicle's LiDAR returns escape into the static branch
+on every frame, and across $N$ frames the trails are visible. The
+hand-labelled build (right) eliminates the trails at the cost of using
+only the 1\,Hz subset of frames for accumulation.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{figures/ablation_labels.png}
+  \caption{\textbf{Ablation: dual labels source.} Left: static cloud
+  built from the 10\,Hz interpolated V2X boxes. Right: the same cloud
+  built from the 1\,Hz hand-labelled boxes. Note the disappearance of
+  the bus-trail and car-trail artefacts on the road surface (insets).
+  The hand-labelled boxes are too sparse for per-frame dynamic-object
+  rendering, so the released system uses each label source where it is
+  strongest.}
+  \label{fig:ablation-labels}
+\end{figure}
+
+\paragraph{Outlier reference for max-dist-to-LiDAR cull.}
+A subtle interaction between the ground-band skip and the
+\texttt{max\_dist\_to\_lidar} outlier filter inside
+\texttt{lidar\_priority\_fill} is shown in
+Fig.~\ref{fig:ablation-outlier-ref}. When the KD-tree underlying the
+filter is built on the post-skip LiDAR, the AA-HAD road points'
+nearest-LiDAR query returns a several-metres-up vertical structure;
+those AA-HAD points are then falsely dropped, leaving a "halo around
+verticals" pattern. Building the KD-tree on the un-thinned LiDAR
+(while the backbone still uses the post-skip subset) fixes the
+artefact.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{figures/ablation_outlier_ref.png}
+  \caption{\textbf{Ablation: outlier-rejection reference cloud.} The
+  \texttt{max-dist-to-lidar} cull keeps AA-HAD points that are close
+  to a LiDAR return. When \texttt{lidar\_priority\_fill}'s KD-tree is
+  built on the post-skip LiDAR (left), the cull falsely drops AA-HAD
+  road points (the nearest LiDAR is now a vertical structure several
+  metres up). Pointing the KD-tree at the un-thinned LiDAR while still
+  using the post-skip subset for the backbone (right) gives a clean
+  road surface.}
+  \label{fig:ablation-outlier-ref}
+\end{figure}
+
+
+\subsection{Runtime}
+\label{sec:exp-runtime}
+
+Table~\ref{tab:runtime} reports per-stage wall-clock times on the
+4$\times$A100 + 100-core hardware described in
+Sec.~\ref{sec:exp-setup}. The hot path is per-(cam, ts) network
+refinement in the \texttt{complete} stage, parallelised across the 4
+GPUs via \texttt{torch.multiprocessing.Pool}. The
+\texttt{object-accum} stage runs CPU-only with 16 parallel
+\texttt{ProcessPoolExecutor} workers.
+
+\begin{table}[t]
+  \centering
+  \small
+  \begin{tabular}{lr@{\,}lr}
+    \toprule
+    Stage & \multicolumn{2}{c}{Hardware} & Wall time \\
+    \midrule
+    \texttt{depth}        & 4$\times$ & A100 & $\sim$3\,min \\
+    \texttt{mask}         & 4$\times$ & A100 & $\sim$2\,min \\
+    \texttt{seg}          & 4$\times$ & A100 & $\sim$2\,min \\
+    \texttt{calib}        & 1$\times$ & A100 & $\sim$2\,min \\
+    \texttt{object-accum} & 16$\times$ & CPU & $\sim$30--60\,min \\
+    \texttt{complete}     & 4$\times$ & A100 & $\sim$30\,min \\
+    \texttt{inject}       & 1$\times$ & CPU & $\sim$2\,min \\
+    \texttt{render-bev}   & 1$\times$ & CPU & $\sim$5--10\,min \\
+    \midrule
+    \textbf{Total} (\texttt{pipeline}) & & & $\sim$75--120\,min \\
+    \bottomrule
+  \end{tabular}
+  \caption{\textbf{End-to-end runtime for one scene} ($\sim$190 frames per
+  camera, 4 cameras, $\sim$20 dynamic objects). All stages are
+  resumable: \texttt{--from-stage <X>} skips upstream stages that
+  succeeded, \texttt{--skip-existing} (on by default in
+  \texttt{object-accum}) lets a killed run pick up where it left off.}
+  \label{tab:runtime}
+\end{table}
+
+
+%======================================================================
+\section{Discussion and limitations}
+\label{sec:discussion}
+
+\paragraph{What HAD assumes.} HAD assumes (i) per-instance bounding
+boxes are available — a reasonable assumption in V2X but not in the
+general monocular setting; (ii) the road plane is locally
+approximately level — which holds for urban intersections but degrades
+on steep grades; and (iii) the camera tilt is well-calibrated to a
+fraction of a degree — which is the AA-HAD axis-alignment assumption,
+and which the ground-snap covers for small tilt errors.
+
+\paragraph{Residual head generalisation.} Our zero-shot transfer
+result (Sec.~\ref{sec:exp-zeroshot}) shows the residual head trained
+on one intersection generalises to another, but this is a single
+data point. We expect the head to need re-training (or fine-tuning)
+when applied to scenes with substantially different camera mounting
+heights, sensor configurations, or scene types (e.g.\ rural roads,
+parking lots).
+
+\paragraph{Dynamic-object completeness.} The per-object accumulated
+clouds inherit the self-occlusion of the single fly-through
+observation: a vehicle passing on the far side of the intersection is
+observed only from one side, and the reconstructed object is
+missing the occluded faces. The \texttt{--mirror-axis y} flag
+mitigates this for vehicles assumed to be left-right symmetric, but a
+principled fix would use a learnt object prior — the natural next
+extension of the system.
+
+
+%======================================================================
+\section{Conclusion}
+\label{sec:conclusion}
+
+We introduced \ourmethod{}, a closed-form-anchored dense 3D
+reconstruction pipeline for roadside V2X scenes. The conceptual core
+is the Height-Anchored Depth formulation, which calibrates a
+foundation depth model against per-instance world-frame heights in a
+single one-shot linear solve. Around this core we have built a
+typed eight-stage CLI that turns raw V2X data into both dense static
+reconstructions and BEV videos with smooth dynamic actors, in $\sim$2
+hours of wall time per scene on four A100s.
+
+The two design choices we hope generalise beyond this specific
+pipeline are (i) \emph{anchor on what is annotated} — per-instance
+heights, not per-pixel depths; the V2X data already gives us the
+former — and (ii) \emph{anchor in the world frame}, where the scene
+geometry is well-conditioned, rather than in the camera frame where
+foundation models naturally produce relative outputs.
+
+
+%======================================================================
+{\small
+\bibliographystyle{ieee_fullname}
+\bibliography{references}
+}
+
+\end{document}
